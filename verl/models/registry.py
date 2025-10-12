@@ -36,6 +36,10 @@ _MODELS = {
         "apertus",
         ("ParallelApertusForCausalLMRmPadPP", "ParallelApertusForValueRmPadPP", "ParallelApertusForCausalLMRmPad"),
     ),
+    "CustomSplitLLamaForCausalLM": (
+        "custom_split_llama",
+        ("ParallelCustomSplitLLamaForCausalLMRmPadPP", "ParallelCustomSplitLLamaForValueRmPadPP", "ParallelCustomSplitLLamaForCausalLMRmPad"),
+    ),
 }
 
 
