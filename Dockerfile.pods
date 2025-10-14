@@ -1,0 +1,99 @@
+# Dockerfile for veRL with Custom Split LLaMA
+# Tested on RunPod, Lambda Labs, Vast.ai
+
+FROM nvidia/cuda:12.1.0-devel-ubuntu22.04
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV CUDA_HOME=/usr/local/cuda
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    wget \
+    curl \
+    ca-certificates \
+    ninja-build \
+    ccache \
+    python3.10 \
+    python3.10-dev \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install UV
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.cargo/bin:$PATH"
+
+# Set working directory
+WORKDIR /workspace
+
+# Clone veRL with Custom Split LLaMA
+RUN git clone https://github.com/manncodes/verl.git && \
+    cd verl && \
+    git checkout feat/custom-split-llama
+
+WORKDIR /workspace/verl
+
+# Create virtual environment
+RUN uv venv --python python3.10
+ENV PATH="/workspace/verl/.venv/bin:$PATH"
+
+# Install PyTorch
+RUN . .venv/bin/activate && \
+    uv pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Install veRL dependencies
+RUN . .venv/bin/activate && \
+    uv pip install --no-cache-dir \
+        accelerate \
+        codetiming \
+        datasets \
+        dill \
+        hydra-core \
+        "numpy<2.0.0" \
+        pandas \
+        peft \
+        "pyarrow>=19.0.0" \
+        pybind11 \
+        pylatexenc \
+        "ray[default]>=2.41.0" \
+        torchdata \
+        "tensordict>=0.8.0,<=0.10.0,!=0.9.0" \
+        transformers \
+        wandb \
+        "packaging>=20.0" \
+        tensorboard \
+        uvicorn \
+        fastapi \
+        latex2sympy2_extended \
+        math_verify
+
+# Install GPU packages (with error handling)
+RUN . .venv/bin/activate && \
+    uv pip install --no-cache-dir liger-kernel || true && \
+    MAX_JOBS=4 uv pip install --no-cache-dir flash-attn --no-build-isolation || echo "Flash-attention failed (non-critical)" && \
+    uv pip install --no-cache-dir vllm==0.8.4 || echo "vLLM failed (non-critical)"
+
+# Install veRL
+RUN . .venv/bin/activate && \
+    uv pip install --no-cache-dir -e .
+
+# Verify installation
+RUN . .venv/bin/activate && \
+    python -c "import verl; print(f'veRL: {verl.__version__}')" && \
+    python -c "import torch; print(f'PyTorch: {torch.__version__}'); assert torch.cuda.is_available()"
+
+# Create activation script
+RUN echo '#!/bin/bash\nsource /workspace/verl/.venv/bin/activate\nexec "$@"' > /entrypoint.sh && \
+    chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["/bin/bash"]
+
+# Labels
+LABEL maintainer="veRL Community"
+LABEL description="veRL with Custom Split LLaMA for GPU pods"
+LABEL version="1.0"
