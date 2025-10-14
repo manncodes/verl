@@ -94,6 +94,16 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
 
+# Import CustomSplitLLama support
+try:
+    from verl.models.transformers.custom_split_llama import CustomSplitLLamaForCausalLM
+    CUSTOM_SPLIT_LLAMA_AVAILABLE = True
+    logger.info("✅ CustomSplitLLama support enabled")
+except ImportError:
+    CUSTOM_SPLIT_LLAMA_AVAILABLE = False
+    CustomSplitLLamaForCausalLM = None
+    logger.debug("CustomSplitLLama not available - will use standard AutoModel")
+
 
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
@@ -373,12 +383,36 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 else:
                     actor_module_class = AutoModel
 
-            actor_module = actor_module_class.from_pretrained(
-                pretrained_model_name_or_path=local_path,
-                torch_dtype=torch_dtype,
-                config=actor_model_config,
-                trust_remote_code=trust_remote_code,
+            # Check if this is CustomSplitLLama and use the custom class if available
+            is_custom_split_llama = (
+                hasattr(actor_model_config, "architectures")
+                and actor_model_config.architectures
+                and len(actor_model_config.architectures) > 0
+                and "CustomSplitLLamaForCausalLM" in actor_model_config.architectures[0]
             )
+
+            if is_custom_split_llama:
+                if CUSTOM_SPLIT_LLAMA_AVAILABLE:
+                    logger.info(f"Loading CustomSplitLLama model from {local_path}")
+                    actor_module = CustomSplitLLamaForCausalLM.from_pretrained(
+                        pretrained_model_name_or_path=local_path,
+                        torch_dtype=torch_dtype,
+                        config=actor_model_config,
+                        trust_remote_code=trust_remote_code,
+                    )
+                else:
+                    raise ImportError(
+                        f"CustomSplitLLamaForCausalLM architecture detected in config.json "
+                        f"but the model class is not available. Please ensure "
+                        f"verl/models/transformers/custom_split_llama.py exists."
+                    )
+            else:
+                actor_module = actor_module_class.from_pretrained(
+                    pretrained_model_name_or_path=local_path,
+                    torch_dtype=torch_dtype,
+                    config=actor_model_config,
+                    trust_remote_code=trust_remote_code,
+                )
 
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
