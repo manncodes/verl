@@ -1,0 +1,55 @@
+--- a/verl/workers/fsdp_workers.py
++++ b/verl/workers/fsdp_workers.py
+@@ -88,14 +88,17 @@
+
+ device_name = get_device_name()
+
+-################# CustomSplitLLama Registry #################
+-from transformers import LlamaConfig
+-from transformers import AutoConfig, AutoModelForCausalLM
+-from verl.models.custom_split_llama.modelling_custom_split_llama import CustomSplitLLamaForCausalLM
+-
+-# AutoModelForCausalLM.register(LlamaConfig, CustomSplitLLamaForCausalLM)
+-
+-# from vllm.model_executor.models import ModelRegistry
+-# ModelRegistry.register_model("CustomSplitLLamaForCausalLM", CustomSplitLLamaForCausalLM)
+-################# END of CustomSplitLLama Registry #################
++################# CustomSplitLLama Support #################
++# Import CustomSplitLLama model
++try:
++    from verl.models.transformers.custom_split_llama import CustomSplitLLamaForCausalLM
++    CUSTOM_SPLIT_LLAMA_AVAILABLE = True
++    logger.info("CustomSplitLLama support enabled")
++except ImportError:
++    try:
++        from verl.models.custom_split_llama.modelling_custom_split_llama import CustomSplitLLamaForCausalLM
++        CUSTOM_SPLIT_LLAMA_AVAILABLE = True
++        logger.info("CustomSplitLLama support enabled (alternative import)")
++    except ImportError:
++        CUSTOM_SPLIT_LLAMA_AVAILABLE = False
++        logger.warning("CustomSplitLLama not available - custom model support disabled")
++################# END CustomSplitLLama Support #################
+@@ -367,6 +370,20 @@
+             print(f"[DEBUG] actor_model_config : {actor_model_config}")
+             print(f"[DEBUG] actor_module_class : {actor_module_class}")
+
++            # Check if this is a CustomSplitLLama model
++            is_custom_split = (
++                hasattr(actor_model_config, "architectures")
++                and actor_model_config.architectures
++                and "CustomSplitLLamaForCausalLM" in actor_model_config.architectures[0]
++            )
++
++            if is_custom_split and CUSTOM_SPLIT_LLAMA_AVAILABLE:
++                logger.info("Loading CustomSplitLLama model")
++                actor_module = CustomSplitLLamaForCausalLM.from_pretrained(
++                    pretrained_model_name_or_path=local_path,
++                    torch_dtype=torch_dtype,
++                    config=actor_model_config,
++                    trust_remote_code=trust_remote_code,
++                )
++            else:
++                # Standard model loading
+             actor_module = actor_module_class.from_pretrained(
+                 pretrained_model_name_or_path=local_path,
+                 torch_dtype=torch_dtype,
