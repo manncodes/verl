@@ -222,8 +222,16 @@ def _check_instruction_builtin(instruction_id: str, response: str, kwargs: dict)
     - number_sentences: Number of sentences
     - etc.
     """
+    # Forbidden words (check before keywords to avoid matching "keywords:forbidden_words")
+    if "forbidden_words" in instruction_id:
+        forbidden_words = kwargs.get("forbidden_words", [])
+        for word in forbidden_words:
+            if word.lower() in response.lower():
+                return False
+        return True
+
     # Keyword constraints
-    if "keywords:" in instruction_id:
+    elif "keywords:" in instruction_id:
         keywords = kwargs.get("keywords", [])
         relation = kwargs.get("relation", "at least")
         frequency = kwargs.get("frequency", 1)
@@ -235,14 +243,6 @@ def _check_instruction_builtin(instruction_id: str, response: str, kwargs: dict)
             elif relation == "at most" and count > frequency:
                 return False
 
-        return True
-
-    # Forbidden words
-    elif "forbidden_words" in instruction_id:
-        forbidden_words = kwargs.get("forbidden_words", [])
-        for word in forbidden_words:
-            if word.lower() in response.lower():
-                return False
         return True
 
     # Length constraints: number of words
