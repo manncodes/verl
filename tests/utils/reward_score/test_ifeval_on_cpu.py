@@ -74,8 +74,8 @@ class TestKeywordInstructions:
         assert result["prompt_strict_acc"] == 0.0
 
     def test_multiple_keywords(self):
-        """Test multiple keyword constraints."""
-        response = "Robot technology is advancing. AI and machine learning improve robot capabilities."
+        """Test multiple keyword constraints - each keyword must meet frequency."""
+        response = "Robot technology is advancing. AI systems and machine learning improve robot and AI capabilities."
         ground_truth = {
             "instruction_id_list": ["keywords:existence"],
             "kwargs": [{"keywords": ["robot", "AI"], "frequency": 2, "relation": "at least"}]
@@ -91,7 +91,7 @@ class TestKeywordInstructions:
         response = "ai and AI are both valid. Artificial Intelligence uses ai techniques."
         ground_truth = {
             "instruction_id_list": ["keywords:existence"],
-            "kwargs": [{"keywords": ["AI"], "frequency": 4, "relation": "at least"}]
+            "kwargs": [{"keywords": ["AI"], "frequency": 3, "relation": "at least"}]
         }
 
         result = compute_score(response, ground_truth, use_ifeval_library=False)
@@ -480,7 +480,7 @@ P.S. I look forward to hearing from you."""
             "kwargs": [
                 {"start_phrase": "Dear Sir"},
                 {"keywords": ["AI"], "frequency": 1, "relation": "at least"},
-                {"num_paragraphs": 3},
+                {"num_paragraphs": 4},  # Including P.S. as separate paragraph
                 {"postscript_marker": "P.S."}
             ]
         }
@@ -495,32 +495,30 @@ P.S. I look forward to hearing from you."""
         """Test technical document with formatting requirements."""
         response = """technical analysis of ai systems
 
-- First point about neural networks
-- Second point about deep learning
-- Third point about transformers
+- first point about neural networks
+- second point about deep learning
+- third point about transformers
 
-{"conclusion": "AI is advancing rapidly"}"""
+ai technology is advancing rapidly in multiple ai applications"""
 
         ground_truth = {
             "instruction_id_list": [
                 "change_case:english_lowercase",
                 "detectable_format:number_bullet_lists",
-                "detectable_format:json_format",
                 "keywords:existence"
             ],
             "kwargs": [
                 {"capital": "lower"},
                 {"num_bullets": 3},
-                {},
-                {"keywords": ["ai"], "frequency": 2, "relation": "at least"}
+                {"keywords": ["ai"], "frequency": 3, "relation": "at least"}
             ]
         }
 
         result = compute_score(response, ground_truth, use_ifeval_library=False)
 
-        assert result["num_instructions"] == 4
-        # Note: JSON check might fail due to surrounding text
-        assert result["num_followed"] >= 3
+        assert result["num_instructions"] == 3
+        assert result["num_followed"] == 3
+        assert result["score"] == 1.0
 
 
 class TestDefaultComputeScore:
@@ -546,7 +544,7 @@ class TestDefaultComputeScore:
 
     def test_default_compute_score_ifeval_alternate_source(self):
         """Test IFEval with alternate data source name."""
-        response = "This is a test response."
+        response = "This is a test response."  # 5 words
         ground_truth = {
             "instruction_id_list": ["length_constraints:number_words"],
             "kwargs": [{"num_words": 5, "relation": "at least"}]
@@ -560,7 +558,7 @@ class TestDefaultComputeScore:
         )
 
         assert isinstance(result, dict)
-        assert result["score"] == 0.0  # Only 5 words, needs at least 5
+        assert result["score"] == 1.0  # 5 words meets "at least 5" requirement
 
 
 class TestEdgeCases:

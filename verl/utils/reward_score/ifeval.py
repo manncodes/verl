@@ -86,15 +86,18 @@ def _compute_score_with_library(
     if not strict:
         response = _preprocess_response_loose(response)
 
-    # Extract instruction information
+    # Extract instruction information - try ground_truth first, then extra_info
+    instruction_list = []
+    kwargs_list = []
+
     if isinstance(ground_truth, dict):
         instruction_list = ground_truth.get("instruction_id_list", [])
         kwargs_list = ground_truth.get("kwargs", [])
-    elif extra_info is not None:
+
+    # Fall back to extra_info if ground_truth didn't have instructions
+    if not instruction_list and extra_info is not None:
         instruction_list = extra_info.get("instruction_id_list", [])
         kwargs_list = extra_info.get("kwargs", [])
-    else:
-        return {"score": 0.0, "num_instructions": 0, "num_followed": 0, "error": "No instruction information provided"}
 
     if not instruction_list:
         return {"score": 0.0, "num_instructions": 0, "num_followed": 0}
@@ -145,16 +148,18 @@ def _compute_score_builtin(
     if not strict:
         response = _preprocess_response_loose(response)
 
-    # Extract instruction information
+    # Extract instruction information - try ground_truth first, then extra_info
+    instruction_list = []
+    kwargs_list = []
+
     if isinstance(ground_truth, dict):
         instruction_list = ground_truth.get("instruction_id_list", [])
         kwargs_list = ground_truth.get("kwargs", [])
-    elif extra_info is not None:
+
+    # Fall back to extra_info if ground_truth didn't have instructions
+    if not instruction_list and extra_info is not None:
         instruction_list = extra_info.get("instruction_id_list", [])
         kwargs_list = extra_info.get("kwargs", [])
-    else:
-        # If no specific instructions provided, return 0
-        return {"score": 0.0, "num_instructions": 0, "num_followed": 0, "error": "No instruction information provided"}
 
     if not instruction_list:
         return {"score": 0.0, "num_instructions": 0, "num_followed": 0}
@@ -360,7 +365,7 @@ def _check_instruction_builtin(instruction_id: str, response: str, kwargs: dict)
         return len(placeholders) >= num_placeholders
 
     # Postscript marker
-    elif "postscript_marker" in instruction_id or "end_checker:end_with_postscript" in instruction_id:
+    elif "postscript" in instruction_id:
         postscript_marker = kwargs.get("postscript_marker", "P.S.")
         return postscript_marker in response
 
