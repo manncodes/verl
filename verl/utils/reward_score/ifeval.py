@@ -14,20 +14,269 @@
 """
 IFEval (Instruction Following Evaluation) reward function.
 
+Migrated from allenai/open-instruct codebase.
+This module contains all 25 constraint verification functions from the IFEval taxonomy.
+
 Reference: Zhou, Jeffrey, et al. "Instruction-Following Evaluation for Large Language Models."
 arXiv preprint arXiv:2311.07911 (2023).
-
-This module provides reward scoring based on instruction following verification.
-It supports the Google IFEval benchmark which evaluates models on their ability
-to follow verifiable instructions.
-
-The evaluation supports both strict and loose accuracy modes:
-- Strict: Exact verification of instruction following
-- Loose: Applies preprocessing (remove first/last line, markdown cleanup) before verification
 """
 
+import json
 import re
-from typing import Any
+from typing import Any, List
+
+
+# ============================================================================
+# All 25 Constraint Verification Functions (from open-instruct)
+# ============================================================================
+
+
+def verify_keywords(text, keyword_list):
+    """Verify if the response contains all the specified keywords."""
+    response_lower = text.lower()
+    return all(keyword.lower() in response_lower for keyword in keyword_list)
+
+
+def verify_keyword_frequency(text, word, N):
+    """Verifies if a keyword appears exactly N times in the given text."""
+    text = text.lower()
+    keyword = word.lower()
+    words = re.findall(r"\b\w+\b", text)
+    actual_count = sum(1 for w in words if w == keyword)
+    return actual_count == N
+
+
+def validate_forbidden_words(text, forbidden_words):
+    """Validates that the text does not contain any of the specified forbidden words."""
+    text_lower = text.lower()
+    found_words = [word for word in forbidden_words if word.lower() in text_lower]
+    return len(found_words) == 0
+
+
+def verify_letter_frequency(text: str, letter: str, N: int) -> bool:
+    """Verifies if a given letter appears exactly the specified number of times in the text."""
+    if len(letter) != 1:
+        raise ValueError("Letter parameter must be a single character")
+    actual_count = text.count(letter)
+    return actual_count == N
+
+
+def validate_response_language(text, language):
+    """Validates that the entire response is in the specified language."""
+    try:
+        from langdetect import detect
+
+        detected_language = detect(text)
+        return detected_language == language
+    except:
+        # If langdetect fails, return True to avoid penalizing
+        return True
+
+
+def verify_paragraph_count(text: str, N: int) -> bool:
+    """Verifies that a text contains the expected number of paragraphs."""
+
+    def clean_text(text: str) -> str:
+        return "\n".join(line.strip() for line in text.splitlines()).strip()
+
+    text = clean_text(text)
+    paragraphs = text.split("* * *")
+    actual_count = len(paragraphs)
+    valid_paragraphs = [p.strip() for p in paragraphs if p.strip()]
+    if len(valid_paragraphs) != actual_count:
+        return False
+    return actual_count == N
+
+
+def validate_word_constraint(text: str, N: int, quantifier: str) -> bool:
+    """Validates if a text meets specified word count constraints."""
+    words = text.strip().split()
+    actual_count = len(words)
+    tolerance = max(round(N * 0.1), 1)
+
+    if quantifier == "at least":
+        return actual_count >= N
+    elif quantifier == "at most":
+        return actual_count <= N
+    elif quantifier == "around":
+        return abs(actual_count - N) <= tolerance
+    else:
+        return False
+
+
+def verify_sentence_constraint(text: str, N: int, quantifier: str) -> bool:
+    """Verifies if a text contains the expected number of sentences."""
+    sentences = re.split(r"(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\.)\s", text)
+    actual_count = len(sentences)
+
+    if quantifier == "at least":
+        return actual_count >= N
+    elif quantifier == "around":
+        return abs(actual_count - N) <= 1
+    elif quantifier == "at most":
+        return actual_count <= N
+    else:
+        return False
+
+
+def validate_paragraphs(text, N, first_word, i):
+    """Validates that a text contains the expected number of paragraphs and that the i-th paragraph starts with a specific word."""
+    paragraphs = text.split("\n\n")
+    if len(paragraphs) != N:
+        return False
+    if paragraphs[i - 1].strip().startswith(first_word):
+        return True
+    return False
+
+
+def verify_postscript(text, postscript_marker):
+    """Verifies if a text contains a postscript starting with the given marker."""
+    if postscript_marker in text:
+        marker_index = text.find(postscript_marker)
+        remaining_text = text[marker_index:].strip()
+        return len(remaining_text) > len(postscript_marker)
+    return False
+
+
+def validate_placeholders(text: str, N: int):
+    """Validates if a text contains at least the specified number of placeholders in square brackets."""
+    pattern = r"\[(.*?)\]"
+    placeholders = re.findall(pattern, text)
+    return len(placeholders) >= N
+
+
+def verify_bullet_points(text: str, N: int):
+    """Verifies if a text contains exactly N bullet points in markdown format."""
+    lines = text.split("\n")
+    bullet_points = [line.strip() for line in lines if line.strip().startswith(("*", "-"))]
+    return len(bullet_points) == N
+
+
+def validate_title(text: str) -> bool:
+    """Validates if text contains a title wrapped in double angular brackets."""
+    pattern = r"<<(.*?)>>"
+    matches = re.findall(pattern, text)
+    return len(matches) > 0
+
+
+def validate_choice(text: str, options: list) -> bool:
+    """Validates if text matches one of the given options."""
+    for option in options:
+        if text in option:
+            return True
+    return False
+
+
+def validate_highlighted_sections(text: str, N: int) -> bool:
+    """Validates if text has at least N highlighted sections (markdown emphasis)."""
+    pattern = r"\*(.*?)\*"
+    matches = re.findall(pattern, text)
+    return len(matches) >= N
+
+
+def validate_sections(text: str, N: int, section_splitter: str) -> bool:
+    """Validates if text has exactly N sections."""
+    sections = text.split(section_splitter)
+    if sections[0] == "":
+        sections.pop(0)
+    return len(sections) == N
+
+
+def validate_json_format(text: str) -> bool:
+    """Validates if entire output is wrapped in JSON format."""
+    try:
+        json.loads(text)
+    except ValueError:
+        return False
+    return True
+
+
+def validate_repeat_prompt(text: str, original_prompt: str) -> bool:
+    """Validates if text starts with the original prompt."""
+    return text.startswith(original_prompt)
+
+
+def validate_two_responses(text: str) -> bool:
+    """Validates if text contains two different responses separated by 6 asterisks."""
+    if text.count("******") == 1:
+        response_list = text.split("******")
+        first_response = response_list[0].strip()
+        second_response = response_list[1].strip()
+        return first_response != second_response
+    return False
+
+
+def validate_uppercase(text: str) -> bool:
+    """Validates if entire response is in uppercase."""
+    return text == text.upper()
+
+
+def validate_lowercase(text: str) -> bool:
+    """Validates if entire response is in lowercase."""
+    return text == text.lower()
+
+
+def validate_frequency_capital_words(text: str, N: int, quantifier: str) -> bool:
+    """Validates frequency of all-capital words."""
+    words = re.findall(r"\b[A-Z]+\b", text)
+    if quantifier == "at least":
+        return len(words) >= N
+    elif quantifier == "around":
+        return len(words) == N
+    elif quantifier == "at most":
+        return len(words) <= N
+    else:
+        return False
+
+
+def validate_end(text: str, end_phrase: str) -> bool:
+    """Validates if response ends with the exact phrase."""
+    return text.endswith(end_phrase)
+
+
+def validate_quotation(text: str) -> bool:
+    """Validates if entire response is wrapped in double quotation marks."""
+    return text.startswith('"') and text.endswith('"')
+
+
+def validate_no_commas(text: str) -> bool:
+    """Validates if response contains no commas."""
+    return "," not in text
+
+
+# Map of all IF constraint verification functions
+IF_FUNCTIONS_MAP = {
+    "verify_keywords": verify_keywords,
+    "verify_keyword_frequency": verify_keyword_frequency,
+    "validate_forbidden_words": validate_forbidden_words,
+    "verify_letter_frequency": verify_letter_frequency,
+    "validate_response_language": validate_response_language,
+    "verify_paragraph_count": verify_paragraph_count,
+    "validate_word_constraint": validate_word_constraint,
+    "verify_sentence_constraint": verify_sentence_constraint,
+    "validate_paragraphs": validate_paragraphs,
+    "verify_postscript": verify_postscript,
+    "validate_placeholders": validate_placeholders,
+    "verify_bullet_points": verify_bullet_points,
+    "validate_title": validate_title,
+    "validate_choice": validate_choice,
+    "validate_highlighted_sections": validate_highlighted_sections,
+    "validate_sections": validate_sections,
+    "validate_json_format": validate_json_format,
+    "validate_repeat_prompt": validate_repeat_prompt,
+    "validate_two_responses": validate_two_responses,
+    "validate_uppercase": validate_uppercase,
+    "validate_lowercase": validate_lowercase,
+    "validate_frequency_capital_words": validate_frequency_capital_words,
+    "validate_end": validate_end,
+    "validate_quotation": validate_quotation,
+    "validate_no_commas": validate_no_commas,
+}
+
+
+# ============================================================================
+# VERL Integration - compute_score function
+# ============================================================================
 
 
 def compute_score(
@@ -59,20 +308,15 @@ def compute_score(
     # Try to use the official ifeval library if available
     if use_ifeval_library:
         try:
-            import sys
-
-            # Try to import the ifeval library
-            # Note: This requires the instruction_following_eval package to be installed
-            # pip install git+https://github.com/google-research/google-research.git#subdirectory=instruction_following_eval
             from instruction_following_eval import instructions_registry
 
             return _compute_score_with_library(solution_str, ground_truth, extra_info, strict)
         except ImportError:
-            # Fall back to built-in verification if library not available
+            # Fall back to custom verification functions
             pass
 
-    # Use built-in verification functions
-    return _compute_score_builtin(solution_str, ground_truth, extra_info, strict)
+    # Use custom verification functions from open-instruct
+    return _compute_score_with_custom_functions(solution_str, ground_truth, extra_info, strict)
 
 
 def _compute_score_with_library(
@@ -86,18 +330,8 @@ def _compute_score_with_library(
     if not strict:
         response = _preprocess_response_loose(response)
 
-    # Extract instruction information - try ground_truth first, then extra_info
-    instruction_list = []
-    kwargs_list = []
-
-    if isinstance(ground_truth, dict):
-        instruction_list = ground_truth.get("instruction_id_list", [])
-        kwargs_list = ground_truth.get("kwargs", [])
-
-    # Fall back to extra_info if ground_truth didn't have instructions
-    if not instruction_list and extra_info is not None:
-        instruction_list = extra_info.get("instruction_id_list", [])
-        kwargs_list = extra_info.get("kwargs", [])
+    # Extract instruction information
+    instruction_list, kwargs_list = _extract_instruction_data(ground_truth, extra_info)
 
     if not instruction_list:
         return {"score": 0.0, "num_instructions": 0, "num_followed": 0}
@@ -108,18 +342,15 @@ def _compute_score_with_library(
 
     for instruction_id, kwargs in zip(instruction_list, kwargs_list):
         try:
-            # Get the instruction checker from the registry
             instruction_cls = instructions_registry.INSTRUCTION_DICT.get(instruction_id)
             if instruction_cls is None:
                 continue
 
-            # Create instruction instance and check
             instruction = instruction_cls(instruction_id)
             is_followed = instruction.check_following(response, **kwargs)
             if is_followed:
                 num_followed += 1
         except Exception:
-            # If verification fails, count as not followed
             continue
 
     # Calculate metrics
@@ -127,7 +358,7 @@ def _compute_score_with_library(
     prompt_level_acc = 1.0 if num_followed == num_instructions else 0.0
 
     return {
-        "score": inst_level_acc,  # Use instruction-level accuracy as the main score
+        "score": inst_level_acc,
         "prompt_strict_acc": prompt_level_acc,
         "inst_strict_acc": inst_level_acc,
         "num_instructions": num_instructions,
@@ -135,44 +366,41 @@ def _compute_score_with_library(
     }
 
 
-def _compute_score_builtin(
+def _compute_score_with_custom_functions(
     solution_str: str, ground_truth: dict | list, extra_info: dict[str, Any] | None, strict: bool
 ) -> dict[str, Any]:
-    """Compute score using built-in verification functions.
-
-    This is a fallback implementation that covers common IFEval instruction types.
-    For full compatibility, install the official ifeval library.
-    """
+    """Compute score using custom verification functions from open-instruct."""
     # Preprocess response for loose accuracy
     response = solution_str
     if not strict:
         response = _preprocess_response_loose(response)
 
-    # Extract instruction information - try ground_truth first, then extra_info
-    instruction_list = []
-    kwargs_list = []
-
-    if isinstance(ground_truth, dict):
-        instruction_list = ground_truth.get("instruction_id_list", [])
-        kwargs_list = ground_truth.get("kwargs", [])
-
-    # Fall back to extra_info if ground_truth didn't have instructions
-    if not instruction_list and extra_info is not None:
-        instruction_list = extra_info.get("instruction_id_list", [])
-        kwargs_list = extra_info.get("kwargs", [])
+    # Extract instruction information
+    instruction_list, kwargs_list = _extract_instruction_data(ground_truth, extra_info)
 
     if not instruction_list:
         return {"score": 0.0, "num_instructions": 0, "num_followed": 0}
 
-    # Verify each instruction using built-in checkers
+    # Verify each instruction using custom functions
     num_instructions = len(instruction_list)
     num_followed = 0
 
     for instruction_id, kwargs in zip(instruction_list, kwargs_list):
         try:
-            is_followed = _check_instruction_builtin(instruction_id, response, kwargs)
-            if is_followed:
-                num_followed += 1
+            # Map instruction_id to function name
+            func_name = _map_instruction_to_function(instruction_id, kwargs)
+            if func_name and func_name in IF_FUNCTIONS_MAP:
+                func = IF_FUNCTIONS_MAP[func_name]
+                # Remove None values and func_name from kwargs
+                clean_kwargs = {k: v for k, v in kwargs.items() if v is not None and k != "func_name"}
+                # Call the verification function
+                if clean_kwargs:
+                    is_followed = func(response, **clean_kwargs)
+                else:
+                    is_followed = func(response)
+
+                if is_followed:
+                    num_followed += 1
         except Exception:
             # If verification fails, count as not followed
             continue
@@ -182,7 +410,7 @@ def _compute_score_builtin(
     prompt_level_acc = 1.0 if num_followed == num_instructions else 0.0
 
     return {
-        "score": inst_level_acc,  # Use instruction-level accuracy as the main score
+        "score": inst_level_acc,
         "prompt_strict_acc": prompt_level_acc,
         "inst_strict_acc": inst_level_acc,
         "num_instructions": num_instructions,
@@ -190,14 +418,97 @@ def _compute_score_builtin(
     }
 
 
-def _preprocess_response_loose(response: str) -> str:
-    """Preprocess response for loose accuracy evaluation.
+def _extract_instruction_data(ground_truth: dict | list, extra_info: dict[str, Any] | None):
+    """Extract instruction_id_list and kwargs from ground_truth or extra_info."""
+    instruction_list = []
+    kwargs_list = []
 
-    Applies transformations:
-    - Remove first line (to skip intros like "Sure, here it is:")
-    - Remove last line (to skip outros)
-    - Remove markdown formatting
+    # Try ground_truth first
+    if isinstance(ground_truth, dict):
+        instruction_list = ground_truth.get("instruction_id_list", [])
+        kwargs_list = ground_truth.get("kwargs", [])
+
+    # Fall back to extra_info if needed
+    if not instruction_list and extra_info is not None:
+        instruction_list = extra_info.get("instruction_id_list", [])
+        kwargs_list = extra_info.get("kwargs", [])
+
+    # Ensure kwargs_list matches instruction_list length
+    if len(kwargs_list) < len(instruction_list):
+        kwargs_list.extend([{}] * (len(instruction_list) - len(kwargs_list)))
+
+    return instruction_list, kwargs_list
+
+
+def _map_instruction_to_function(instruction_id: str, kwargs: dict) -> str | None:
+    """Map an instruction_id to a verification function name.
+
+    This mapping is based on the open-instruct IFEvalVerifierOld implementation,
+    which uses explicit function names in the constraint dict.
     """
+    # If kwargs has func_name, use it directly (old format)
+    if "func_name" in kwargs:
+        return kwargs["func_name"]
+
+    # Otherwise, infer from instruction_id (new format)
+    # Map common instruction patterns to function names
+    if "keywords:existence" in instruction_id:
+        return "verify_keywords"
+    elif "keywords:frequency" in instruction_id:
+        return "verify_keyword_frequency"
+    elif "keywords:forbidden_words" in instruction_id:
+        return "validate_forbidden_words"
+    elif "keywords:letter_frequency" in instruction_id:
+        return "verify_letter_frequency"
+    elif "language:response_language" in instruction_id:
+        return "validate_response_language"
+    elif "length_constraints:number_paragraphs" in instruction_id:
+        return "verify_paragraph_count"
+    elif "length_constraints:number_words" in instruction_id:
+        return "validate_word_constraint"
+    elif "length_constraints:number_sentences" in instruction_id:
+        return "verify_sentence_constraint"
+    elif "length_constraints:nth_paragraph_first_word" in instruction_id:
+        return "validate_paragraphs"
+    elif "detectable_content:postscript" in instruction_id:
+        return "verify_postscript"
+    elif "detectable_content:number_placeholders" in instruction_id:
+        return "validate_placeholders"
+    elif "detectable_format:number_bullet_lists" in instruction_id:
+        return "verify_bullet_points"
+    elif "detectable_format:title" in instruction_id:
+        return "validate_title"
+    elif "detectable_format:constrained_response" in instruction_id:
+        return "validate_choice"
+    elif "detectable_format:number_highlighted_sections" in instruction_id:
+        return "validate_highlighted_sections"
+    elif "detectable_format:multiple_sections" in instruction_id:
+        return "validate_sections"
+    elif "detectable_format:json_format" in instruction_id:
+        return "validate_json_format"
+    elif "combination:repeat_prompt" in instruction_id:
+        return "validate_repeat_prompt"
+    elif "combination:two_responses" in instruction_id:
+        return "validate_two_responses"
+    elif "change_case:english_capital" in instruction_id:
+        return "validate_uppercase"
+    elif "change_case:english_lowercase" in instruction_id:
+        return "validate_lowercase"
+    elif "detectable_format:number_highlighted_sections" in instruction_id:
+        return "validate_highlighted_sections"
+    elif "detectable_content:number_placeholders" in instruction_id:
+        return "validate_placeholders"
+    elif "startswith:quotation" in instruction_id:
+        return "validate_quotation"
+    elif "punctuation:no_comma" in instruction_id:
+        return "validate_no_commas"
+    else:
+        # Return None if no mapping found
+        return None
+
+
+def _preprocess_response_loose(response: str) -> str:
+    """Preprocess response for loose accuracy evaluation."""
     lines = response.split("\n")
 
     # Remove first and last lines if response has more than 2 lines
@@ -213,185 +524,3 @@ def _preprocess_response_loose(response: str) -> str:
     response = re.sub(r"_(.+?)_", r"\1", response)  # Italic
 
     return response
-
-
-def _check_instruction_builtin(instruction_id: str, response: str, kwargs: dict) -> bool:
-    """Check if response follows instruction using built-in verifiers.
-
-    Supports common IFEval instruction types:
-    - keywords: Mention specific keywords
-    - forbidden_words: Avoid forbidden words
-    - length_constraints: Number of words/sentences/paragraphs
-    - startswith/endswith: Response starts/ends with specific content
-    - number_paragraphs: Number of paragraphs
-    - number_sentences: Number of sentences
-    - etc.
-    """
-    # Forbidden words (check before keywords to avoid matching "keywords:forbidden_words")
-    if "forbidden_words" in instruction_id:
-        forbidden_words = kwargs.get("forbidden_words", [])
-        for word in forbidden_words:
-            if word.lower() in response.lower():
-                return False
-        return True
-
-    # Keyword constraints
-    elif "keywords:" in instruction_id:
-        keywords = kwargs.get("keywords", [])
-        relation = kwargs.get("relation", "at least")
-        frequency = kwargs.get("frequency", 1)
-
-        for keyword in keywords:
-            count = response.lower().count(keyword.lower())
-            if relation == "at least" and count < frequency:
-                return False
-            elif relation == "at most" and count > frequency:
-                return False
-
-        return True
-
-    # Length constraints: number of words
-    elif "length_constraints:number_words" in instruction_id:
-        relation = kwargs.get("relation", "at least")
-        num_words = kwargs.get("num_words", 0)
-        word_count = len(response.split())
-
-        if relation == "at least":
-            return word_count >= num_words
-        elif relation == "at most":
-            return word_count <= num_words
-        elif relation == "less than":
-            return word_count < num_words
-        elif relation == "more than":
-            return word_count > num_words
-        else:
-            return word_count == num_words
-
-    # Number of paragraphs
-    elif "number_paragraphs" in instruction_id or "num_paragraphs" in instruction_id:
-        num_paragraphs = kwargs.get("num_paragraphs", 0)
-        paragraphs = [p.strip() for p in response.split("\n\n") if p.strip()]
-        return len(paragraphs) == num_paragraphs
-
-    # Number of sentences
-    elif "number_sentences" in instruction_id or "num_sentences" in instruction_id:
-        relation = kwargs.get("relation", "at least")
-        num_sentences = kwargs.get("num_sentences", 0)
-
-        # Simple sentence splitting (can be improved)
-        sentences = re.split(r"[.!?]+", response)
-        sentences = [s.strip() for s in sentences if s.strip()]
-        sentence_count = len(sentences)
-
-        if relation == "at least":
-            return sentence_count >= num_sentences
-        elif relation == "at most":
-            return sentence_count <= num_sentences
-        elif relation == "less than":
-            return sentence_count < num_sentences
-        else:
-            return sentence_count == num_sentences
-
-    # Starts with
-    elif "startswith:" in instruction_id:
-        start_phrase = kwargs.get("start_phrase", "")
-        return response.strip().startswith(start_phrase)
-
-    # Ends with
-    elif "endswith:" in instruction_id:
-        end_phrase = kwargs.get("end_phrase", "")
-        return response.strip().endswith(end_phrase)
-
-    # Contains letter frequency
-    elif "letter_frequency" in instruction_id or "nth_letter_check" in instruction_id:
-        letter = kwargs.get("letter", "").lower()
-        frequency = kwargs.get("frequency", 0) or kwargs.get("let_frequency", 0)
-
-        if not letter:
-            return True
-
-        count = response.lower().count(letter)
-        return count >= frequency
-
-    # Change case (all lowercase or all uppercase)
-    elif "change_case:" in instruction_id:
-        case = kwargs.get("capital", "lower")
-        if case == "lower":
-            return response == response.lower()
-        elif case == "upper":
-            return response == response.upper()
-
-    # Detectable format (JSON, bullet list, title, etc.)
-    elif "detectable_format" in instruction_id:
-        format_type = instruction_id.split(":")[-1] if ":" in instruction_id else ""
-
-        if "json" in format_type.lower():
-            # Check if response is valid JSON
-            try:
-                import json
-
-                json.loads(response)
-                return True
-            except:
-                return False
-
-        elif "bullet_list" in format_type.lower() or "number_bullet_lists" in instruction_id:
-            # Check for bullet points
-            num_bullets = kwargs.get("num_bullets", 0)
-            bullet_patterns = [r"^\s*[-*•]", r"^\s*\d+\."]
-            lines = response.split("\n")
-            bullet_count = sum(1 for line in lines if any(re.match(p, line) for p in bullet_patterns))
-            return bullet_count >= num_bullets
-
-        elif "title" in format_type.lower():
-            # Check if response has a title (first line is different/capitalized)
-            lines = [line.strip() for line in response.split("\n") if line.strip()]
-            return len(lines) > 0 and (lines[0].isupper() or lines[0].istitle())
-
-    # Number of highlighted sections (bold, italic, etc.)
-    elif "number_highlighted_sections" in instruction_id or "highlighted_section" in instruction_id:
-        num_highlights = kwargs.get("num_highlights", 0)
-        # Count markdown bold/italic sections
-        bold_count = len(re.findall(r"\*\*(.+?)\*\*", response))
-        italic_count = len(re.findall(r"\*(.+?)\*", response))
-        total_highlights = bold_count + italic_count
-        return total_highlights >= num_highlights
-
-    # Placeholder constraint (use specific placeholder format)
-    elif "detectable_content:number_placeholders" in instruction_id:
-        num_placeholders = kwargs.get("num_placeholders", 0)
-        # Check for square bracket placeholders
-        placeholders = re.findall(r"\[.+?\]", response)
-        return len(placeholders) >= num_placeholders
-
-    # Postscript marker
-    elif "postscript" in instruction_id:
-        postscript_marker = kwargs.get("postscript_marker", "P.S.")
-        return postscript_marker in response
-
-    # Quotation
-    elif "quotation" in instruction_id:
-        # Check for quoted text (regular quotes and smart quotes)
-        return '"' in response or "'" in response or '\u201c' in response or '\u2018' in response
-
-    # Number of sections
-    elif "detectable_format:multiple_sections" in instruction_id:
-        section_splitter = kwargs.get("section_splitter", "Section")
-        num_sections = kwargs.get("num_sections", 0)
-        sections = response.split(section_splitter)
-        return len(sections) >= num_sections + 1  # +1 because split creates n+1 parts for n separators
-
-    # Repeat prompt
-    elif "repeat_prompt" in instruction_id or "combination:repeat_prompt" in instruction_id:
-        prompt = kwargs.get("prompt_to_repeat", "")
-        return prompt.lower() in response.lower()
-
-    # Two responses (responses separated by specific markers)
-    elif "two_responses" in instruction_id or "combination:two_responses" in instruction_id:
-        # Check for multiple response markers like "Response 1:", "Response 2:"
-        markers = ["Response 1", "Response 2", "***", "---"]
-        return any(marker in response for marker in markers)
-
-    # Default: if instruction type is unknown, return True to avoid penalizing
-    # In production, you may want to return False or log a warning
-    return True
