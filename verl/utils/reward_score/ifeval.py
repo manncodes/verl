@@ -73,8 +73,11 @@ def _compute_score_with_library(
     """Compute score using the official ifeval library."""
     from instruction_following_eval import instructions_registry
 
+    # IMPORTANT: Remove thinking section first (before any other processing)
+    # This ensures that reasoning model think tags don't affect instruction checks
+    response = _remove_thinking_section(solution_str)
+
     # Preprocess response for loose accuracy
-    response = solution_str
     if not strict:
         response = _preprocess_response_loose(response)
 
@@ -118,8 +121,11 @@ def _compute_score_with_ifeval_g(
     solution_str: str, ground_truth: dict | list, extra_info: dict[str, Any] | None, strict: bool
 ) -> dict[str, Any]:
     """Compute score using IFEvalG from ifeval_util (open-instruct implementation)."""
+    # IMPORTANT: Remove thinking section first (before any other processing)
+    # This ensures that reasoning model think tags don't affect instruction checks
+    response = _remove_thinking_section(solution_str)
+
     # Preprocess response for loose accuracy
-    response = solution_str
     if not strict:
         response = _preprocess_response_loose(response)
 
@@ -168,6 +174,40 @@ def _compute_score_with_ifeval_g(
         "num_instructions": num_instructions,
         "num_followed": num_followed,
     }
+
+
+def _remove_thinking_section(prediction: str) -> str:
+    """Remove thinking section from prediction.
+
+    This is critical for evaluating reasoning models that output their thinking process
+    before the final answer. The thinking section should not be considered when checking
+    instructions like word count, forbidden words, commas, etc.
+
+    Based on open-instruct implementation.
+
+    Args:
+        prediction: The raw model output which may contain think tags
+
+    Returns:
+        The prediction with thinking section, answer tags, and assistant prefix removed
+
+    Examples:
+        >>> _remove_thinking_section("<think>Reasoning here</think>Final answer")
+        'Final answer'
+        >>> _remove_thinking_section("<|assistant|><think>Think</think><answer>Answer</answer>")
+        'Answer'
+    """
+    # Remove assistant prefix (common in chat models)
+    prediction = prediction.replace("<|assistant|>", "").strip()
+
+    # Remove thinking section (everything before and including </think>)
+    if "</think>" in prediction:
+        prediction = prediction.split("</think>")[-1]
+
+    # Remove answer tags (some models wrap final answer in these)
+    prediction = prediction.replace("<answer>", "").replace("</answer>", "")
+
+    return prediction.strip()
 
 
 def _extract_instruction_data(ground_truth: dict | list, extra_info: dict[str, Any] | None):
