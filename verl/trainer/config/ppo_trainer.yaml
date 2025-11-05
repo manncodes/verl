@@ -113,6 +113,21 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # Filter groups configuration (used in DAPO, GRPO, GSPO, etc.)
+  filter_groups:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.trainer.config.FilterGroupsConfig
+
+    # Whether to enable filter groups
+    enable: False
+
+    # Metric to use for filtering: "acc", "score", "seq_reward", "seq_final_reward", etc.
+    metric: null
+
+    # Non-positive values mean no upper limit
+    max_num_gen_batches: 0
+
 # config for the trainer
 trainer:
 
