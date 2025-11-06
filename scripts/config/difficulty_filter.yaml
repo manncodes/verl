@@ -1,0 +1,42 @@
+# Configuration for difficulty filtering script
+
+# Model configuration
+model:
+  path: ???  # Required: Path to model checkpoint
+  use_shm: false
+
+# Data configuration
+data:
+  path: ???  # Required: Path to parquet data file
+  batch_size: 4
+  prompt_key: prompt
+  max_prompt_length: 1024
+  truncation: right
+  trust_remote_code: false
+  reward_fn_key: reward_model  # Key in data that contains reward model info
+
+# Generation configuration
+generation:
+  max_new_tokens: 512
+  temperature: 0.7
+  top_p: 0.9
+  do_sample: true
+
+# Reward model configuration
+reward_model:
+  enable: false  # Set to true if using model-based RM
+  reward_manager: naive  # Options: naive, batch, prime, dapo
+  reward_kwargs: {}
+
+# Output configuration
+output_dir: ./difficulty_results
+num_samples: 5  # Number of samples to generate per problem
+bucketing_strategy: percentile  # Options: percentile, pass_rate, mean_reward, adaptive
+
+# Ray configuration (optional)
+ray_kwargs:
+  ray_init:
+    num_cpus: null
+    runtime_env:
+      env_vars:
+        TOKENIZERS_PARALLELISM: "false"
