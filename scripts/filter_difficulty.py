@@ -28,10 +28,8 @@ from os import environ, getenv
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
-import hydra
 import numpy as np
 import pandas as pd
-import ray
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 from openai import OpenAI, InternalServerError, RateLimitError
@@ -47,6 +45,7 @@ from verl.utils import hf_tokenizer, hf_processor
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.trainer.ppo.metric_utils import process_validation_metrics
 
+# Note: hydra and ray are imported conditionally based on usage mode
 log = logging.getLogger(__name__)
 
 
@@ -233,8 +232,14 @@ class DifficultyFilter:
 
         # Initialize Ray only if not using VLLM
         use_vllm = config.get("use_vllm", False)
-        if not use_vllm and not ray.is_initialized():
-            ray.init(**OmegaConf.to_container(config.get("ray_kwargs", {}).get("ray_init", {})))
+        if not use_vllm:
+            try:
+                import ray
+                if not ray.is_initialized():
+                    ray.init(**OmegaConf.to_container(config.get("ray_kwargs", {}).get("ray_init", {})))
+            except ImportError:
+                print("Warning: ray not installed. Only VLLM mode is available.")
+                print("Install ray with: pip install ray")
 
         # Load dataset using verl's RLHFDataset
         print(f"Loading data from {config.data.path}...")
@@ -628,9 +633,110 @@ class DifficultyFilter:
                   f"pass_rate={stats['mean_pass_rate']:.1f}%)")
 
 
-@hydra.main(config_path="config", config_name="difficulty_filter", version_base=None)
-def main(config: DictConfig):
-    """Main entry point using Hydra configuration."""
+def create_default_config(args: argparse.Namespace) -> DictConfig:
+    """Create OmegaConf configuration from argparse arguments."""
+    config_dict = {
+        "model": {
+            "path": args.model_path,
+            "use_shm": args.use_shm,
+        },
+        "use_vllm": args.use_vllm,
+        "vllm": {
+            "base_url": args.vllm_base_url,
+            "model_name": args.vllm_model_name,
+        },
+        "data": {
+            "path": args.data_path,
+            "batch_size": args.batch_size,
+            "prompt_key": "prompt",
+            "max_prompt_length": args.max_prompt_length,
+            "truncation": "right",
+            "trust_remote_code": args.trust_remote_code,
+            "reward_fn_key": "reward_model",
+        },
+        "generation": {
+            "max_new_tokens": args.max_new_tokens,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "do_sample": args.do_sample,
+        },
+        "reward_model": {
+            "enable": False,
+            "reward_manager": "naive",
+            "reward_kwargs": {},
+        },
+        "output_dir": args.output_dir,
+        "num_samples": args.num_samples,
+        "bucketing_strategy": args.bucketing_strategy,
+        "ray_kwargs": {
+            "ray_init": {
+                "num_cpus": None,
+                "runtime_env": {
+                    "env_vars": {
+                        "TOKENIZERS_PARALLELISM": "false"
+                    }
+                }
+            }
+        }
+    }
+    return OmegaConf.create(config_dict)
+
+
+def parse_args():
+    """Parse command-line arguments for standalone mode."""
+    parser = argparse.ArgumentParser(
+        description="Filter and bucket training problems by difficulty",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    # Model arguments
+    parser.add_argument("--model_path", type=str, required=True,
+                       help="Path to the model")
+    parser.add_argument("--use_shm", action="store_true",
+                       help="Use shared memory for model loading")
+
+    # Generation mode
+    parser.add_argument("--use_vllm", action="store_true",
+                       help="Use VLLM client for generation")
+    parser.add_argument("--vllm_base_url", type=str, default="http://localhost:8000/v1",
+                       help="VLLM server base URL")
+    parser.add_argument("--vllm_model_name", type=str, default=None,
+                       help="VLLM model name (defaults to model_path)")
+
+    # Data arguments
+    parser.add_argument("--data_path", type=str, required=True,
+                       help="Path to the dataset (parquet format)")
+    parser.add_argument("--batch_size", type=int, default=4,
+                       help="Batch size for processing")
+    parser.add_argument("--max_prompt_length", type=int, default=1024,
+                       help="Maximum prompt length")
+    parser.add_argument("--trust_remote_code", action="store_true",
+                       help="Trust remote code in model")
+
+    # Generation arguments
+    parser.add_argument("--max_new_tokens", type=int, default=512,
+                       help="Maximum new tokens to generate")
+    parser.add_argument("--temperature", type=float, default=0.7,
+                       help="Sampling temperature")
+    parser.add_argument("--top_p", type=float, default=0.9,
+                       help="Nucleus sampling parameter")
+    parser.add_argument("--do_sample", action="store_true", default=True,
+                       help="Use sampling for generation")
+
+    # Output arguments
+    parser.add_argument("--output_dir", type=str, default="./difficulty_results",
+                       help="Directory to save results")
+    parser.add_argument("--num_samples", type=int, default=5,
+                       help="Number of samples per problem for mean@k")
+    parser.add_argument("--bucketing_strategy", type=str, default="percentile",
+                       choices=["percentile", "pass_rate", "mean_reward", "adaptive"],
+                       help="Strategy for bucketing problems")
+
+    return parser.parse_args()
+
+
+def run_difficulty_filter(config: DictConfig):
+    """Run the difficulty filtering process."""
     print("Configuration:")
     print(OmegaConf.to_yaml(config))
 
@@ -665,6 +771,58 @@ def main(config: DictConfig):
     print("\n" + "="*80)
     print("DONE!")
     print("="*80)
+
+
+def main_hydra(config: DictConfig):
+    """Main entry point using Hydra configuration."""
+    run_difficulty_filter(config)
+
+
+def main_standalone():
+    """Main entry point for standalone mode (without Hydra config files)."""
+    args = parse_args()
+    config = create_default_config(args)
+    run_difficulty_filter(config)
+
+
+def main():
+    """Main entry point - detects Hydra usage or falls back to argparse."""
+    import sys
+
+    # Check if user is trying to use Hydra (has = in arguments or --config-name)
+    using_hydra = any('=' in arg or arg.startswith('--config') for arg in sys.argv[1:])
+
+    # Check if config directory exists
+    config_dir_exists = os.path.exists(os.path.join(os.path.dirname(__file__), "config"))
+
+    if using_hydra and config_dir_exists:
+        # Use Hydra mode
+        print("Running in Hydra mode (with config files)")
+
+        try:
+            import hydra
+
+            # Create a Hydra-wrapped version of main
+            @hydra.main(config_path="config", config_name="difficulty_filter", version_base=None)
+            def hydra_main(config: DictConfig):
+                main_hydra(config)
+
+            hydra_main()
+        except ImportError:
+            print("Error: hydra-core is not installed but Hydra syntax was detected.")
+            print("Install with: pip install hydra-core")
+            print("Or use standalone mode: python filter_difficulty.py --help")
+            sys.exit(1)
+    else:
+        # Use standalone argparse mode
+        if using_hydra and not config_dir_exists:
+            print("Warning: Hydra syntax detected but config directory not found.")
+            print("Falling back to standalone argparse mode.")
+            print("Usage: python filter_difficulty.py --model_path <path> --data_path <path>")
+            sys.exit(1)
+
+        print("Running in standalone mode (no config files required)")
+        main_standalone()
 
 
 if __name__ == "__main__":

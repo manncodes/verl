@@ -7,6 +7,33 @@ This script helps filter and bucket training problems based on their difficulty 
 4. Computing mean@k metrics
 5. Bucketing problems by difficulty using various strategies
 
+## 🚀 Quick Start (Standalone Mode)
+
+**No config files required!** Just use command-line arguments:
+
+```bash
+# Basic usage with HuggingFace model
+python scripts/filter_difficulty.py \
+    --model_path meta-llama/Llama-3.1-8B-Instruct \
+    --data_path /path/to/data.parquet \
+    --output_dir ./results \
+    --num_samples 5
+
+# Using VLLM server (much faster!)
+python scripts/filter_difficulty.py \
+    --model_path meta-llama/Llama-3.1-8B-Instruct \
+    --data_path /path/to/data.parquet \
+    --use_vllm \
+    --vllm_base_url http://localhost:8000/v1 \
+    --output_dir ./results \
+    --num_samples 10
+
+# Show all options
+python scripts/filter_difficulty.py --help
+```
+
+**No Hydra or config files needed!** The script works standalone out of the box.
+
 ## Key Features
 
 ### Built on verl's Infrastructure
@@ -18,6 +45,18 @@ This script **reuses the same code** from verl's PPO trainer:
 - **`dump_generations()`**: Same generation dumping pattern as validation
 
 This ensures **consistency** between difficulty filtering and actual training.
+
+### Two Usage Modes
+
+1. **Standalone Mode (Recommended for simplicity)**
+   - No config files required
+   - Simple command-line arguments
+   - Works immediately without setup
+
+2. **Hydra Mode (Recommended for complex configs)**
+   - Use YAML config files
+   - Override with command-line
+   - Better for experiments
 
 ### Difficulty Metrics Calculated
 
