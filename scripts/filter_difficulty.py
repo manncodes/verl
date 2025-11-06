@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import asyncio
 import json
 import logging
 import os
@@ -32,7 +33,7 @@ import numpy as np
 import pandas as pd
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
-from openai import OpenAI, InternalServerError, RateLimitError
+from openai import OpenAI, AsyncOpenAI, InternalServerError, RateLimitError
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -70,7 +71,7 @@ class GenerationClient(ABC):
 
 
 class VllmClient(GenerationClient):
-    """VLLM client for generation using OpenAI-compatible API."""
+    """VLLM client for generation using OpenAI-compatible API with async support."""
 
     def __init__(self, config: DictConfig, tokenizer, max_tokens: int = 8192) -> None:
         # Remove proxy environment variables for client connection
@@ -82,33 +83,69 @@ class VllmClient(GenerationClient):
         super().__init__(config, tokenizer, max_tokens)
         self.base_url = config.vllm.base_url
         self.model_name = config.vllm.get("model_name", config.model.path)
-        self.client = OpenAI(api_key="EMPTY", base_url=self.base_url)
-        log.info(f"Initialized VLLM client with base_url: {self.base_url}")
+        self.async_client = AsyncOpenAI(api_key="EMPTY", base_url=self.base_url)
+        self.max_concurrent = config.vllm.get("max_concurrent", 100)  # Max concurrent requests
+        log.info(f"Initialized async VLLM client with base_url: {self.base_url}, max_concurrent: {self.max_concurrent}")
+
+    async def _generate_single(self, prompt: str, temperature: float, top_p: float, max_tokens: int) -> str:
+        """Generate a single response asynchronously."""
+        messages = [{"role": "user", "content": prompt}]
+
+        try:
+            completion = await self.async_client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+            )
+            return completion.choices[0].message.content
+        except Exception as e:
+            log.error(f"Error generating with VLLM: {e}")
+            return ""  # Return empty string on error
+
+    async def _generate_batch_async(self, prompts: List[str], temperature: float, top_p: float, max_tokens: int) -> List[str]:
+        """Generate responses for all prompts concurrently with semaphore control."""
+        semaphore = asyncio.Semaphore(self.max_concurrent)
+
+        async def generate_with_semaphore(prompt: str) -> str:
+            async with semaphore:
+                return await self._generate_single(prompt, temperature, top_p, max_tokens)
+
+        # Create all tasks and gather results
+        tasks = [generate_with_semaphore(prompt) for prompt in prompts]
+        responses = await asyncio.gather(*tasks)
+        return list(responses)
 
     def generate_batch(self, prompts: List[str], **kwargs) -> List[str]:
-        """Generate responses for a batch of prompts using VLLM."""
+        """Generate responses for a batch of prompts using VLLM (async internally)."""
         temperature = kwargs.get("temperature", 0.7)
         top_p = kwargs.get("top_p", 0.9)
         max_tokens = kwargs.get("max_tokens", self.max_tokens)
 
-        responses = []
-        for prompt in prompts:
-            # Convert prompt to chat format
-            messages = [{"role": "user", "content": prompt}]
-
-            try:
-                completion = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
+        # Run async generation in event loop
+        try:
+            # Try to get existing event loop
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If loop is already running, create a new one in a thread
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        asyncio.run,
+                        self._generate_batch_async(prompts, temperature, top_p, max_tokens)
+                    )
+                    responses = future.result()
+            else:
+                # Run in existing loop
+                responses = loop.run_until_complete(
+                    self._generate_batch_async(prompts, temperature, top_p, max_tokens)
                 )
-                response = completion.choices[0].message.content
-                responses.append(response)
-            except Exception as e:
-                log.error(f"Error generating with VLLM: {e}")
-                responses.append("")  # Return empty string on error
+        except RuntimeError:
+            # No event loop exists, create new one
+            responses = asyncio.run(
+                self._generate_batch_async(prompts, temperature, top_p, max_tokens)
+            )
 
         return responses
 
@@ -654,6 +691,7 @@ def create_default_config(args: argparse.Namespace) -> DictConfig:
         "vllm": {
             "base_url": args.vllm_base_url,
             "model_name": args.vllm_model_name,
+            "max_concurrent": args.vllm_max_concurrent,
         },
         "data": {
             "path": args.data_path,
@@ -712,6 +750,8 @@ def parse_args():
                        help="VLLM server base URL")
     parser.add_argument("--vllm_model_name", type=str, default=None,
                        help="VLLM model name (defaults to model_path)")
+    parser.add_argument("--vllm_max_concurrent", type=int, default=100,
+                       help="Max concurrent async requests to VLLM")
 
     # Data arguments
     parser.add_argument("--data_path", type=str, required=True,

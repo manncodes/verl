@@ -12,6 +12,7 @@ use_vllm: false  # Set to true to use VLLM server for generation
 vllm:
   base_url: http://localhost:8000/v1  # VLLM server base URL
   model_name: null  # Optional: override model name for VLLM
+  max_concurrent: 100  # Max concurrent async requests to VLLM
 
 # Data configuration
 data:

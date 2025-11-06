@@ -12,6 +12,7 @@ use_vllm: true
 vllm:
   base_url: http://localhost:8000/v1  # Your VLLM server URL
   model_name: meta-llama/Llama-3.1-8B-Instruct  # Model name on VLLM server
+  max_concurrent: 100  # Max concurrent async requests (adjust based on VLLM capacity)
 
 # Data configuration
 data:
