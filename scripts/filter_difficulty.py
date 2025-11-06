@@ -44,6 +44,8 @@ from verl.utils.fs import copy_to_local
 from verl.utils import hf_tokenizer, hf_processor
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.trainer.ppo.metric_utils import process_validation_metrics
+from verl.utils.reward_score import default_compute_score
+from verl.workers.reward_manager.naive import NaiveRewardManager
 
 # Note: hydra and ray are imported conditionally based on usage mode
 log = logging.getLogger(__name__)
@@ -225,10 +227,16 @@ class DifficultyFilter:
         self.tokenizer = hf_tokenizer(model_path, trust_remote_code=trust_remote_code)
         self.processor = hf_processor(model_path, trust_remote_code=trust_remote_code, use_fast=True)
 
-        # Load reward manager using verl's infrastructure
-        self.reward_fn = load_reward_manager(
-            config, self.tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
+        # Initialize reward manager directly (simpler for standalone mode)
+        # Use NaiveRewardManager with default_compute_score function
+        reward_fn_key = config.data.get("reward_fn_key", "reward_model")
+        self.reward_fn = NaiveRewardManager(
+            tokenizer=self.tokenizer,
+            num_examine=1,
+            compute_score=default_compute_score,
+            reward_fn_key=reward_fn_key,
         )
+        print(f"Initialized NaiveRewardManager with reward_fn_key: {reward_fn_key}")
 
         # Initialize Ray only if not using VLLM
         use_vllm = config.get("use_vllm", False)
