@@ -1,0 +1,42 @@
+# Example configuration for using VLLM server
+
+# Model configuration
+model:
+  path: meta-llama/Llama-3.1-8B-Instruct  # Model path (used for tokenizer)
+  use_shm: false
+
+# Enable VLLM mode
+use_vllm: true
+
+# VLLM server configuration
+vllm:
+  base_url: http://localhost:8000/v1  # Your VLLM server URL
+  model_name: meta-llama/Llama-3.1-8B-Instruct  # Model name on VLLM server
+
+# Data configuration
+data:
+  path: /path/to/your/data.parquet
+  batch_size: 8  # Can be larger with VLLM
+  prompt_key: prompt
+  max_prompt_length: 1024
+  truncation: right
+  trust_remote_code: false
+  reward_fn_key: reward_model
+
+# Generation configuration
+generation:
+  max_new_tokens: 1024
+  temperature: 0.8
+  top_p: 0.95
+  do_sample: true
+
+# Reward model configuration
+reward_model:
+  enable: false
+  reward_manager: naive
+  reward_kwargs: {}
+
+# Output configuration
+output_dir: ./difficulty_results_vllm
+num_samples: 10  # More samples with faster VLLM
+bucketing_strategy: percentile

@@ -8,19 +8,23 @@ based on difficulty using various strategies.
 
 Usage:
     python scripts/filter_difficulty.py \
-        --model_path <path_to_model> \
-        --data_path <path_to_parquet> \
-        --output_dir <output_directory> \
-        --num_samples 5 \
-        --bucketing_strategy percentile
+        model.path=<path_to_model> \
+        data.path=<path_to_parquet> \
+        output_dir=<output_directory> \
+        num_samples=5 \
+        bucketing_strategy=percentile
 """
 
 import argparse
 import json
+import logging
 import os
+import time
 import uuid
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
+from os import environ, getenv
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
@@ -30,7 +34,9 @@ import pandas as pd
 import ray
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
+from openai import OpenAI, InternalServerError, RateLimitError
 from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # Import verl components
 from verl import DataProto
@@ -40,6 +46,140 @@ from verl.utils.fs import copy_to_local
 from verl.utils import hf_tokenizer, hf_processor
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.trainer.ppo.metric_utils import process_validation_metrics
+
+log = logging.getLogger(__name__)
+
+
+# ============================================================================
+# VLLM Client Classes
+# ============================================================================
+
+class GenerationClient(ABC):
+    """Abstract base class for generation clients."""
+
+    def __init__(self, config: DictConfig, tokenizer, max_tokens: int = 8192) -> None:
+        self.config = config
+        self.tokenizer = tokenizer
+        self.max_tokens = max_tokens
+
+    @abstractmethod
+    def generate_batch(self, prompts: List[str], **kwargs) -> List[str]:
+        """Generate responses for a batch of prompts."""
+        pass
+
+
+class VllmClient(GenerationClient):
+    """VLLM client for generation using OpenAI-compatible API."""
+
+    def __init__(self, config: DictConfig, tokenizer, max_tokens: int = 8192) -> None:
+        # Remove proxy environment variables for client connection
+        for env_variable in ["https_proxy", "http_proxy", "HTTPS_PROXY", "HTTP_PROXY"]:
+            if getenv(env_variable):
+                del environ[env_variable]
+                log.info(f"Environment variable {env_variable} deleted - necessary for client connection")
+
+        super().__init__(config, tokenizer, max_tokens)
+        self.base_url = config.vllm.base_url
+        self.model_name = config.vllm.get("model_name", config.model.path)
+        self.client = OpenAI(api_key="EMPTY", base_url=self.base_url)
+        log.info(f"Initialized VLLM client with base_url: {self.base_url}")
+
+    def generate_batch(self, prompts: List[str], **kwargs) -> List[str]:
+        """Generate responses for a batch of prompts using VLLM."""
+        temperature = kwargs.get("temperature", 0.7)
+        top_p = kwargs.get("top_p", 0.9)
+        max_tokens = kwargs.get("max_tokens", self.max_tokens)
+
+        responses = []
+        for prompt in prompts:
+            # Convert prompt to chat format
+            messages = [{"role": "user", "content": prompt}]
+
+            try:
+                completion = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+                response = completion.choices[0].message.content
+                responses.append(response)
+            except Exception as e:
+                log.error(f"Error generating with VLLM: {e}")
+                responses.append("")  # Return empty string on error
+
+        return responses
+
+
+class HuggingFaceClient(GenerationClient):
+    """HuggingFace transformers client for generation."""
+
+    def __init__(self, config: DictConfig, tokenizer, max_tokens: int = 8192) -> None:
+        super().__init__(config, tokenizer, max_tokens)
+
+        model_path = copy_to_local(config.model.path, use_shm=config.model.get("use_shm", False))
+        log.info(f"Loading HuggingFace model from {model_path}...")
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            device_map="auto" if device == "cuda" else None,
+        )
+        if device != "cuda":
+            self.model = self.model.to(device)
+        self.model.eval()
+        self.device = device
+        log.info(f"HuggingFace model loaded on device: {device}")
+
+    def generate_batch(self, prompts: List[str], **kwargs) -> List[str]:
+        """Generate responses for a batch of prompts using HuggingFace."""
+        temperature = kwargs.get("temperature", 0.7)
+        top_p = kwargs.get("top_p", 0.9)
+        max_tokens = kwargs.get("max_tokens", self.max_tokens)
+        do_sample = kwargs.get("do_sample", True)
+
+        # Tokenize prompts
+        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        # Generate
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=do_sample,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+
+        # Decode responses (remove prompt)
+        prompt_length = inputs['input_ids'].shape[1]
+        responses = []
+        for output in outputs:
+            response = self.tokenizer.decode(output[prompt_length:], skip_special_tokens=True)
+            responses.append(response)
+
+        return responses
+
+
+class ClientFactory:
+    """Factory for creating generation clients."""
+
+    @staticmethod
+    def create_client(config: DictConfig, tokenizer, max_tokens: int = 8192) -> GenerationClient:
+        """Create a generation client based on configuration."""
+        use_vllm = config.get("use_vllm", False)
+
+        if use_vllm:
+            log.info("Using VLLM client for generation")
+            return VllmClient(config, tokenizer, max_tokens)
+        else:
+            log.info("Using HuggingFace client for generation")
+            return HuggingFaceClient(config, tokenizer, max_tokens)
 
 
 @dataclass
@@ -91,8 +231,9 @@ class DifficultyFilter:
             config, self.tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
         )
 
-        # Initialize Ray for parallel generation if using actor workers
-        if not ray.is_initialized():
+        # Initialize Ray only if not using VLLM
+        use_vllm = config.get("use_vllm", False)
+        if not use_vllm and not ray.is_initialized():
             ray.init(**OmegaConf.to_container(config.get("ray_kwargs", {}).get("ray_init", {})))
 
         # Load dataset using verl's RLHFDataset
@@ -114,74 +255,55 @@ class DifficultyFilter:
             num_workers=0,  # For simplicity in offline mode
         )
 
-        # Initialize actor/rollout for generation if config provided
-        self.actor_worker = None
-        if hasattr(config, 'actor_rollout_ref'):
-            self._init_actor_worker()
+        # Initialize generation client (VLLM or HuggingFace)
+        max_tokens = config.generation.get("max_new_tokens", 512)
+        self.generation_client = ClientFactory.create_client(config, self.tokenizer, max_tokens)
+        print(f"Initialized generation client: {type(self.generation_client).__name__}")
 
-    def _init_actor_worker(self):
-        """Initialize actor worker for generation (optional, can use HF generate instead)."""
-        # For simplicity, we'll use HuggingFace generation in this script
-        # If you want to use verl's rollout workers, implement similar to ray_trainer.py
-        from transformers import AutoModelForCausalLM
-
-        model_path = copy_to_local(self.config.model.path, use_shm=self.config.model.get("use_shm", False))
-        print(f"Loading model from {model_path}...")
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-            device_map="auto" if device == "cuda" else None,
-        )
-        if device != "cuda":
-            self.model = self.model.to(device)
-        self.model.eval()
-        self.device = device
-
-    def generate_responses(self, data_batch: DataProto, num_samples: int = 1) -> List[DataProto]:
+    def generate_responses(self, data_batch: DataProto, num_samples: int = 1) -> DataProto:
         """
-        Generate multiple responses for a batch using verl-style generation.
+        Generate multiple responses for a batch using generation client.
 
         Args:
             data_batch: DataProto containing input prompts
             num_samples: Number of responses to generate per prompt
 
         Returns:
-            List of DataProto objects with generated responses
+            DataProto with generated responses
         """
         # Repeat the batch for multiple samples
         repeated_batch = data_batch.repeat(repeat_times=num_samples, interleave=True)
 
+        # Decode input_ids to text prompts
         input_ids = repeated_batch.batch["input_ids"]
-        attention_mask = repeated_batch.batch["attention_mask"]
+        prompts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
 
-        # Move to device
-        input_ids = input_ids.to(self.device)
-        attention_mask = attention_mask.to(self.device)
-
-        # Generate responses
+        # Generate responses using client
         gen_config = self.config.generation
-        with torch.no_grad():
-            outputs = self.model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=gen_config.get("max_new_tokens", 512),
-                temperature=gen_config.get("temperature", 0.7),
-                top_p=gen_config.get("top_p", 0.9),
-                do_sample=gen_config.get("do_sample", True),
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                num_return_sequences=1,
-            )
+        gen_kwargs = {
+            "temperature": gen_config.get("temperature", 0.7),
+            "top_p": gen_config.get("top_p", 0.9),
+            "max_tokens": gen_config.get("max_new_tokens", 512),
+            "do_sample": gen_config.get("do_sample", True),
+        }
 
-        # Extract responses (remove prompt tokens)
-        prompt_length = input_ids.shape[1]
-        responses = outputs[:, prompt_length:]
+        response_texts = self.generation_client.generate_batch(prompts, **gen_kwargs)
 
-        # Create output DataProto
+        # Tokenize responses
+        response_encodings = self.tokenizer(
+            response_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=gen_config.get("max_new_tokens", 512),
+        )
+
+        responses = response_encodings["input_ids"]
+        response_mask = response_encodings["attention_mask"]
+
+        # Add responses to batch
         repeated_batch.batch["responses"] = responses
-        repeated_batch.batch["response_mask"] = (responses != self.tokenizer.pad_token_id).long()
+        repeated_batch.batch["response_mask"] = response_mask.long()
 
         return repeated_batch
 

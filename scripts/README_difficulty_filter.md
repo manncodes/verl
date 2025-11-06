@@ -95,6 +95,66 @@ python scripts/filter_difficulty.py \
     --config-name=my_filter
 ```
 
+### Using VLLM Server (Recommended for Speed)
+
+For faster generation, use a VLLM server instead of loading the model locally:
+
+#### 1. Start VLLM Server
+
+```bash
+# Start VLLM server (in a separate terminal)
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --port 8000
+```
+
+#### 2. Configure for VLLM
+
+Create a VLLM config or use command-line overrides:
+
+```yaml
+# config/vllm_filter.yaml
+model:
+  path: meta-llama/Llama-3.1-8B-Instruct
+
+use_vllm: true  # Enable VLLM mode
+
+vllm:
+  base_url: http://localhost:8000/v1
+  model_name: meta-llama/Llama-3.1-8B-Instruct
+
+data:
+  path: /path/to/data.parquet
+  batch_size: 8  # Can be larger with VLLM
+
+output_dir: ./results
+num_samples: 10
+bucketing_strategy: percentile
+```
+
+#### 3. Run with VLLM
+
+```bash
+python scripts/filter_difficulty.py --config-name=vllm_filter
+```
+
+Or override from command line:
+
+```bash
+python scripts/filter_difficulty.py \
+    use_vllm=true \
+    vllm.base_url=http://localhost:8000/v1 \
+    model.path=meta-llama/Llama-3.1-8B-Instruct \
+    data.path=/path/to/data.parquet \
+    output_dir=./results
+```
+
+**Benefits of VLLM:**
+- 🚀 **Much faster generation** (optimized inference)
+- 💾 **Lower memory usage** (no model loaded in script)
+- 🔄 **No Ray spawning** (simpler process management)
+- 📊 **Higher throughput** (can process more samples)
+
 ### Command-line Override
 
 You can override any config value from the command line:

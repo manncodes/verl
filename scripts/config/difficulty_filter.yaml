@@ -5,6 +5,14 @@ model:
   path: ???  # Required: Path to model checkpoint
   use_shm: false
 
+# Generation mode: use_vllm = true for VLLM client, false for HuggingFace
+use_vllm: false  # Set to true to use VLLM server for generation
+
+# VLLM configuration (only used if use_vllm=true)
+vllm:
+  base_url: http://localhost:8000/v1  # VLLM server base URL
+  model_name: null  # Optional: override model name for VLLM
+
 # Data configuration
 data:
   path: ???  # Required: Path to parquet data file
@@ -33,7 +41,7 @@ output_dir: ./difficulty_results
 num_samples: 5  # Number of samples to generate per problem
 bucketing_strategy: percentile  # Options: percentile, pass_rate, mean_reward, adaptive
 
-# Ray configuration (optional)
+# Ray configuration (optional, not used when use_vllm=true)
 ray_kwargs:
   ray_init:
     num_cpus: null
