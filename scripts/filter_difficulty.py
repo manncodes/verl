@@ -314,7 +314,9 @@ class DifficultyFilter:
         responses = response_encodings["input_ids"]
         response_mask = response_encodings["attention_mask"]
 
-        # Add responses to batch
+        # Add responses and prompts to batch
+        # NaiveRewardManager expects "prompts" key (the original input)
+        repeated_batch.batch["prompts"] = input_ids  # Original input_ids
         repeated_batch.batch["responses"] = responses
         repeated_batch.batch["response_mask"] = response_mask.long()
 
