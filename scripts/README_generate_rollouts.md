@@ -129,6 +129,36 @@ python scripts/generate_rollouts.py --vllm_max_concurrent 200 ...
 - **With this optimization**: ~50 minutes
 - **Time saved**: You can go home early! 🎉
 
+## 🔥 Multi-VLLM Load Balancing
+
+**NEW**: Run multiple VLLM instances and load balance across them for even better throughput!
+
+Instead of 1 large VLLM instance:
+```bash
+# 1 instance with TP=8 (8 GPUs)
+python -m vllm.entrypoints.openai.api_server --tensor-parallel-size 8 --port 8000
+```
+
+Run multiple smaller instances:
+```bash
+# 4 instances with TP=2 each (8 GPUs total, but FASTER!)
+bash scripts/launch_multi_vllm.sh Qwen/Qwen2.5-7B-Instruct 4 2
+
+# Then generate with load balancing:
+python scripts/generate_rollouts.py \
+    --use_vllm \
+    --vllm_base_url "http://localhost:8000/v1,http://localhost:8001/v1,http://localhost:8002/v1,http://localhost:8003/v1" \
+    --vllm_max_concurrent 300 \
+    ...
+```
+
+**Benefits:**
+- 1.5-3x better throughput (less inter-GPU communication)
+- Better GPU utilization (4 independent queues)
+- Just comma-separate URLs - automatic round-robin load balancing!
+
+📖 See [Multi-VLLM Load Balancing Guide](README_multi_vllm.md) for full details.
+
 ## Usage
 
 ### Basic Example

@@ -34,25 +34,38 @@ log = logging.getLogger(__name__)
 
 
 class VLLMRolloutGenerator:
-    """Generate rollouts using VLLM server (async)."""
+    """Generate rollouts using VLLM server(s) with load balancing (async)."""
 
-    def __init__(self, base_url: str, model_name: str, tokenizer, max_concurrent: int = 100):
+    def __init__(self, base_urls: List[str], model_name: str, tokenizer, max_concurrent: int = 100):
         # Remove proxy vars
         for env_var in ["https_proxy", "http_proxy", "HTTPS_PROXY", "HTTP_PROXY"]:
             if getenv(env_var):
                 del environ[env_var]
 
-        self.base_url = base_url
+        # Support multiple VLLM endpoints for load balancing
+        if isinstance(base_urls, str):
+            base_urls = [base_urls]
+
+        self.base_urls = base_urls
         self.model_name = model_name
         self.tokenizer = tokenizer
-        self.client = AsyncOpenAI(api_key="EMPTY", base_url=base_url)
-        self.max_concurrent = max_concurrent
-        log.info(f"Initialized VLLM client: {base_url}, max_concurrent={max_concurrent}")
 
-    async def _generate_one(self, prompt: str, temperature: float, top_p: float, max_tokens: int) -> str:
-        """Generate one response."""
+        # Create a client for each endpoint
+        self.clients = [AsyncOpenAI(api_key="EMPTY", base_url=url) for url in base_urls]
+        self.num_clients = len(self.clients)
+        self.max_concurrent = max_concurrent
+
+        log.info(f"Initialized {self.num_clients} VLLM client(s):")
+        for i, url in enumerate(base_urls):
+            log.info(f"  [{i}] {url}")
+        log.info(f"Max concurrent requests (total): {max_concurrent}")
+        log.info(f"Load balancing: Round-robin across {self.num_clients} instance(s)")
+
+    async def _generate_one(self, prompt: str, temperature: float, top_p: float, max_tokens: int, client_idx: int = 0) -> str:
+        """Generate one response using specified client (for load balancing)."""
         try:
-            response = await self.client.chat.completions.create(
+            client = self.clients[client_idx % self.num_clients]
+            response = await client.chat.completions.create(
                 model=self.model_name,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=temperature,
@@ -61,19 +74,22 @@ class VLLMRolloutGenerator:
             )
             return response.choices[0].message.content
         except Exception as e:
-            log.error(f"Generation error: {e}")
+            log.error(f"Generation error on client {client_idx % self.num_clients}: {e}")
             return ""
 
     async def _generate_batch_async(self, prompts: List[str], temperature: float,
                                    top_p: float, max_tokens: int) -> List[str]:
-        """Generate all prompts concurrently."""
+        """Generate all prompts concurrently with load balancing across multiple VLLM instances."""
         semaphore = asyncio.Semaphore(self.max_concurrent)
 
-        async def generate_with_sem(prompt: str) -> str:
+        async def generate_with_sem(prompt: str, idx: int) -> str:
             async with semaphore:
-                return await self._generate_one(prompt, temperature, top_p, max_tokens)
+                # Round-robin load balancing: distribute requests across clients
+                client_idx = idx % self.num_clients
+                return await self._generate_one(prompt, temperature, top_p, max_tokens, client_idx)
 
-        tasks = [generate_with_sem(p) for p in prompts]
+        # Create tasks with index for load balancing
+        tasks = [generate_with_sem(p, i) for i, p in enumerate(prompts)]
         return await asyncio.gather(*tasks)
 
     def generate_batch(self, prompts: List[str], temperature: float = 0.7,
@@ -182,8 +198,14 @@ def generate_rollouts(args):
 
     # Initialize generator
     if args.use_vllm:
+        # Support multiple VLLM URLs (comma-separated)
+        if ',' in args.vllm_base_url:
+            base_urls = [url.strip() for url in args.vllm_base_url.split(',')]
+        else:
+            base_urls = [args.vllm_base_url]
+
         generator = VLLMRolloutGenerator(
-            base_url=args.vllm_base_url,
+            base_urls=base_urls,
             model_name=args.vllm_model_name or args.model_path,
             tokenizer=tokenizer,
             max_concurrent=args.vllm_max_concurrent,
@@ -299,11 +321,11 @@ def main():
     parser.add_argument("--use_vllm", action="store_true",
                        help="Use VLLM server for generation")
     parser.add_argument("--vllm_base_url", type=str, default="http://localhost:8000/v1",
-                       help="VLLM server URL")
+                       help="VLLM server URL(s) - comma-separated for multiple instances (load balancing)")
     parser.add_argument("--vllm_model_name", type=str, default=None,
                        help="Model name on VLLM server")
     parser.add_argument("--vllm_max_concurrent", type=int, default=100,
-                       help="Max concurrent requests to VLLM")
+                       help="Max concurrent requests to VLLM (total across all instances)")
 
     # Data args
     parser.add_argument("--data_path", type=str, required=True,

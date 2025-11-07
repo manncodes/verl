@@ -157,8 +157,25 @@ VLLM is 10-50x faster than HuggingFace for generation:
 vllm serve Qwen/Qwen2.5-7B-Instruct --port 8000
 
 # Then use --use_vllm flag
-python scripts/generate_rollouts.py --use_vllm --vllm_url http://localhost:8000/v1 ...
+python scripts/generate_rollouts.py --use_vllm --vllm_base_url http://localhost:8000/v1 ...
 ```
+
+### Multi-VLLM Load Balancing (Even Faster!)
+Run multiple VLLM instances and load balance across them for 1.5-3x better throughput:
+
+```bash
+# Launch 4 instances with TP=2 each (8 GPUs total)
+bash scripts/launch_multi_vllm.sh Qwen/Qwen2.5-7B-Instruct 4 2
+
+# Generate with load balancing (comma-separated URLs)
+python scripts/generate_rollouts.py \
+    --use_vllm \
+    --vllm_base_url "http://localhost:8000/v1,http://localhost:8001/v1,http://localhost:8002/v1,http://localhost:8003/v1" \
+    --vllm_max_concurrent 300 \
+    ...
+```
+
+📖 See [Multi-VLLM Guide](README_multi_vllm.md) for details.
 
 ### Async VLLM for Massive Speedup
 Use `--max_concurrent` to control concurrent requests:
