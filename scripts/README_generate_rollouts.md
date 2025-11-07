@@ -68,6 +68,67 @@ Handles different prompt formats:
 - Chat format (list of messages)
 - Any column name (specify with `--prompt_key`)
 
+## ⚡ Performance: Concurrent Generation
+
+**This script generates ALL samples concurrently for MAXIMUM SPEED!**
+
+### How It Works
+
+The script expands prompts and sends everything to VLLM at once:
+
+**Old approach (SLOW):**
+```python
+for prompt in prompts:          # Loop through each prompt
+    for sample in range(10):    # Loop through each sample
+        generate(prompt)        # Wait for response (SEQUENTIAL)
+```
+
+**New approach (FAST):**
+```python
+# Expand: [prompt1]*10 + [prompt2]*10 + ... = all prompts
+all_prompts = expand(prompts, num_samples)
+responses = generate_all(all_prompts)  # VLLM handles concurrency!
+```
+
+### Real Speedup Numbers
+
+**Example: 100 prompts × 10 samples = 1000 generations**
+
+| Approach | Time | Speed |
+|----------|------|-------|
+| Sequential (old) | 100 × 10 × 3 sec = **50 minutes** | 1x |
+| Concurrent (new) | 1000 / 100 concurrent × 3 sec = **30 seconds** | **100x faster** |
+
+The async VLLM client with semaphore control handles all concurrency automatically!
+
+### Tuning for Maximum Speed
+
+Control concurrency with `--vllm_max_concurrent`:
+
+```bash
+# Conservative (20 concurrent) - for small VLLM servers
+python scripts/generate_rollouts.py --vllm_max_concurrent 20 ...
+
+# Default (100 concurrent) - balanced, works for most setups
+python scripts/generate_rollouts.py --vllm_max_concurrent 100 ...
+
+# Aggressive (200+ concurrent) - for large VLLM clusters
+python scripts/generate_rollouts.py --vllm_max_concurrent 200 ...
+```
+
+**Rule of thumb:**
+- Higher `max_concurrent` = Faster generation
+- But also more VLLM memory usage
+- Start with 100, increase if VLLM has spare capacity
+
+### Why This Matters
+
+**Scenario**: You need rollouts for 10,000 problems with 10 samples each
+
+- **Without this optimization**: ~83 hours
+- **With this optimization**: ~50 minutes
+- **Time saved**: You can go home early! 🎉
+
 ## Usage
 
 ### Basic Example
