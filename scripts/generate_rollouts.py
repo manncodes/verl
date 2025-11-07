@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 class VLLMRolloutGenerator:
     """Generate rollouts using VLLM server(s) with load balancing (async)."""
 
-    def __init__(self, base_urls: List[str], model_name: str, tokenizer, max_concurrent: int = 100):
+    def __init__(self, base_urls: List[str], model_name: str, tokenizer, max_concurrent: int = 100, use_chat_api: bool = True):
         # Remove proxy vars
         for env_var in ["https_proxy", "http_proxy", "HTTPS_PROXY", "HTTP_PROXY"]:
             if getenv(env_var):
@@ -49,6 +49,7 @@ class VLLMRolloutGenerator:
         self.base_urls = base_urls
         self.model_name = model_name
         self.tokenizer = tokenizer
+        self.use_chat_api = use_chat_api
 
         # Create a client for each endpoint
         self.clients = [AsyncOpenAI(api_key="EMPTY", base_url=url) for url in base_urls]
@@ -60,19 +61,33 @@ class VLLMRolloutGenerator:
             log.info(f"  [{i}] {url}")
         log.info(f"Max concurrent requests (total): {max_concurrent}")
         log.info(f"Load balancing: Round-robin across {self.num_clients} instance(s)")
+        log.info(f"API mode: {'Chat' if use_chat_api else 'Completions'}")
 
     async def _generate_one(self, prompt: str, temperature: float, top_p: float, max_tokens: int, client_idx: int = 0) -> str:
         """Generate one response using specified client (for load balancing)."""
         try:
             client = self.clients[client_idx % self.num_clients]
-            response = await client.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-            )
-            return response.choices[0].message.content
+
+            if self.use_chat_api:
+                # Use chat completions API (default)
+                response = await client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                )
+                return response.choices[0].message.content
+            else:
+                # Use completions API (more stable with some VLLM versions)
+                response = await client.completions.create(
+                    model=self.model_name,
+                    prompt=prompt,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                )
+                return response.choices[0].text
         except Exception as e:
             log.error(f"Generation error on client {client_idx % self.num_clients}: {e}")
             return ""
@@ -209,6 +224,7 @@ def generate_rollouts(args):
             model_name=args.vllm_model_name or args.model_path,
             tokenizer=tokenizer,
             max_concurrent=args.vllm_max_concurrent,
+            use_chat_api=not args.vllm_use_completions_api,
         )
     else:
         generator = HFRolloutGenerator(
@@ -326,6 +342,8 @@ def main():
                        help="Model name on VLLM server")
     parser.add_argument("--vllm_max_concurrent", type=int, default=100,
                        help="Max concurrent requests to VLLM (total across all instances)")
+    parser.add_argument("--vllm_use_completions_api", action="store_true",
+                       help="Use completions API instead of chat API (more stable with some VLLM versions)")
 
     # Data args
     parser.add_argument("--data_path", type=str, required=True,
