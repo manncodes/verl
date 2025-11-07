@@ -198,43 +198,64 @@ def generate_rollouts(args):
     df = load_data(args.data_path, args.prompt_key)
     prompts = extract_prompts(df, args.prompt_key)
 
-    # Generate rollouts
+    # Generate rollouts - ALL SAMPLES AT ONCE (MUCH FASTER!)
     log.info(f"Generating {args.num_samples} responses per prompt...")
+    log.info(f"Total prompts: {len(prompts)}, Total generations: {len(prompts) * args.num_samples}")
 
     all_results = []
-    batch_size = args.batch_size
 
-    for i in tqdm(range(0, len(prompts), batch_size), desc="Generating rollouts"):
-        batch_prompts = prompts[i:i + batch_size]
-        batch_indices = list(range(i, min(i + batch_size, len(prompts))))
+    # PERFORMANCE FIX: Repeat each prompt num_samples times and generate ALL concurrently
+    # Old way: Sequential loops (SLOW)
+    # New way: Generate everything at once, let VLLM/async handle concurrency (FAST)
 
-        # Generate num_samples responses for each prompt
+    expanded_prompts = []
+    expanded_indices = []
+    expanded_sample_idx = []
+
+    for data_idx, prompt in enumerate(prompts):
         for sample_idx in range(args.num_samples):
-            responses = generator.generate_batch(
-                batch_prompts,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                max_tokens=args.max_tokens,
-            )
+            expanded_prompts.append(prompt)
+            expanded_indices.append(data_idx)
+            expanded_sample_idx.append(sample_idx)
 
-            # Store results
-            for prompt, response, data_idx in zip(batch_prompts, responses, batch_indices):
-                result = {
-                    "prompt": prompt,
-                    "response": response,
-                    "sample_idx": sample_idx,
-                    "data_idx": data_idx,
-                    "temperature": args.temperature,
-                    "top_p": args.top_p,
-                    "max_tokens": args.max_tokens,
-                }
+    log.info(f"Sending {len(expanded_prompts)} requests to generator...")
 
-                # Add original data fields
-                for col in df.columns:
-                    if col not in ["prompt", "response"]:
-                        result[f"original_{col}"] = df.iloc[data_idx][col]
+    # Process in batches to manage memory
+    batch_size = args.batch_size * args.num_samples  # Larger batches since we're doing all samples
 
-                all_results.append(result)
+    for i in tqdm(range(0, len(expanded_prompts), batch_size), desc="Generating rollouts"):
+        batch_prompts = expanded_prompts[i:i + batch_size]
+        batch_data_indices = expanded_indices[i:i + batch_size]
+        batch_sample_indices = expanded_sample_idx[i:i + batch_size]
+
+        # Generate all responses in this batch concurrently
+        responses = generator.generate_batch(
+            batch_prompts,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_tokens=args.max_tokens,
+        )
+
+        # Store results
+        for prompt, response, data_idx, sample_idx in zip(
+            batch_prompts, responses, batch_data_indices, batch_sample_indices
+        ):
+            result = {
+                "prompt": prompt,
+                "response": response,
+                "sample_idx": sample_idx,
+                "data_idx": data_idx,
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+                "max_tokens": args.max_tokens,
+            }
+
+            # Add original data fields
+            for col in df.columns:
+                if col not in ["prompt", "response"]:
+                    result[f"original_{col}"] = df.iloc[data_idx][col]
+
+            all_results.append(result)
 
     # Save results
     output_path = Path(args.output_path)
