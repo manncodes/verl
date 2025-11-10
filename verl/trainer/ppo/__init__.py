@@ -11,3 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.trainer.ppo.ray_trainer_with_sampling import RayPPOTrainerWithSampling
+
+__all__ = ["RayPPOTrainer", "RayPPOTrainerWithSampling"]
