@@ -23,7 +23,6 @@ arXiv preprint arXiv:2311.07911 (2023).
 
 import re
 from typing import Any, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from verl.utils.reward_score.ifeval_util import instructions_registry
 from verl.utils.reward_score.ifeval_util.instructions_registry import INSTRUCTION_DICT
@@ -41,13 +40,23 @@ def _get_judge() -> StructuredJudge:
 
     This function implements lazy initialization to avoid creating
     the judge until it's actually needed.
+
+    The judge is configured with default settings:
+    - max_workers: 128 (for concurrent batch evaluation)
+    - timeout: 2.0 seconds per evaluation
+    - max_retries: 0 (no retries by default)
+
+    To customize these settings, modify the StructuredJudge initialization below.
     """
     global _judge_instance
 
     if _judge_instance is None:
         _judge_instance = StructuredJudge(
             base_url="http://qpn744-vllm-gptoss120b-svc.llm-pretraining.svc.cluster.local:8000/v1",
-            api_key="dummy"
+            api_key="dummy",
+            max_workers=128,  # High concurrency for batch processing
+            timeout=2.0,       # Timeout per evaluation
+            max_retries=0      # Retries on timeout/failure
         )
 
     return _judge_instance
@@ -208,15 +217,18 @@ def _batch_evaluate_with_judge(
     prompts: list[str],
     responses: list[str],
     indices_to_eval: list[int],
-    max_workers: int = 10
+    show_progress: bool = False
 ) -> dict[int, float]:
-    """Batch evaluate responses using LLM judge with concurrent processing.
+    """Batch evaluate responses using LLM judge's built-in batching.
+
+    Leverages StructuredJudge.evaluate_batch() which handles concurrent
+    processing, timeout, retry, and progress tracking.
 
     Args:
-        prompts: List of prompts
-        responses: List of responses
+        prompts: Full list of prompts
+        responses: Full list of responses
         indices_to_eval: Indices of items that need judge evaluation (V_i > 0)
-        max_workers: Maximum number of concurrent judge evaluations
+        show_progress: Whether to show progress bar during evaluation
 
     Returns:
         Dictionary mapping index to S_i (preference score)
@@ -225,33 +237,33 @@ def _batch_evaluate_with_judge(
         return {}
 
     judge = _get_judge()
+
+    # Extract only the prompts and responses that need evaluation
+    prompts_to_eval = [format_chat_prompt(prompts[idx]) for idx in indices_to_eval]
+    responses_to_eval = [responses[idx] for idx in indices_to_eval]
+
+    # Use judge's built-in batch evaluation
+    # This handles concurrency, timeout, retry, and progress tracking
+    evaluations = judge.evaluate_batch(
+        prompts=prompts_to_eval,
+        responses=responses_to_eval,
+        temperature=0.0,
+        show_progress=show_progress,
+        desc="Judge evaluation"
+    )
+
+    # Map results back to original indices
     results = {}
-
-    # Use ThreadPoolExecutor for concurrent judge evaluations
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all evaluation tasks
-        future_to_idx = {}
-        for idx in indices_to_eval:
-            formatted_prompt = format_chat_prompt(prompts[idx])
-            future = executor.submit(
-                judge.evaluate_with_timeout,
-                prompt=formatted_prompt,
-                response=responses[idx]
-            )
-            future_to_idx[future] = idx
-
-        # Collect results as they complete
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                eval_result = future.result()
-                # Compute S_i as normalized aggregate score
-                S_i = eval_result.overall.aggregate_score / 10.0
-                results[idx] = S_i
-            except Exception as e:
-                print(f"Error in LLM Judge for index {idx}: {e}")
-                # Default to low score on error (conservative approach)
-                results[idx] = 0.0
+    for i, idx in enumerate(indices_to_eval):
+        eval_result = evaluations[i]
+        if eval_result is not None:
+            # Compute S_i as normalized aggregate score
+            S_i = eval_result.overall.aggregate_score / 10.0
+            results[idx] = S_i
+        else:
+            # Failed evaluation - default to low score (conservative approach)
+            print(f"Warning: Judge evaluation failed for index {idx}, using S_i=0.0")
+            results[idx] = 0.0
 
     return results
 
@@ -263,13 +275,14 @@ def compute_score_batched(
     extra_infos: list[dict[str, Any]],
     strict: bool = True,
     alpha_threshold: float = 0.5,
-    max_judge_workers: int = 10,
+    show_progress: bool = False,
     **kwargs
 ) -> list[dict[str, Any]]:
     """Compute batched IFEval reward scores for instruction following.
 
     This is the main entry point for batched reward computation, optimized for
-    use with BatchRewardManager.
+    use with BatchRewardManager. Uses StructuredJudge's built-in batching
+    capabilities for efficient concurrent judge evaluations.
 
     Args:
         data_sources: List of data source identifiers
@@ -279,7 +292,7 @@ def compute_score_batched(
         extra_infos: List of dicts containing additional context like 'prompt', etc.
         strict: If True, use strict verification. If False, apply preprocessing before verification
         alpha_threshold: Threshold for preference score (S_i > alpha gives bonus, else penalty)
-        max_judge_workers: Maximum number of concurrent LLM judge evaluations
+        show_progress: Whether to show progress bar during judge evaluation
         **kwargs: Additional keyword arguments (unused, for compatibility)
 
     Returns:
@@ -294,6 +307,11 @@ def compute_score_batched(
             - num_instructions: Total number of instructions
             - num_followed: Number of instructions successfully followed
             - format_score: Format compliance score
+
+    Note:
+        Judge concurrency is configured via StructuredJudge's max_workers parameter
+        (default: 128). Timeout and retry settings are also configured at judge
+        initialization.
     """
     batch_size = len(solution_strs)
 
@@ -324,12 +342,13 @@ def compute_score_batched(
             indices_needing_judge.append(i)
 
     # Phase 2: Batch evaluate with LLM judge (only for items with V_i > 0)
+    # Uses judge's built-in evaluate_batch() with its configured max_workers
     prompts = [extra_info.get('prompt', '') for extra_info in extra_infos]
     judge_results = _batch_evaluate_with_judge(
         prompts,
         solution_strs,
         indices_needing_judge,
-        max_workers=max_judge_workers
+        show_progress=show_progress
     )
 
     # Phase 3: Combine results and compute final rewards
