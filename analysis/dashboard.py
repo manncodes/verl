@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import List, Optional
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import pandas as pd
 
 from .data_loader import RolloutDataLoader
 from .metrics_computer import MetricsComputer
@@ -47,115 +48,284 @@ class TrainingDashboard:
         self.upsampling_data = self.metrics.compute_upsampling_candidates()
         self.score_distributions = self.metrics.compute_score_distributions()
 
-    def generate_all_charts(self) -> dict:
-        """Generate all charts.
+    def export_all_metrics(self, output_dir: str | Path) -> None:
+        """Export all computed metrics to CSV files.
+
+        Args:
+            output_dir: Directory to save CSV files
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        print("\n" + "="*80)
+        print("EXPORTING METRICS TO CSV")
+        print("="*80 + "\n")
+
+        # Export prompt-level metrics
+        print(f"Exporting prompt_metrics.csv ({len(self.prompt_metrics)} rows)...")
+        self.prompt_metrics.to_csv(output_dir / 'prompt_metrics.csv', index=False)
+
+        # Export learning dynamics
+        print(f"Exporting learning_dynamics.csv ({len(self.learning_dynamics)} rows)...")
+        self.learning_dynamics.to_csv(output_dir / 'learning_dynamics.csv', index=False)
+
+        # Export instruction type metrics
+        print(f"Exporting instruction_type_metrics.csv ({len(self.inst_type_metrics)} rows)...")
+        self.inst_type_metrics.to_csv(output_dir / 'instruction_type_metrics.csv', index=False)
+
+        # Export reward distribution
+        print(f"Exporting reward_distribution.csv ({len(self.reward_dist)} rows)...")
+        self.reward_dist.to_csv(output_dir / 'reward_distribution.csv', index=False)
+
+        # Export exploration metrics
+        print(f"Exporting exploration_metrics.csv ({len(self.exploration_metrics)} rows)...")
+        self.exploration_metrics.to_csv(output_dir / 'exploration_metrics.csv', index=False)
+
+        # Export V_i vs S_i data
+        print(f"Exporting vi_si_correlation.csv ({len(self.vi_si_data)} rows)...")
+        self.vi_si_data.to_csv(output_dir / 'vi_si_correlation.csv', index=False)
+
+        # Export instruction interference
+        print(f"Exporting instruction_interference.csv ({len(self.interference_data)} rows)...")
+        self.interference_data.to_csv(output_dir / 'instruction_interference.csv', index=False)
+
+        # Export upsampling candidates
+        print(f"Exporting upsampling_candidates.csv ({len(self.upsampling_data)} rows)...")
+        self.upsampling_data.to_csv(output_dir / 'upsampling_candidates.csv', index=False)
+
+        # Export instruction type summary (aggregated)
+        print("Exporting instruction_type_summary.csv...")
+        inst_summary = self.inst_type_metrics.groupby('instruction_type').agg({
+            'success_rate': ['mean', 'std', 'min', 'max'],
+            'num_samples': 'sum'
+        }).round(4)
+        inst_summary.columns = ['_'.join(col).strip() for col in inst_summary.columns.values]
+        inst_summary = inst_summary.sort_values('success_rate_mean')
+        inst_summary.to_csv(output_dir / 'instruction_type_summary.csv')
+
+        # Export prompt hardness ranking (all prompts sorted by difficulty)
+        print(f"Exporting prompt_hardness_ranking.csv ({len(self.learning_dynamics)} prompts)...")
+        hardness_ranking = self.learning_dynamics[[
+            'prompt_hash', 'iterations_to_learn', 'final_score', 'learning_rate',
+            'num_forgetting_events', 'instruction_types', 'num_instructions'
+        ]].sort_values('iterations_to_learn', ascending=False)
+        hardness_ranking.to_csv(output_dir / 'prompt_hardness_ranking.csv', index=False)
+
+        print(f"\n✓ All metrics exported to {output_dir}\n")
+
+    def _save_chart(self, fig: go.Figure, name: str, output_dir: Path, format: str = 'html') -> None:
+        """Save a single chart immediately.
+
+        Args:
+            fig: Plotly figure to save
+            name: Chart name (without extension)
+            output_dir: Directory to save to
+            format: Output format ('html' or 'png')
+        """
+        output_path = output_dir / f"{name}.{format}"
+        print(f"  💾 Saving {output_path.name}...")
+
+        if format == 'html':
+            fig.write_html(str(output_path))
+        elif format == 'png':
+            fig.write_image(str(output_path))
+        else:
+            raise ValueError(f"Unsupported format: {format}")
+
+    def generate_all_charts(self, max_prompts: Optional[int] = None, skip_heatmaps: bool = False,
+                            output_dir: Optional[Path] = None, format: str = 'html') -> dict:
+        """Generate all charts, optionally saving immediately to avoid memory issues.
+
+        Args:
+            max_prompts: Maximum number of prompts to include in heatmaps (None = all)
+            skip_heatmaps: If True, skip computationally expensive heatmaps
+            output_dir: If provided, save charts immediately as they're generated
+            format: Output format if saving ('html' or 'png')
 
         Returns:
             Dictionary mapping chart names to Plotly figures
         """
         charts = {}
 
-        print("Generating prompt dynamics heatmap (F_i)...")
-        charts['prompt_dynamics_fi'] = create_prompt_dynamics_heatmap(
-            self.prompt_metrics,
-            self.learning_dynamics,
-            metric='mean_score',
-            sort_by='first_success'
-        )
+        # Subsample data if needed
+        if max_prompts is not None and len(self.learning_dynamics) > max_prompts:
+            print(f"\n⚠️  Large dataset detected ({len(self.learning_dynamics)} prompts)")
+            print(f"   Limiting heatmaps to {max_prompts} prompts for performance")
+            print(f"   (Use --max-prompts to adjust or export full data to CSV)\n")
 
-        print("Generating prompt dynamics heatmap (V_i)...")
-        charts['prompt_dynamics_vi'] = create_prompt_dynamics_heatmap(
-            self.prompt_metrics,
-            self.learning_dynamics,
-            metric='mean_V_i',
-            sort_by='first_success'
-        )
+            # Sample diverse prompts: hardest, easiest, and random
+            sorted_dynamics = self.learning_dynamics.sort_values('iterations_to_learn', ascending=False)
+            n_hard = max_prompts // 3
+            n_easy = max_prompts // 3
+            n_random = max_prompts - n_hard - n_easy
 
-        print("Generating prompt dynamics heatmap (S_i)...")
-        charts['prompt_dynamics_si'] = create_prompt_dynamics_heatmap(
-            self.prompt_metrics,
-            self.learning_dynamics,
-            metric='mean_S_i',
-            sort_by='first_success'
-        )
+            sampled_hashes = set()
+            sampled_hashes.update(sorted_dynamics.head(n_hard)['prompt_hash'])
+            sampled_hashes.update(sorted_dynamics.tail(n_easy)['prompt_hash'])
+            sampled_hashes.update(sorted_dynamics.sample(n=n_random, random_state=42)['prompt_hash'])
 
-        print("Generating prompt strict accuracy heatmap...")
-        charts['prompt_accuracy'] = create_prompt_dynamics_heatmap(
-            self.prompt_metrics,
-            self.learning_dynamics,
-            metric='prompt_strict_acc',
-            sort_by='first_success'
-        )
+            # Filter metrics
+            filtered_prompt_metrics = self.prompt_metrics[
+                self.prompt_metrics['prompt_hash'].isin(sampled_hashes)
+            ]
+            filtered_learning_dynamics = self.learning_dynamics[
+                self.learning_dynamics['prompt_hash'].isin(sampled_hashes)
+            ]
+            filtered_exploration = self.exploration_metrics[
+                self.exploration_metrics['prompt_hash'].isin(sampled_hashes)
+            ]
+        else:
+            filtered_prompt_metrics = self.prompt_metrics
+            filtered_learning_dynamics = self.learning_dynamics
+            filtered_exploration = self.exploration_metrics
+
+        if not skip_heatmaps:
+            print("Generating prompt dynamics heatmap (F_i)...")
+            fig = create_prompt_dynamics_heatmap(
+                filtered_prompt_metrics,
+                filtered_learning_dynamics,
+                metric='mean_score',
+                sort_by='first_success'
+            )
+            charts['prompt_dynamics_fi'] = fig
+            if output_dir:
+                self._save_chart(fig, 'prompt_dynamics_fi', output_dir, format)
+
+            print("Generating prompt dynamics heatmap (V_i)...")
+            fig = create_prompt_dynamics_heatmap(
+                filtered_prompt_metrics,
+                filtered_learning_dynamics,
+                metric='mean_V_i',
+                sort_by='first_success'
+            )
+            charts['prompt_dynamics_vi'] = fig
+            if output_dir:
+                self._save_chart(fig, 'prompt_dynamics_vi', output_dir, format)
+
+            print("Generating prompt dynamics heatmap (S_i)...")
+            fig = create_prompt_dynamics_heatmap(
+                filtered_prompt_metrics,
+                filtered_learning_dynamics,
+                metric='mean_S_i',
+                sort_by='first_success'
+            )
+            charts['prompt_dynamics_si'] = fig
+            if output_dir:
+                self._save_chart(fig, 'prompt_dynamics_si', output_dir, format)
+
+            print("Generating prompt strict accuracy heatmap...")
+            fig = create_prompt_dynamics_heatmap(
+                filtered_prompt_metrics,
+                filtered_learning_dynamics,
+                metric='prompt_strict_acc',
+                sort_by='first_success'
+            )
+            charts['prompt_accuracy'] = fig
+            if output_dir:
+                self._save_chart(fig, 'prompt_accuracy', output_dir, format)
+        else:
+            print("⏭️  Skipping prompt dynamics heatmaps (--skip-heatmaps enabled)")
+
+        if not skip_heatmaps:
+            print("Generating exploration heatmap...")
+            fig = create_exploration_heatmap(
+                filtered_exploration,
+                filtered_learning_dynamics
+            )
+            charts['exploration'] = fig
+            if output_dir:
+                self._save_chart(fig, 'exploration', output_dir, format)
+
+            print("Generating forgetting analysis...")
+            fig = create_forgetting_analysis(
+                filtered_prompt_metrics,
+                filtered_learning_dynamics
+            )
+            charts['forgetting_analysis'] = fig
+            if output_dir:
+                self._save_chart(fig, 'forgetting_analysis', output_dir, format)
+        else:
+            print("⏭️  Skipping exploration and forgetting heatmaps")
 
         print("Generating instruction type heatmap...")
-        charts['instruction_types'] = create_instruction_type_heatmap(self.inst_type_metrics)
+        fig = create_instruction_type_heatmap(self.inst_type_metrics)
+        charts['instruction_types'] = fig
+        if output_dir:
+            self._save_chart(fig, 'instruction_types', output_dir, format)
 
         print("Generating reward case evolution...")
-        charts['reward_case_evolution'] = create_reward_case_evolution(self.reward_dist)
+        fig = create_reward_case_evolution(self.reward_dist)
+        charts['reward_case_evolution'] = fig
+        if output_dir:
+            self._save_chart(fig, 'reward_case_evolution', output_dir, format)
 
         print("Generating sample efficiency chart...")
-        charts['sample_efficiency'] = create_sample_efficiency_chart(self.learning_dynamics)
-
-        print("Generating exploration heatmap...")
-        charts['exploration'] = create_exploration_heatmap(
-            self.exploration_metrics,
-            self.learning_dynamics
-        )
+        fig = create_sample_efficiency_chart(self.learning_dynamics)
+        charts['sample_efficiency'] = fig
+        if output_dir:
+            self._save_chart(fig, 'sample_efficiency', output_dir, format)
 
         print("Generating V_i vs S_i correlation...")
-        charts['vi_si_correlation'] = create_vi_si_correlation(self.vi_si_data)
+        fig = create_vi_si_correlation(self.vi_si_data)
+        charts['vi_si_correlation'] = fig
+        if output_dir:
+            self._save_chart(fig, 'vi_si_correlation', output_dir, format)
 
         print("Generating plateau detection chart...")
-        charts['plateau_detection'] = create_plateau_detection_chart(self.learning_dynamics)
-
-        print("Generating forgetting analysis...")
-        charts['forgetting_analysis'] = create_forgetting_analysis(
-            self.prompt_metrics,
-            self.learning_dynamics
-        )
+        fig = create_plateau_detection_chart(self.learning_dynamics)
+        charts['plateau_detection'] = fig
+        if output_dir:
+            self._save_chart(fig, 'plateau_detection', output_dir, format)
 
         print("Generating instruction interference matrix...")
-        charts['instruction_interference'] = create_instruction_interference_matrix(
+        fig = create_instruction_interference_matrix(
             self.interference_data
         )
+        charts['instruction_interference'] = fig
+        if output_dir:
+            self._save_chart(fig, 'instruction_interference', output_dir, format)
 
         print("Generating upsampling candidates table...")
-        charts['upsampling_candidates'] = create_upsampling_candidates_table(
+        fig = create_upsampling_candidates_table(
             self.upsampling_data,
             top_n=20
         )
+        charts['upsampling_candidates'] = fig
+        if output_dir:
+            self._save_chart(fig, 'upsampling_candidates', output_dir, format)
 
         print("Generating score distribution evolution...")
-        charts['score_distribution'] = create_score_distribution_evolution(
+        fig = create_score_distribution_evolution(
             self.score_distributions
         )
+        charts['score_distribution'] = fig
+        if output_dir:
+            self._save_chart(fig, 'score_distribution', output_dir, format)
 
         return charts
 
-    def save_all_charts(self, output_dir: str | Path, format: str = 'html') -> None:
-        """Save all charts to files.
+    def save_all_charts(self, output_dir: str | Path, format: str = 'html',
+                        max_prompts: Optional[int] = None, skip_heatmaps: bool = False) -> None:
+        """Save all charts to files (saves immediately as generated to avoid memory issues).
 
         Args:
             output_dir: Directory to save charts
             format: Output format ('html' or 'png')
+            max_prompts: Maximum number of prompts to include in heatmaps
+            skip_heatmaps: If True, skip computationally expensive heatmaps
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        charts = self.generate_all_charts()
+        # Generate and save charts incrementally (saves each chart as it's created)
+        self.generate_all_charts(
+            max_prompts=max_prompts,
+            skip_heatmaps=skip_heatmaps,
+            output_dir=output_dir,
+            format=format
+        )
 
-        for name, fig in charts.items():
-            output_path = output_dir / f"{name}.{format}"
-            print(f"Saving {output_path}...")
-
-            if format == 'html':
-                fig.write_html(str(output_path))
-            elif format == 'png':
-                fig.write_image(str(output_path))
-            else:
-                raise ValueError(f"Unsupported format: {format}")
-
-        print(f"\nAll charts saved to {output_dir}")
+        print(f"\n✓ All charts saved to {output_dir}")
 
     def create_combined_dashboard(self) -> go.Figure:
         """Create a single HTML page with all charts.
@@ -173,13 +343,16 @@ class TrainingDashboard:
 
         return charts
 
-    def save_combined_dashboard(self, output_path: str | Path) -> None:
+    def save_combined_dashboard(self, output_path: str | Path,
+                                 max_prompts: Optional[int] = None, skip_heatmaps: bool = False) -> None:
         """Save a combined dashboard with all charts.
 
         Args:
             output_path: Path to save the dashboard HTML
+            max_prompts: Maximum number of prompts to include in heatmaps
+            skip_heatmaps: If True, skip computationally expensive heatmaps
         """
-        charts = self.generate_all_charts()
+        charts = self.generate_all_charts(max_prompts=max_prompts, skip_heatmaps=skip_heatmaps)
 
         # Create custom HTML with tabs
         html_parts = [

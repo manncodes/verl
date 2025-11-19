@@ -11,10 +11,21 @@ pip install plotly pandas numpy
 ### 1. Generate Dashboard
 
 ```bash
-python -m analysis.run_analysis /path/to/ROLLOUT_DIR --combined-dashboard
+# Fast mode: Export metrics only (for large datasets with 1000+ prompts)
+python -m analysis.run_analysis /path/to/ROLLOUT_DIR --export-metrics-only
+
+# Full dashboard with sampled heatmaps (recommended for large datasets)
+python -m analysis.run_analysis /path/to/ROLLOUT_DIR --combined-dashboard --max-prompts 500
+
+# Skip heatmaps entirely (very fast, only statistical charts)
+python -m analysis.run_analysis /path/to/ROLLOUT_DIR --combined-dashboard --skip-heatmaps
+
+# Full dashboard with all prompts (WARNING: slow for >1000 prompts)
+python -m analysis.run_analysis /path/to/ROLLOUT_DIR --combined-dashboard --max-prompts 0
 ```
 
 This creates `analysis_output/training_dashboard.html` with all charts in one file.
+**Metrics are always exported to CSV first** (fast operation).
 
 ### 2. Open Dashboard
 
