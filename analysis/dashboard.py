@@ -20,6 +20,8 @@ from .charts import (
     create_instruction_interference_matrix,
     create_upsampling_candidates_table,
     create_score_distribution_evolution,
+    create_instruction_hierarchy_sunburst,
+    create_instruction_hierarchy_treemap,
 )
 
 
@@ -252,6 +254,18 @@ class TrainingDashboard:
         charts['instruction_types'] = fig
         if output_dir:
             self._save_chart(fig, 'instruction_types', output_dir, format)
+
+        print("Generating instruction hierarchy sunburst (animated)...")
+        fig = create_instruction_hierarchy_sunburst(self.inst_type_metrics)
+        charts['instruction_hierarchy_sunburst'] = fig
+        if output_dir:
+            self._save_chart(fig, 'instruction_hierarchy_sunburst', output_dir, format)
+
+        print("Generating instruction hierarchy treemap (animated)...")
+        fig = create_instruction_hierarchy_treemap(self.inst_type_metrics)
+        charts['instruction_hierarchy_treemap'] = fig
+        if output_dir:
+            self._save_chart(fig, 'instruction_hierarchy_treemap', output_dir, format)
 
         print("Generating reward case evolution...")
         fig = create_reward_case_evolution(self.reward_dist)

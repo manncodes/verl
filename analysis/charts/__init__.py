@@ -11,6 +11,10 @@ from .forgetting_analysis import create_forgetting_analysis
 from .instruction_interference import create_instruction_interference_matrix
 from .upsampling_candidates import create_upsampling_candidates_table
 from .score_distribution import create_score_distribution_evolution
+from .instruction_hierarchy_tree import (
+    create_instruction_hierarchy_sunburst,
+    create_instruction_hierarchy_treemap,
+)
 
 __all__ = [
     "create_prompt_dynamics_heatmap",
@@ -24,4 +28,6 @@ __all__ = [
     "create_instruction_interference_matrix",
     "create_upsampling_candidates_table",
     "create_score_distribution_evolution",
+    "create_instruction_hierarchy_sunburst",
+    "create_instruction_hierarchy_treemap",
 ]
