@@ -9,6 +9,12 @@ import pandas as pd
 from .data_loader import RolloutDataLoader
 from .metrics_computer import MetricsComputer
 from .charts import (
+    create_instruction_performance_heatmap,
+    create_instruction_hierarchy_sunburst,
+    create_instruction_hierarchy_treemap,
+    create_instruction_interference_matrix,
+    create_upsampling_candidates_table,
+    # Legacy charts
     create_prompt_dynamics_heatmap,
     create_instruction_type_heatmap,
     create_reward_case_evolution,
@@ -17,11 +23,7 @@ from .charts import (
     create_vi_si_correlation,
     create_plateau_detection_chart,
     create_forgetting_analysis,
-    create_instruction_interference_matrix,
-    create_upsampling_candidates_table,
     create_score_distribution_evolution,
-    create_instruction_hierarchy_sunburst,
-    create_instruction_hierarchy_treemap,
 )
 
 
@@ -249,11 +251,12 @@ class TrainingDashboard:
         else:
             print("⏭️  Skipping exploration and forgetting heatmaps")
 
-        print("Generating instruction type heatmap...")
-        fig = create_instruction_type_heatmap(self.inst_type_metrics)
-        charts['instruction_types'] = fig
+        # PRIMARY INSTRUCTION-LEVEL CHARTS
+        print("Generating instruction performance heatmap (PRIMARY)...")
+        fig = create_instruction_performance_heatmap(self.inst_type_metrics, self.metrics.df)
+        charts['instruction_performance'] = fig
         if output_dir:
-            self._save_chart(fig, 'instruction_types', output_dir, format)
+            self._save_chart(fig, 'instruction_performance', output_dir, format)
 
         print("Generating instruction hierarchy sunburst (animated)...")
         fig = create_instruction_hierarchy_sunburst(self.inst_type_metrics)
