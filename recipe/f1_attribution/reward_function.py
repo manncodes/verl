@@ -196,8 +196,10 @@ def compute_score(
             "score": NEUTRAL_REWARD,
             "positive_match": False,
             "negative_match": False,
-            "positive_matches": [],
-            "negative_matches": [],
+            "positive_match_count": 0,
+            "negative_match_count": 0,
+            "positive_matches_str": "",
+            "negative_matches_str": "",
         }
 
     positive_matches = []
@@ -233,8 +235,10 @@ def compute_score(
         "score": score,
         "positive_match": has_positive,
         "negative_match": has_negative,
-        "positive_matches": positive_matches,
-        "negative_matches": negative_matches,
+        "positive_match_count": len(positive_matches),
+        "negative_match_count": len(negative_matches),
+        "positive_matches_str": "|".join(str(m) for m in positive_matches) if positive_matches else "",
+        "negative_matches_str": "|".join(str(m) for m in negative_matches) if negative_matches else "",
     }
 
 
