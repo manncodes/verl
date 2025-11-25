@@ -95,7 +95,7 @@ def extract_conversation_parts(conversation: list[dict]) -> tuple[list[dict], st
 
 
 def convert_dpo_to_rl(
-    input_path: str,
+    input_paths: list[str],
     output_dir: str,
     data_source: str = "f1_attribution",
     train_split: float = 0.9,
@@ -105,16 +105,20 @@ def convert_dpo_to_rl(
     Convert DPO data to RL format.
 
     Args:
-        input_path: Path to input JSONL file with DPO data
+        input_paths: List of paths to input JSONL files with DPO data
         output_dir: Directory to save output parquet files
         data_source: Data source identifier for the reward function
         train_split: Fraction of data to use for training (rest for validation)
         hdfs_dir: Optional HDFS directory to copy output to
     """
-    # Load DPO data
-    print(f"Loading DPO data from {input_path}...")
-    dpo_data = load_jsonl(input_path)
-    print(f"Loaded {len(dpo_data)} examples")
+    # Load DPO data from all input files
+    dpo_data = []
+    for input_path in input_paths:
+        print(f"Loading DPO data from {input_path}...")
+        file_data = load_jsonl(input_path)
+        print(f"  Loaded {len(file_data)} examples from {input_path}")
+        dpo_data.extend(file_data)
+    print(f"Total: {len(dpo_data)} examples from {len(input_paths)} file(s)")
 
     # Convert to RL format
     rl_data = []
@@ -193,10 +197,11 @@ def main():
         description="Convert DPO data to RL format for F1 attribution training"
     )
     parser.add_argument(
-        "--input_path",
+        "--input_paths",
         type=str,
+        nargs="+",
         required=True,
-        help="Path to input JSONL file with DPO data",
+        help="Path(s) to input JSONL file(s) with DPO data",
     )
     parser.add_argument(
         "--local_save_dir",
@@ -226,7 +231,7 @@ def main():
     args = parser.parse_args()
 
     convert_dpo_to_rl(
-        input_path=args.input_path,
+        input_paths=args.input_paths,
         output_dir=args.local_save_dir,
         data_source=args.data_source,
         train_split=args.train_split,
