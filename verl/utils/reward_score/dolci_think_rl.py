@@ -24,9 +24,12 @@ Reference: https://huggingface.co/datasets/allenai/Dolci-Think-RL
 """
 
 import logging
-from typing import Optional
+from typing import Optional, Any
 
 logger = logging.getLogger(__name__)
+
+# Singleton instance for LLM judge
+_judge_instance: Optional[Any] = None
 
 
 def compute_score(
@@ -94,36 +97,58 @@ def compute_score(
         return _basic_string_match(solution_str, ground_truth)
 
 
+def _get_judge(**kwargs) -> Any:
+    """Get or create the singleton StructuredJudge instance.
+
+    Implements lazy initialization to avoid creating the judge until needed.
+
+    Args:
+        **kwargs: Arguments for create_verl_judge (base_url, model, max_concurrent).
+
+    Returns:
+        StructuredJudge instance or None if unavailable.
+    """
+    global _judge_instance
+
+    if _judge_instance is None:
+        try:
+            from verl.utils.reward_score.llm_judge import create_verl_judge
+            _judge_instance = create_verl_judge(
+                base_url=kwargs.get("base_url", "http://0.0.0.0:8000/v1"),
+                model=kwargs.get("model"),
+                max_concurrent=kwargs.get("max_concurrent", 128),
+            )
+            logger.info("Initialized singleton StructuredJudge instance")
+        except ImportError:
+            logger.warning("StructuredJudge not available (llm_judge module not found)")
+            return None
+
+    return _judge_instance
+
+
 def _compute_code_score_llm_judge(
     solution_str: str,
     ground_truth: str,
     extra_info: Optional[dict] = None,
-    judge=None,
     **kwargs,
 ) -> float:
     """Compute code reward using LLM-as-a-judge via StructuredJudge.
+
+    Uses singleton pattern to reuse judge instance across calls.
 
     Args:
         solution_str: The model's generated code solution.
         ground_truth: The expected ground truth or problem description.
         extra_info: Optional dict with problem context.
-        judge: Optional StructuredJudge instance. If not provided, creates one.
         **kwargs: Additional arguments (base_url, model, etc. for judge).
 
     Returns:
         Score as a float (0.0 or 1.0).
     """
+    judge = _get_judge(**kwargs)
+
     if judge is None:
-        try:
-            from verl.utils.reward_score.llm_judge import create_verl_judge
-            judge = create_verl_judge(
-                base_url=kwargs.get("base_url", "http://0.0.0.0:8000/v1"),
-                model=kwargs.get("model"),
-                max_concurrent=kwargs.get("max_concurrent", 128),
-            )
-        except ImportError:
-            logger.warning("StructuredJudge not available, falling back to basic comparison")
-            return _basic_string_match(solution_str, str(ground_truth))
+        return _basic_string_match(solution_str, str(ground_truth))
 
     try:
         # Get problem context
