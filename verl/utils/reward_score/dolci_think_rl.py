@@ -32,6 +32,23 @@ logger = logging.getLogger(__name__)
 _judge_instance: Optional[Any] = None
 
 
+def remove_thinking_section(prediction: str) -> str:
+    """Remove thinking/reasoning sections from model output before reward computation.
+
+    Strips <think>...</think>, <evaluation>...</evaluation>, and <answer> tags.
+    """
+    if prediction is None:
+        return ""
+    prediction = prediction.replace("<|assistant|>", "").strip()
+    # remove thinking section from the prediction
+    prediction = prediction.split("</think>")[-1]
+    # remove evaluation
+    prediction = prediction.split("</evaluation>")[-1]
+    # remove answer tags from the prediction
+    prediction = prediction.replace("<answer>", "").replace("</answer>", "")
+    return prediction.strip()
+
+
 def _get_judge(**kwargs) -> Any:
     """Get or create the singleton StructuredJudge instance.
 
@@ -62,15 +79,12 @@ def _get_judge(**kwargs) -> Any:
 
 
 def _basic_string_match(solution_str: str, ground_truth: str) -> float:
-    """Basic string matching for fallback."""
-    import re
+    """Basic string matching for fallback.
 
-    # Extract answer after </think> if present
-    match = re.search(r"</think>\s*(.*)$", solution_str, re.DOTALL | re.IGNORECASE)
-    answer = match.group(1).strip() if match else solution_str.strip()
-
+    NOTE: Assumes thinking section already removed via remove_thinking_section().
+    """
     # Normalize
-    answer = answer.lower().strip()
+    answer = solution_str.lower().strip()
     ground_truth = str(ground_truth).lower().strip()
 
     if answer == ground_truth:
@@ -114,6 +128,9 @@ def compute_score(
 
     if ground_truth is None:
         return 0.0
+
+    # Remove thinking section before reward computation
+    solution_str = remove_thinking_section(solution_str)
 
     # Determine task type from extra_info
     dataset_source = ""
@@ -175,6 +192,9 @@ def compute_score_batch(
     n = len(solution_strs)
     if extra_infos is None:
         extra_infos = [None] * n
+
+    # Remove thinking sections from all solutions upfront
+    solution_strs = [remove_thinking_section(s) if s else "" for s in solution_strs]
 
     # Initialize results
     scores = [0.0] * n
