@@ -138,19 +138,58 @@ def _preprocess_response_loose(response: str) -> str:
 
 
 def _extract_instruction_data(ground_truth: dict | list, extra_info: dict[str, Any] | None):
-    """Extract instruction_id_list and kwargs from ground_truth or extra_info."""
+    """Extract instruction_id_list and kwargs from ground_truth or extra_info.
+
+    Args:
+        ground_truth: Can be:
+            - dict with instruction_id_list and kwargs (legacy format)
+            - list containing string repr: ["[{'instruction_id': [...], 'kwargs': [...]}]"]
+            - other formats
+        extra_info: Fallback dict containing instruction_id_list and kwargs
+
+    Returns:
+        tuple: (instruction_list, kwargs_list)
+    """
+    import ast
+
     instruction_list = []
     kwargs_list = []
 
     # Try ground_truth first
     if isinstance(ground_truth, dict):
+        # Legacy dict format
         instruction_list = ground_truth.get("instruction_id_list", [])
         kwargs_list = ground_truth.get("kwargs", [])
+    elif isinstance(ground_truth, list) and len(ground_truth) > 0:
+        # New format: list containing string repr
+        # Format: ["[{'instruction_id': [...], 'kwargs': [...]}]"]
+        try:
+            # Get the string from the list
+            ground_truth_str = ground_truth[0]
+            if isinstance(ground_truth_str, str):
+                # Parse the string repr to get the actual data
+                parsed = ast.literal_eval(ground_truth_str)
+                if isinstance(parsed, list) and len(parsed) > 0:
+                    data = parsed[0]
+                    instruction_list = data.get("instruction_id", [])
+                    kwargs_list = data.get("kwargs", [])
+        except (ValueError, SyntaxError, KeyError, IndexError) as e:
+            # Failed to parse - will fall back to extra_info
+            pass
 
     # Fall back to extra_info if needed
     if not instruction_list and extra_info is not None:
         instruction_list = extra_info.get("instruction_id_list", [])
         kwargs_list = extra_info.get("kwargs", [])
+
+        # If kwargs has the PyArrow sentinel value, replace with empty dict
+        kwargs_list_cleaned = []
+        for kwarg in kwargs_list:
+            if isinstance(kwarg, dict) and kwarg.get("__empty__") is True and len(kwarg) == 1:
+                kwargs_list_cleaned.append({})
+            else:
+                kwargs_list_cleaned.append(kwarg)
+        kwargs_list = kwargs_list_cleaned
 
     # Ensure kwargs_list matches instruction_list length
     if len(kwargs_list) < len(instruction_list):

@@ -53,35 +53,32 @@ def process_aime_example(example, idx):
         "Put your reasoning in <think>...</think> tags and your final answer in <answer>...</answer> tags."
     )
 
-    # Store all dict/list fields as JSON strings to avoid PyArrow type mixing
-    ground_truth_dict = {"answer": answer}
-
-    extra_info_dict = {
-        "ability": "math",
-        "split": "test",
-        "index": idx,
-        "original_problem": problem,
-        "dataset_source": "aime_2025",
-        "answer": answer,
-        "prompt": problem,  # For consistency with IFEval
-    }
-
-    reward_model_dict = {
-        "style": "rule",
-        "ground_truth": json.dumps(ground_truth_dict),
-    }
-
+    # Match the exact format from your example
     data = {
+        "ground_truth": [answer],  # List with single string
+        "dataset": ["math"],  # List with dataset name
         "data_source": "aime_2025",
-        "prompt": json.dumps([
+        "prompt": [
             {
-                "role": "user",
                 "content": prompt_with_instruction,
+                "role": "user",
             }
-        ]),
+        ],
         "ability": "math",
-        "reward_model": json.dumps(reward_model_dict),
-        "extra_info": json.dumps(extra_info_dict),
+        "reward_model": {
+            "ground_truth": answer,  # String, not dict
+            "style": "rule",
+        },
+        "extra_info": {
+            "ability": "math",
+            "split": "test",
+            "index": idx,
+            "original_problem": problem,
+            "dataset_source": "aime_2025",
+            "answer": answer,
+            "prompt": problem,
+            "original_prompt": prompt_with_instruction,
+        },
     }
     return data
 
@@ -105,41 +102,50 @@ def process_ifeval_example(example, idx):
         "Put your reasoning in <think>...</think> tags and your response in <answer>...</answer> tags."
     )
 
-    # Store all dict/list fields as JSON strings to avoid PyArrow type mixing
-    # For IFEval ground_truth, use string repr of list[dict]
+    # PyArrow can't handle empty dicts in lists - add a dummy field for empty kwargs
+    # This is needed for Parquet serialization
+    kwargs_processed = []
+    for kwarg_dict in kwargs:
+        if not kwarg_dict or len(kwarg_dict) == 0:
+            # Empty dict - add a sentinel value for PyArrow
+            kwargs_processed.append({"__empty__": True})
+        else:
+            kwargs_processed.append(kwarg_dict)
+
+    # Format ground_truth as string repr of list[dict] in a list
     # Format: "[{'instruction_id': [...], 'kwargs': [...]}]"
-    ground_truth_list = [{
+    # Use original kwargs for the string repr (not processed)
+    ground_truth_str = str([{
         "instruction_id": instruction_id_list,
-        "kwargs": kwargs,
-    }]
+        "kwargs": kwargs,  # Original kwargs
+    }])
 
-    extra_info_dict = {
-        "ability": "instruction_following",
-        "split": "test",
-        "index": idx,
-        "original_prompt": prompt_text,
-        "dataset_source": "ifeval",
-        "instruction_id_list": instruction_id_list,
-        "kwargs": kwargs,
-        "prompt": prompt_text,  # Required for judge evaluation
-    }
-
-    reward_model_dict = {
-        "style": "rule",
-        "ground_truth": str(ground_truth_list),
-    }
-
+    # Match the exact format from your example
     data = {
+        "ground_truth": [ground_truth_str],  # List with string repr
+        "dataset": ["ifeval"],  # List with dataset name
         "data_source": "ifeval",
-        "prompt": json.dumps([
+        "prompt": [
             {
-                "role": "user",
                 "content": prompt_with_instruction,
+                "role": "user",
             }
-        ]),
+        ],
         "ability": "instruction_following",
-        "reward_model": json.dumps(reward_model_dict),
-        "extra_info": json.dumps(extra_info_dict),
+        "reward_model": {
+            "ground_truth": ground_truth_str,  # String repr
+            "style": "rule",
+        },
+        "extra_info": {
+            "ability": "instruction_following",
+            "split": "test",
+            "index": idx,
+            "original_prompt": prompt_text,
+            "dataset_source": "ifeval",
+            "instruction_id_list": instruction_id_list,
+            "kwargs": kwargs_processed,  # Use processed kwargs for PyArrow
+            "prompt": prompt_text,  # Required for judge evaluation
+        },
     }
     return data
 
@@ -335,12 +341,18 @@ if __name__ == "__main__":
     print(f"Total examples: {len(all_examples)}")
     print("=" * 80)
 
-    # Convert to pandas DataFrame first (handles mixed types better)
-    print("Converting to DataFrame...")
-    df = pd.DataFrame(all_examples)
+    # Convert list of dicts to dict of lists for datasets.Dataset.from_dict()
+    print("Converting to Dataset...")
+    data_dict = {}
+    for key in all_examples[0].keys():
+        data_dict[key] = [ex[key] for ex in all_examples]
+
+    # Create dataset
+    combined_dataset = datasets.Dataset.from_dict(data_dict)
 
     # Shuffle with seed for reproducibility
-    df = df.sample(frac=1, random_state=args.seed).reset_index(drop=True)
+    print("Shuffling dataset...")
+    combined_dataset = combined_dataset.shuffle(seed=args.seed)
 
     # Save to disk
     local_dir = os.path.expanduser(args.local_save_dir)
@@ -349,12 +361,7 @@ if __name__ == "__main__":
     test_path = os.path.join(local_dir, "test.parquet")
 
     print(f"Saving to parquet: {test_path}...")
-    # Save directly from pandas (more robust with mixed types)
-    df.to_parquet(test_path, index=False, engine='pyarrow')
-
-    # Also load as Dataset for compatibility checking
-    print("Loading as Dataset for verification...")
-    combined_dataset = datasets.Dataset.from_pandas(df, preserve_index=False)
+    combined_dataset.to_parquet(test_path)
 
     # Save example JSON for reference
     if len(combined_dataset) > 0:
