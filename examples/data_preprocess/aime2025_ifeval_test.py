@@ -63,7 +63,9 @@ def process_aime_example(example, idx):
         "ability": "math",
         "reward_model": {
             "style": "rule",
-            "ground_truth": answer,
+            "ground_truth": {
+                "answer": answer,
+            },
         },
         "extra_info": {
             "ability": "math",
@@ -71,6 +73,8 @@ def process_aime_example(example, idx):
             "index": idx,
             "original_problem": problem,
             "dataset_source": "aime_2025",
+            "answer": answer,
+            "prompt": problem,  # For consistency with IFEval
         },
     }
     return data
