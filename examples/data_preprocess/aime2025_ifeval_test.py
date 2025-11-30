@@ -101,11 +101,12 @@ def process_ifeval_example(example, idx):
         "Put your reasoning in <think>...</think> tags and your response in <answer>...</answer> tags."
     )
 
-    # Store ground_truth as JSON string to avoid PyArrow type mixing
-    ground_truth_dict = {
-        "instruction_id_list": instruction_id_list,
+    # Store ground_truth as string repr of list[dict] for IFEval compatibility
+    # Format: "[{'instruction_id': [...], 'kwargs': [...]}]"
+    ground_truth_list = [{
+        "instruction_id": instruction_id_list,
         "kwargs": kwargs,
-    }
+    }]
 
     data = {
         "data_source": "ifeval",
@@ -118,7 +119,7 @@ def process_ifeval_example(example, idx):
         "ability": "instruction_following",
         "reward_model": {
             "style": "rule",
-            "ground_truth": json.dumps(ground_truth_dict),  # String instead of dict
+            "ground_truth": str(ground_truth_list),  # String repr of list
         },
         "extra_info": {
             "ability": "instruction_following",
