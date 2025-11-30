@@ -56,6 +56,17 @@ def process_aime_example(example, idx):
     # Store ground_truth as JSON string to avoid PyArrow type mixing
     ground_truth_dict = {"answer": answer}
 
+    # Store extra_info as JSON string to avoid PyArrow type mixing
+    extra_info_dict = {
+        "ability": "math",
+        "split": "test",
+        "index": idx,
+        "original_problem": problem,
+        "dataset_source": "aime_2025",
+        "answer": answer,
+        "prompt": problem,  # For consistency with IFEval
+    }
+
     data = {
         "data_source": "aime_2025",
         "prompt": [
@@ -69,15 +80,7 @@ def process_aime_example(example, idx):
             "style": "rule",
             "ground_truth": json.dumps(ground_truth_dict),  # String instead of dict
         },
-        "extra_info": {
-            "ability": "math",
-            "split": "test",
-            "index": idx,
-            "original_problem": problem,
-            "dataset_source": "aime_2025",
-            "answer": answer,
-            "prompt": problem,  # For consistency with IFEval
-        },
+        "extra_info": json.dumps(extra_info_dict),  # String instead of dict
     }
     return data
 
@@ -108,6 +111,18 @@ def process_ifeval_example(example, idx):
         "kwargs": kwargs,
     }]
 
+    # Store extra_info as JSON string to avoid PyArrow type mixing
+    extra_info_dict = {
+        "ability": "instruction_following",
+        "split": "test",
+        "index": idx,
+        "original_prompt": prompt_text,
+        "dataset_source": "ifeval",
+        "instruction_id_list": instruction_id_list,
+        "kwargs": kwargs,
+        "prompt": prompt_text,  # Required for judge evaluation
+    }
+
     data = {
         "data_source": "ifeval",
         "prompt": [
@@ -121,16 +136,7 @@ def process_ifeval_example(example, idx):
             "style": "rule",
             "ground_truth": str(ground_truth_list),  # String repr of list
         },
-        "extra_info": {
-            "ability": "instruction_following",
-            "split": "test",
-            "index": idx,
-            "original_prompt": prompt_text,
-            "dataset_source": "ifeval",
-            "instruction_id_list": instruction_id_list,
-            "kwargs": kwargs,
-            "prompt": prompt_text,  # Required for judge evaluation
-        },
+        "extra_info": json.dumps(extra_info_dict),  # String instead of dict
     }
     return data
 
