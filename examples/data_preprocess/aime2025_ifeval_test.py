@@ -29,10 +29,10 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 from typing import Optional
 
 import datasets
-from verl.utils.hdfs_io import copy, makedirs
 
 
 def process_aime_example(example, idx):
@@ -200,7 +200,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--hdfs_dir",
         default=None,
-        help="HDFS directory to copy processed data to.",
+        help="Additional directory to copy processed data to (optional).",
     )
     parser.add_argument(
         "--aime_local_path",
@@ -351,12 +351,12 @@ if __name__ == "__main__":
             json.dump(examples_to_save, f, indent=2, default=str)
         print(f"Saved example(s) to {example_path}")
 
-    # Copy to HDFS if specified
+    # Copy to additional directory if specified
     if args.hdfs_dir is not None:
-        print(f"Copying to HDFS: {args.hdfs_dir}...")
-        makedirs(args.hdfs_dir)
-        copy(src=local_dir, dst=args.hdfs_dir)
-        print("HDFS copy complete.")
+        print(f"Copying to additional location: {args.hdfs_dir}...")
+        os.makedirs(args.hdfs_dir, exist_ok=True)
+        shutil.copytree(local_dir, args.hdfs_dir, dirs_exist_ok=True)
+        print("Copy complete.")
 
     # Print statistics
     print("\n" + "=" * 80)
