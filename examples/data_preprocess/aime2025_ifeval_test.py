@@ -53,10 +53,9 @@ def process_aime_example(example, idx):
         "Put your reasoning in <think>...</think> tags and your final answer in <answer>...</answer> tags."
     )
 
-    # Store ground_truth as JSON string to avoid PyArrow type mixing
+    # Store all dict/list fields as JSON strings to avoid PyArrow type mixing
     ground_truth_dict = {"answer": answer}
 
-    # Store extra_info as JSON string to avoid PyArrow type mixing
     extra_info_dict = {
         "ability": "math",
         "split": "test",
@@ -67,20 +66,22 @@ def process_aime_example(example, idx):
         "prompt": problem,  # For consistency with IFEval
     }
 
+    reward_model_dict = {
+        "style": "rule",
+        "ground_truth": json.dumps(ground_truth_dict),
+    }
+
     data = {
         "data_source": "aime_2025",
-        "prompt": [
+        "prompt": json.dumps([
             {
                 "role": "user",
                 "content": prompt_with_instruction,
             }
-        ],
+        ]),
         "ability": "math",
-        "reward_model": {
-            "style": "rule",
-            "ground_truth": json.dumps(ground_truth_dict),  # String instead of dict
-        },
-        "extra_info": json.dumps(extra_info_dict),  # String instead of dict
+        "reward_model": json.dumps(reward_model_dict),
+        "extra_info": json.dumps(extra_info_dict),
     }
     return data
 
@@ -104,14 +105,14 @@ def process_ifeval_example(example, idx):
         "Put your reasoning in <think>...</think> tags and your response in <answer>...</answer> tags."
     )
 
-    # Store ground_truth as string repr of list[dict] for IFEval compatibility
+    # Store all dict/list fields as JSON strings to avoid PyArrow type mixing
+    # For IFEval ground_truth, use string repr of list[dict]
     # Format: "[{'instruction_id': [...], 'kwargs': [...]}]"
     ground_truth_list = [{
         "instruction_id": instruction_id_list,
         "kwargs": kwargs,
     }]
 
-    # Store extra_info as JSON string to avoid PyArrow type mixing
     extra_info_dict = {
         "ability": "instruction_following",
         "split": "test",
@@ -123,20 +124,22 @@ def process_ifeval_example(example, idx):
         "prompt": prompt_text,  # Required for judge evaluation
     }
 
+    reward_model_dict = {
+        "style": "rule",
+        "ground_truth": str(ground_truth_list),
+    }
+
     data = {
         "data_source": "ifeval",
-        "prompt": [
+        "prompt": json.dumps([
             {
                 "role": "user",
                 "content": prompt_with_instruction,
             }
-        ],
+        ]),
         "ability": "instruction_following",
-        "reward_model": {
-            "style": "rule",
-            "ground_truth": str(ground_truth_list),  # String repr of list
-        },
-        "extra_info": json.dumps(extra_info_dict),  # String instead of dict
+        "reward_model": json.dumps(reward_model_dict),
+        "extra_info": json.dumps(extra_info_dict),
     }
     return data
 
