@@ -33,6 +33,7 @@ import shutil
 from typing import Optional
 
 import datasets
+import pandas as pd
 
 
 def process_aime_example(example, idx):
@@ -52,6 +53,9 @@ def process_aime_example(example, idx):
         "Put your reasoning in <think>...</think> tags and your final answer in <answer>...</answer> tags."
     )
 
+    # Store ground_truth as JSON string to avoid PyArrow type mixing
+    ground_truth_dict = {"answer": answer}
+
     data = {
         "data_source": "aime_2025",
         "prompt": [
@@ -63,9 +67,7 @@ def process_aime_example(example, idx):
         "ability": "math",
         "reward_model": {
             "style": "rule",
-            "ground_truth": {
-                "answer": answer,
-            },
+            "ground_truth": json.dumps(ground_truth_dict),  # String instead of dict
         },
         "extra_info": {
             "ability": "math",
@@ -99,6 +101,12 @@ def process_ifeval_example(example, idx):
         "Put your reasoning in <think>...</think> tags and your response in <answer>...</answer> tags."
     )
 
+    # Store ground_truth as JSON string to avoid PyArrow type mixing
+    ground_truth_dict = {
+        "instruction_id_list": instruction_id_list,
+        "kwargs": kwargs,
+    }
+
     data = {
         "data_source": "ifeval",
         "prompt": [
@@ -110,10 +118,7 @@ def process_ifeval_example(example, idx):
         "ability": "instruction_following",
         "reward_model": {
             "style": "rule",
-            "ground_truth": {
-                "instruction_id_list": instruction_id_list,
-                "kwargs": kwargs,
-            },
+            "ground_truth": json.dumps(ground_truth_dict),  # String instead of dict
         },
         "extra_info": {
             "ability": "instruction_following",
@@ -320,11 +325,12 @@ if __name__ == "__main__":
     print(f"Total examples: {len(all_examples)}")
     print("=" * 80)
 
-    # Convert to dataset
-    combined_dataset = datasets.Dataset.from_list(all_examples)
+    # Convert to pandas DataFrame first (handles mixed types better)
+    print("Converting to DataFrame...")
+    df = pd.DataFrame(all_examples)
 
     # Shuffle with seed for reproducibility
-    combined_dataset = combined_dataset.shuffle(seed=args.seed)
+    df = df.sample(frac=1, random_state=args.seed).reset_index(drop=True)
 
     # Save to disk
     local_dir = os.path.expanduser(args.local_save_dir)
@@ -332,8 +338,13 @@ if __name__ == "__main__":
 
     test_path = os.path.join(local_dir, "test.parquet")
 
-    print(f"Saving combined test dataset to {test_path}...")
-    combined_dataset.to_parquet(test_path)
+    print(f"Saving to parquet: {test_path}...")
+    # Save directly from pandas (more robust with mixed types)
+    df.to_parquet(test_path, index=False, engine='pyarrow')
+
+    # Also load as Dataset for compatibility checking
+    print("Loading as Dataset for verification...")
+    combined_dataset = datasets.Dataset.from_pandas(df, preserve_index=False)
 
     # Save example JSON for reference
     if len(combined_dataset) > 0:
