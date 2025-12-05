@@ -103,6 +103,26 @@ def default_compute_score(
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
 
+    elif data_source in [
+        "naturalplan",
+        "naturalplan_trip_planning",
+        "naturalplan_meeting_planning",
+        "naturalplan_calendar_scheduling",
+    ]:
+        from . import naturalplan
+
+        # Determine task type from data_source
+        if data_source == "naturalplan_trip_planning":
+            task_type = "trip_planning"
+        elif data_source == "naturalplan_meeting_planning":
+            task_type = "meeting_planning"
+        elif data_source == "naturalplan_calendar_scheduling":
+            task_type = "calendar_scheduling"
+        else:
+            task_type = "auto"
+
+        res = naturalplan.compute_score(solution_str, ground_truth, task_type=task_type)
+
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
