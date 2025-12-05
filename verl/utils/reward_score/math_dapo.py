@@ -138,6 +138,10 @@ def normalize_final_answer(final_answer: str) -> str:
     for expr in REMOVED_EXPRESSIONS:
         final_answer = final_answer.replace(expr, "")
 
+    # Normalize \dfrac to \frac (display fraction to inline fraction)
+    final_answer = final_answer.replace("\\dfrac", "\\frac")
+    final_answer = final_answer.replace("\\tfrac", "\\frac")
+
     # Extract and normalize LaTeX math
     final_answer = re.sub(r"(.*?)(\$)(.*?)(\$)(.*)", "$\\3$", final_answer)
     final_answer = re.sub(r"(\\text\{)(.*?)(\})", "\\2", final_answer)
@@ -163,7 +167,10 @@ def normalize_final_answer(final_answer: str) -> str:
 
 
 def is_correct_minerva(
-    solution_str: str, gt: str, gt_need_extract: bool = False, answer_pattern: str = r"(?i)Answer\s*:\s*([^\n]+)"
+    solution_str: str,
+    gt: str,
+    gt_need_extract: bool = False,
+    answer_pattern: str = r"(?i)\*{0,2}Answer\*{0,2}\s*:\s*([^\n]+)",
 ) -> tuple[bool, str]:
     """Check if the solution is correct according to Minerva criteria.
 
@@ -171,7 +178,7 @@ def is_correct_minerva(
         solution_str: The solution string to check
         gt: The ground truth answer
         gt_need_extract: Whether the ground truth needs extraction
-        answer_pattern: Regex pattern to extract the answer
+        answer_pattern: Regex pattern to extract the answer (handles markdown bold)
 
     Returns:
         Tuple of (is_correct, normalized_prediction)
@@ -214,7 +221,14 @@ def is_correct_strict_box(
     boxed_pred = last_boxed_only_string(pred)
     extracted_pred = remove_boxed(boxed_pred) if boxed_pred is not None else None
 
-    return 1 if (extracted_pred == gt) else -1, extracted_pred
+    if extracted_pred is None:
+        return -1, None
+
+    # Normalize both for comparison (handles \dfrac vs \frac, etc.)
+    normalized_pred = normalize_final_answer(extracted_pred)
+    normalized_gt = normalize_final_answer(gt)
+
+    return 1 if (normalized_pred == normalized_gt) else -1, extracted_pred
 
 
 def verify(
