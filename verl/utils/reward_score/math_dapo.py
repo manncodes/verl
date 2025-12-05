@@ -138,9 +138,48 @@ def normalize_final_answer(final_answer: str) -> str:
     for expr in REMOVED_EXPRESSIONS:
         final_answer = final_answer.replace(expr, "")
 
-    # Normalize \dfrac to \frac (display fraction to inline fraction)
+    # Normalize fraction variants to \frac
     final_answer = final_answer.replace("\\dfrac", "\\frac")
     final_answer = final_answer.replace("\\tfrac", "\\frac")
+    final_answer = final_answer.replace("\\cfrac", "\\frac")
+
+    # Remove \left and \right (delimiter sizing doesn't change value)
+    final_answer = final_answer.replace("\\left", "")
+    final_answer = final_answer.replace("\\right", "")
+
+    # Remove size modifiers for delimiters
+    for size in ["\\Big", "\\big", "\\bigg", "\\Bigg"]:
+        final_answer = final_answer.replace(size, "")
+
+    # Remove style modifiers (don't change value)
+    final_answer = final_answer.replace("\\displaystyle", "")
+    final_answer = final_answer.replace("\\textstyle", "")
+    final_answer = final_answer.replace("\\scriptstyle", "")
+
+    # Normalize Unicode minus to ASCII hyphen
+    final_answer = final_answer.replace("−", "-")  # U+2212 → U+002D
+
+    # Remove spacing commands
+    final_answer = final_answer.replace("\\quad", "")
+    final_answer = final_answer.replace("\\qquad", "")
+    final_answer = final_answer.replace("\\!", "")
+    final_answer = final_answer.replace("\\,", "")
+    final_answer = final_answer.replace("\\:", "")
+    final_answer = final_answer.replace("\\;", "")
+
+    # Remove line breaks
+    final_answer = final_answer.replace("\\\\", "")
+    final_answer = final_answer.replace("\n", "")
+
+    # Normalize math font commands (extract content)
+    final_answer = re.sub(r"\\mathrm\{([^}]*)\}", r"\1", final_answer)
+    final_answer = re.sub(r"\\mathbf\{([^}]*)\}", r"\1", final_answer)
+    final_answer = re.sub(r"\\mathit\{([^}]*)\}", r"\1", final_answer)
+    final_answer = re.sub(r"\\mathsf\{([^}]*)\}", r"\1", final_answer)
+    final_answer = re.sub(r"\\mathtt\{([^}]*)\}", r"\1", final_answer)
+    final_answer = re.sub(r"\\mathcal\{([^}]*)\}", r"\1", final_answer)
+    final_answer = re.sub(r"\\mathbb\{([^}]*)\}", r"\1", final_answer)
+    final_answer = re.sub(r"\\operatorname\{([^}]*)\}", r"\1", final_answer)
 
     # Extract and normalize LaTeX math
     final_answer = re.sub(r"(.*?)(\$)(.*?)(\$)(.*)", "$\\3$", final_answer)
@@ -158,6 +197,9 @@ def normalize_final_answer(final_answer: str) -> str:
     final_answer = re.sub(r"(frac)([^{])(.)", "frac{\\2}{\\3}", final_answer)
     final_answer = re.sub(r"(sqrt)([^{])", "sqrt{\\2}", final_answer)
     final_answer = final_answer.replace("$", "")
+
+    # Remove trailing period (common in sentence answers)
+    final_answer = final_answer.rstrip(".")
 
     # Normalize numbers
     if final_answer.replace(",", "").isdigit():
