@@ -1,0 +1,275 @@
+# GOLD (General Online Logit Distillation) Trainer Configuration
+#
+# This configuration extends the GKD on-policy distillation trainer with:
+# - Generalized JSD loss with configurable beta interpolation
+# - Lambda-controlled on-policy/off-policy mixing
+# - Temperature scaling for distribution smoothing
+#
+# References:
+# - GOLD: https://huggingface.co/docs/trl/main/gold_trainer
+# - GKD: https://arxiv.org/abs/2306.13649
+
+# GOLD-specific parameters
+gold:
+  # JSD interpolation coefficient (0.0-1.0)
+  # beta=0.5: Symmetric JSD (default, balanced between forward and reverse KL)
+  # beta->1.0: Approaches forward KL (student covers all teacher modes, avoids mode collapse)
+  # beta->0.0: Approaches reverse KL (student focuses on high-probability modes)
+  beta: 0.5
+
+  # On-policy fraction (0.0-1.0)
+  # lmbda=1.0: Pure on-policy (all samples generated from student)
+  # lmbda=0.0: Pure off-policy (all samples from dataset)
+  # lmbda=0.5: Mixed (50% on-policy, 50% off-policy)
+  lmbda: 0.5
+
+  # Softmax temperature for distribution smoothing
+  # Higher values make distributions more uniform (softer)
+  # Lower values sharpen distributions (more confident)
+  temperature: 0.9
+
+  # Sequence-level knowledge distillation (not yet implemented)
+  seq_kd: false
+
+# Data configuration
+data:
+  tokenizer: null
+  train_files: /path/to/train.parquet
+  val_files: null
+  prompt_key: question
+  reward_fn_key: data_source
+  max_prompt_length: 512
+  max_response_length: 512
+  train_batch_size: 1024
+  val_batch_size: null
+  return_raw_input_ids: False
+  return_raw_chat: False
+  return_full_prompt: False
+  shuffle: True
+  filter_overlong_prompts: False
+  filter_overlong_prompts_workers: 1
+  truncation: error
+  trust_remote_code: False
+  custom_cls:
+      path: null
+      name: null
+  sampler:
+    class_path: null
+    class_name: null
+  dataloader_num_workers: 8
+  return_multi_modal_inputs: True
+
+# Actor and Rollout configuration
+actor_rollout_ref:
+  hybrid_engine: False
+  nccl_timeout: 600
+  model:
+    path: /path/to/MODEL
+    custom_chat_template: null
+    external_lib: null
+    override_config:
+      model_config: {"num_nextn_predict_layers": 0}
+      moe_config:
+        freeze_moe_router: False
+    enable_gradient_checkpointing: False
+    use_remove_padding: False
+    trust_remote_code: False
+
+  actor:
+    strategy: megatron
+    micro_batch_size: 2
+    megatron:
+      param_offload: False
+      grad_offload: False
+      optimizer_offload: False
+      tensor_model_parallel_size: 1
+      expert_model_parallel_size: 1
+      expert_tensor_parallel_size: null
+      pipeline_model_parallel_size: 1
+      virtual_pipeline_model_parallel_size: null
+      context_parallel_size: 1
+      sequence_parallel: True
+      use_distributed_optimizer: True
+      use_dist_checkpointing: False
+      dist_checkpointing_path: null
+      seed: 42
+      override_transformer_config: {}
+      use_mbridge: False
+    optim:
+      lr: 1e-6
+      lr_warmup_steps_ratio: 0.0
+      total_training_steps: -1
+      weight_decay: 0.01
+      optimizer: adam
+      clip_grad: 1.0
+      lr_warmup_init: 0.0
+      lr_warmup_steps: null
+      lr_decay_steps: null
+      lr_decay_style: constant
+      min_lr: 0.0
+      weight_decay_incr_style: constant
+      lr_wsd_decay_style: exponential
+      lr_wsd_decay_steps: null
+      use_checkpoint_opt_param_scheduler: False
+    data_loader_seed: null
+    load_weight: True
+    checkpoint:
+      async_save: False
+      save_contents: ['model', 'optimizer', 'extra']
+      load_contents: ${actor_rollout_ref.actor.checkpoint.save_contents}
+    use_dynamic_bsz: False
+    max_token_len: 1024
+    use_torch_compile: False
+    shuffle: False
+    profiler:
+      _target_: verl.utils.profiler.ProfilerConfig
+      tool: ${oc.select:global_profiler.tool,null}
+      enable: False
+      all_ranks: False
+      ranks: []
+      save_path: ${oc.select:global_profiler.save_path,null}
+      tool_config:
+        nsys:
+          discrete: ${oc.select:global_profiler.global_tool_config.nsys.discrete}
+        npu:
+          _target_: verl.utils.profiler.config.NPUToolConfig
+          contents: []
+          level: "level1"
+          analysis: True
+        torch:
+          _target_: verl.utils.profiler.config.TorchProfilerToolConfig
+          step_start: 0
+          step_end: null
+
+  rollout:
+    _target_: verl.workers.config.RolloutConfig
+    name: vllm
+    mode: sync
+    temperature: 1.0
+    top_k: -1
+    top_p: 1
+    data_parallel_size: 1
+    expert_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    dtype: bfloat16
+    gpu_memory_utilization: 0.5
+    ignore_eos: False
+    enforce_eager: True
+    free_cache_engine: True
+    load_format: dummy_megatron
+    tensor_model_parallel_size: 1
+    max_num_batched_tokens: 8192
+    max_model_len: null
+    max_num_seqs: 1024
+    disable_log_stats: True
+    enable_chunked_prefill: False
+    do_sample: True
+    layer_name_map:
+      qkv_layer_name: qkv
+      gate_proj_layer_name: gate_up
+    engine_kwargs:
+      vllm:
+        swap_space: null
+        disable_mm_preprocessor_cache: False
+      sglang:
+        attention_backend: null
+    val_kwargs:
+      top_k: -1
+      top_p: 1.0
+      temperature: 0
+      n: 1
+      do_sample: False
+    multi_turn:
+      _target_: verl.workers.config.MultiTurnConfig
+      enable: False
+      max_assistant_turns: null
+      tool_config_path: null
+      max_user_turns: null
+      max_parallel_calls: 1
+      max_tool_response_length: 256
+      tool_response_truncate_side: middle
+      interaction_config_path: null
+      use_inference_chat_template: False
+      tokenization_sanity_check_mode: strict
+      format: hermes
+    agent:
+      num_workers: 8
+      custom_async_server:
+        path: null
+        name: null
+    update_weights_bucket_megabytes: 512
+    calculate_log_probs: False
+
+  teacher:
+    server_ip: localhost
+    server_port: 15555
+    overlap_rollout: False
+    n_server_workers: 1
+
+# Trainer configuration
+trainer:
+  balance_batch: True
+  total_epochs: 30
+  total_training_steps: null
+  profile_steps: null
+  project_name: verl_gold
+  experiment_name: gold_distill
+  logger: ['console']
+  log_val_generations: 0
+  nnodes: 1
+  n_gpus_per_node: 4
+  save_freq: -1
+  esi_redundant_time: 0
+  resume_mode: auto
+  resume_from_path: null
+  del_local_ckpt_after_load: False
+  val_before_train: True
+  test_freq: -1
+  critic_warmup: 0
+  default_hdfs_dir: null
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  max_actor_ckpt_to_keep: null
+  max_critic_ckpt_to_keep: null
+  ray_wait_register_center_timeout: 300
+  device: cuda
+  # Scheduler: one_step_off or two_step_off
+  # one_step_off: Better for simpler overlapping scenarios
+  # two_step_off: Better when teacher takes much longer than weight sync
+  scheduler: one_step_off
+
+# Rollout resource pool
+rollout:
+  nnodes: 1
+  n_gpus_per_node: 4
+
+# Ray initialization
+ray_init:
+  num_cpus: null
+  timeline_json_file: null
+
+# Global profiler configuration
+global_profiler:
+  _target_: verl.utils.profiler.ProfilerConfig
+  tool: null
+  steps: null
+  profile_continuous_steps: False
+  save_path: "outputs/profile"
+  global_tool_config:
+    nsys:
+      _target_: verl.utils.profiler.config.NsightToolConfig
+      discrete: False
+      all_ranks: False
+      ranks: []
+      controller_nsight_options:
+        trace: "cuda,nvtx,cublas,ucx"
+        cuda-memory-usage: "true"
+        cuda-graph-trace: "graph"
+      worker_nsight_options:
+        trace: "cuda,nvtx,cublas,ucx"
+        cuda-memory-usage: "true"
+        cuda-graph-trace: "graph"
+        capture-range: "cudaProfilerApi"
+        capture-range-end: null
+        kill: none
