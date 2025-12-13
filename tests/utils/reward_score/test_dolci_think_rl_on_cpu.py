@@ -442,18 +442,42 @@ class TestCodeScoringFallback:
 # =============================================================================
 
 
-class TestGeneralScoring:
-    """Tests for general quality scoring functionality."""
+class TestFallbackScoring:
+    """Tests for fallback scoring functionality (uses string matching)."""
 
     @pytest.mark.parametrize("test_case", GENERAL_TEST_CASES, ids=lambda tc: tc["description"])
-    def test_general_cases(self, dolci_module, test_case):
-        extra_info = {"dataset_source": "general-quality"}
+    def test_fallback_cases(self, dolci_module, test_case):
+        # Use "other" dataset source to test string matching fallback
+        extra_info = {"dataset_source": "other"}
         score = dolci_module.compute_score(
             solution_str=test_case["solution"],
             ground_truth=test_case["ground_truth"],
             extra_info=extra_info,
         )
         assert score == test_case["expected_score"]
+
+
+# Check if LLM judge is available
+LLM_JUDGE_AVAILABLE = bool(os.environ.get("LLM_JUDGE_URL"))
+requires_llm_judge = pytest.mark.skipif(
+    not LLM_JUDGE_AVAILABLE, reason="LLM_JUDGE_URL environment variable not set"
+)
+
+
+@requires_llm_judge
+class TestGeneralQualityScoring:
+    """Tests for general-quality scoring with LLM judge."""
+
+    def test_general_quality_basic(self, dolci_module):
+        """Test general-quality scoring calls LLM judge."""
+        extra_info = {"dataset_source": "general-quality"}
+        score = dolci_module.compute_score(
+            solution_str="The capital of France is Paris.",
+            ground_truth="Paris",
+            extra_info=extra_info,
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
 
 
 # =============================================================================
@@ -479,7 +503,7 @@ class TestBatchProcessing:
         ]
         extra_infos = [
             {"dataset_source": "math"},
-            {"dataset_source": "general-quality"},
+            {"dataset_source": "other"},  # Uses string matching fallback
         ]
 
         scores = dolci_module.compute_score_batch(
@@ -490,7 +514,7 @@ class TestBatchProcessing:
 
         assert len(scores) == 2
         assert scores[0] == pytest.approx(1.0, abs=0.1)  # Math correct
-        assert scores[1] == 1.0  # General contains answer
+        assert scores[1] == 1.0  # String match fallback
 
     def test_empty_batch(self, dolci_module):
         """Test batch processing with empty input."""
@@ -509,7 +533,7 @@ class TestBatchProcessing:
         extra_infos = [
             {"dataset_source": "math"},
             {"dataset_source": "math"},
-            {"dataset_source": "general-quality"},
+            {"dataset_source": "other"},  # Uses string matching fallback
         ]
 
         scores = dolci_module.compute_score_batch(
@@ -532,14 +556,10 @@ class TestBatchProcessing:
         extra_infos = []
 
         for i in range(n_samples):
-            if i % 2 == 0:
-                solutions.append(f"The answer is {i}.")
-                ground_truths.append(str(i))
-                extra_infos.append({"dataset_source": "general-quality"})
-            else:
-                solutions.append(f"Result: {i}")
-                ground_truths.append(str(i))
-                extra_infos.append({"dataset_source": "other"})
+            # Use "other" dataset source for string matching fallback tests
+            solutions.append(f"The answer is {i}.")
+            ground_truths.append(str(i))
+            extra_infos.append({"dataset_source": "other"})
 
         scores = dolci_module.compute_score_batch(
             solution_strs=solutions,
