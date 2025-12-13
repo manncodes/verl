@@ -15,62 +15,82 @@
 Reward scoring for allenai/Dolci-Think-RL dataset.
 
 Routes to appropriate existing reward functions based on dataset_source:
-- math: Uses math_verify (verifiable)
-- ifeval: Uses IFEval constraint checking (verifiable)
-- code/code_stdio: Uses sandbox_fusion for code execution (BATCHED)
-- general-quality/other: Uses basic verifiable matching
+- math: Uses math_verify.MathVerifier (verifiable)
+- instruction_following: Uses ifeval (verifiable)
+- code: Uses LLM-as-a-judge via StructuredJudge (BATCHED)
+- chat: Uses basic verifiable matching
 
 Reference: https://huggingface.co/datasets/allenai/Dolci-Think-RL
 """
 
-import concurrent.futures
-import json
 import logging
-import os
-import re
-import threading
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Default configuration
-DEFAULT_SANDBOX_TIMEOUT = 10
-DEFAULT_MEMORY_LIMIT_MB = 1024
-DEFAULT_MAX_WORKERS = max(32, os.cpu_count() * 4 if os.cpu_count() else 32)
+# Singleton instance for LLM judge
+_judge_instance: Optional[Any] = None
 
 
 def remove_thinking_section(prediction: str) -> str:
     """Remove thinking/reasoning sections from model output before reward computation.
 
     Strips <think>...</think>, <evaluation>...</evaluation>, and <answer> tags.
-
-    Args:
-        prediction: The model's raw output.
-
-    Returns:
-        Cleaned output with thinking sections removed.
     """
     if prediction is None:
         return ""
     prediction = prediction.replace("<|assistant|>", "").strip()
-    # Remove thinking section from the prediction
+    # remove thinking section from the prediction
     prediction = prediction.split("</think>")[-1]
-    # Remove evaluation section
+    # remove evaluation
     prediction = prediction.split("</evaluation>")[-1]
-    # Remove answer tags from the prediction
+    # remove answer tags from the prediction
     prediction = prediction.replace("<answer>", "").replace("</answer>", "")
     return prediction.strip()
+
+
+def _get_judge(**kwargs) -> Any:
+    """Get or create the singleton StructuredJudge instance.
+
+    Implements lazy initialization to avoid creating the judge until needed.
+
+    Args:
+        **kwargs: Arguments for create_verl_judge (base_url, model, max_concurrent).
+
+    Returns:
+        StructuredJudge instance or None if unavailable.
+    """
+    global _judge_instance
+
+    if _judge_instance is not None:
+        return _judge_instance
+
+    try:
+        from verl.utils.reward_score.judgev3 import create_verl_judge
+
+        _judge_instance = create_verl_judge(
+            base_url=kwargs.get(
+                "base_url",
+                "http://qpn744-vllm-gptoss120b-svc.llm-pretraining.svc.cluster.local:8000/v1",
+            ),
+            model=kwargs.get("model", "openai/gpt-oss-120b"),
+            # max_concurrent=kwargs.get("max_concurrent", 128),
+        )
+        logger.info("Initialized singleton StructuredJudge instance")
+    except ImportError:
+        logger.warning("StructuredJudge not available (judgev3 module not found)")
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to initialize StructuredJudge: {e}")
+        return None
+
+    return _judge_instance
 
 
 def _basic_string_match(solution_str: str, ground_truth: str) -> float:
     """Basic string matching for fallback.
 
-    Args:
-        solution_str: The model's solution (already cleaned).
-        ground_truth: The expected answer.
-
-    Returns:
-        1.0 if match, 0.0 otherwise.
+    NOTE: Assumes thinking section already removed via remove_thinking_section().
     """
     # Normalize
     answer = solution_str.lower().strip()
@@ -83,667 +103,105 @@ def _basic_string_match(solution_str: str, ground_truth: str) -> float:
     return 0.0
 
 
-def _normalize_ground_truth(ground_truth: Any) -> Optional[str]:
-    """Normalize ground_truth which may be a list or string.
-
-    Args:
-        ground_truth: The ground truth value (may be list or string).
-
-    Returns:
-        Normalized string or None.
-    """
-    if ground_truth is None:
-        return None
-    if isinstance(ground_truth, list):
-        return ground_truth[0] if ground_truth else None
-    return str(ground_truth)
-
-
-# =============================================================================
-# Math Scoring
-# =============================================================================
-
-
-def _compute_math_scores(
-    indices: List[int],
-    solutions: List[str],
-    ground_truths: List[str],
-) -> Dict[int, float]:
-    """Compute math scores using math_dapo (primary) or math_verify (fallback).
-
-    Args:
-        indices: Original indices in the batch.
-        solutions: List of solution strings.
-        ground_truths: List of ground truth answers.
-
-    Returns:
-        Dict mapping index to score.
-    """
-    results = {}
-
-    # Try math_dapo first (always available), then math_verify (requires pip install math-verify)
-    math_compute_score = None
-    math_module_name = None
-
-    # Priority 1: math_dapo (always available in verl)
-    try:
-        from verl.utils.reward_score import math_dapo
-
-        math_compute_score = math_dapo.compute_score
-        math_module_name = "math_dapo"
-        logger.debug("Using math_dapo for math scoring")
-    except ImportError:
-        pass
-
-    # Priority 2: math_verify (requires pip install math-verify)
-    if math_compute_score is None:
-        try:
-            from verl.utils.reward_score import math_verify
-
-            # Test if math_verify is actually functional (math-verify package installed)
-            # The module exists but requires external package
-            if hasattr(math_verify, "compute_score"):
-                # Try a quick test to see if it works
-                try:
-                    _ = math_verify.compute_score("\\boxed{1}", "1")
-                    math_compute_score = math_verify.compute_score
-                    math_module_name = "math_verify"
-                    logger.debug("Using math_verify for math scoring")
-                except Exception as e:
-                    logger.debug(f"math_verify.compute_score test failed: {e}")
-        except ImportError:
-            pass
-
-    if math_compute_score is None:
-        logger.error("Neither math_dapo nor math_verify available for math scoring")
-        for idx in indices:
-            results[idx] = 0.0
-        return results
-
-    for idx, sol, gt in zip(indices, solutions, ground_truths):
-        if sol is None or gt is None:
-            results[idx] = 0.0
-            continue
-        try:
-            result = math_compute_score(sol, gt)
-            if isinstance(result, dict):
-                # math_dapo returns {"score": ..., "acc": ..., "pred": ...}
-                score = result.get("score", 0.0)
-            else:
-                score = float(result)
-            # Normalize negative scores to 0.0 for consistency across all data types
-            # math_dapo returns -1.0 for wrong answers, but we want 0.0/1.0 range
-            results[idx] = max(0.0, score)
-        except Exception as e:
-            logger.debug(f"Math verification failed for index {idx} using {math_module_name}: {e}")
-            results[idx] = 0.0
-
-    return results
-
-
-# =============================================================================
-# IFEval Scoring (Instruction Following)
-# =============================================================================
-
-
-class IFEvalChecker:
-    """Checker for IFEval instruction-following constraints.
-
-    Supports common constraint types from the IFEval benchmark.
-    """
-
-    def check_constraint(
-        self,
-        response: str,
-        constraint_type: Optional[str],
-        constraint: Optional[str],
-        extra_info: Optional[Dict],
-    ) -> float:
-        """Check if response satisfies the given constraint.
-
-        Args:
-            response: The model's response.
-            constraint_type: Type of constraint (e.g., "keywords", "length", "format").
-            constraint: The constraint specification.
-            extra_info: Additional context that may contain constraint details.
-
-        Returns:
-            1.0 if constraint satisfied, 0.0 otherwise.
-        """
-        if not constraint_type or not constraint:
-            # No constraint specified, check basic presence
-            return 1.0 if response.strip() else 0.0
-
-        constraint_type = constraint_type.lower()
-        try:
-            # Parse constraint if it's JSON
-            if isinstance(constraint, str):
-                try:
-                    constraint_data = json.loads(constraint)
-                except json.JSONDecodeError:
-                    constraint_data = constraint
-            else:
-                constraint_data = constraint
-
-            # Route to appropriate checker
-            if "keyword" in constraint_type:
-                return self._check_keywords(response, constraint_data)
-            elif "length" in constraint_type or "word" in constraint_type:
-                return self._check_length(response, constraint_data)
-            elif "format" in constraint_type:
-                return self._check_format(response, constraint_data)
-            elif "start" in constraint_type:
-                return self._check_start(response, constraint_data)
-            elif "end" in constraint_type:
-                return self._check_end(response, constraint_data)
-            elif "section" in constraint_type or "bullet" in constraint_type:
-                return self._check_sections(response, constraint_data)
-            elif "json" in constraint_type:
-                return self._check_json(response, constraint_data)
-            elif "language" in constraint_type:
-                return self._check_language(response, constraint_data)
-            else:
-                # Unknown constraint type - be lenient
-                logger.debug(f"Unknown constraint type: {constraint_type}")
-                return 1.0 if response.strip() else 0.0
-
-        except Exception as e:
-            logger.debug(f"Constraint check failed: {e}")
-            return 0.0
-
-    def _check_keywords(self, response: str, constraint: Any) -> float:
-        """Check keyword inclusion/exclusion constraints."""
-        response_lower = response.lower()
-
-        if isinstance(constraint, dict):
-            include = constraint.get("include", constraint.get("keywords", []))
-            exclude = constraint.get("exclude", [])
-
-            # Check all required keywords are present
-            if include:
-                if isinstance(include, str):
-                    include = [include]
-                for keyword in include:
-                    if keyword.lower() not in response_lower:
-                        return 0.0
-
-            # Check no excluded keywords are present
-            if exclude:
-                if isinstance(exclude, str):
-                    exclude = [exclude]
-                for keyword in exclude:
-                    if keyword.lower() in response_lower:
-                        return 0.0
-
-            return 1.0
-
-        elif isinstance(constraint, list):
-            # List of keywords to include
-            for keyword in constraint:
-                if str(keyword).lower() not in response_lower:
-                    return 0.0
-            return 1.0
-
-        elif isinstance(constraint, str):
-            return 1.0 if constraint.lower() in response_lower else 0.0
-
-        return 1.0
-
-    def _check_length(self, response: str, constraint: Any) -> float:
-        """Check word/character length constraints."""
-        word_count = len(response.split())
-
-        if isinstance(constraint, dict):
-            min_words = constraint.get("min_words", constraint.get("min", 0))
-            max_words = constraint.get("max_words", constraint.get("max", float("inf")))
-
-            if word_count < min_words or word_count > max_words:
-                return 0.0
-            return 1.0
-
-        elif isinstance(constraint, int):
-            # Assume it's exact word count
-            return 1.0 if word_count == constraint else 0.0
-
-        return 1.0
-
-    def _check_format(self, response: str, constraint: Any) -> float:
-        """Check format constraints (markdown, lists, etc.)."""
-        if isinstance(constraint, dict):
-            fmt = constraint.get("format", "").lower()
-        else:
-            fmt = str(constraint).lower()
-
-        if "markdown" in fmt or "md" in fmt:
-            # Check for markdown elements
-            has_headers = bool(re.search(r"^#{1,6}\s", response, re.MULTILINE))
-            has_lists = bool(re.search(r"^[-*]\s|\d+\.\s", response, re.MULTILINE))
-            return 1.0 if (has_headers or has_lists) else 0.0
-
-        elif "bullet" in fmt or "list" in fmt:
-            has_bullets = bool(re.search(r"^[-*•]\s", response, re.MULTILINE))
-            has_numbers = bool(re.search(r"^\d+[.)]\s", response, re.MULTILINE))
-            return 1.0 if (has_bullets or has_numbers) else 0.0
-
-        return 1.0
-
-    def _check_start(self, response: str, constraint: Any) -> float:
-        """Check if response starts with specific text."""
-        if isinstance(constraint, dict):
-            prefix = constraint.get("prefix", constraint.get("start", ""))
-        else:
-            prefix = str(constraint)
-
-        if prefix:
-            return 1.0 if response.strip().lower().startswith(prefix.lower()) else 0.0
-        return 1.0
-
-    def _check_end(self, response: str, constraint: Any) -> float:
-        """Check if response ends with specific text."""
-        if isinstance(constraint, dict):
-            suffix = constraint.get("suffix", constraint.get("end", ""))
-        else:
-            suffix = str(constraint)
-
-        if suffix:
-            return 1.0 if response.strip().lower().endswith(suffix.lower()) else 0.0
-        return 1.0
-
-    def _check_sections(self, response: str, constraint: Any) -> float:
-        """Check section/paragraph count constraints."""
-        # Count sections by double newlines or headers
-        sections = re.split(r"\n\n+|^#{1,6}\s", response, flags=re.MULTILINE)
-        sections = [s.strip() for s in sections if s.strip()]
-        section_count = len(sections)
-
-        if isinstance(constraint, dict):
-            min_sections = constraint.get("min", 1)
-            max_sections = constraint.get("max", float("inf"))
-            return 1.0 if min_sections <= section_count <= max_sections else 0.0
-
-        elif isinstance(constraint, int):
-            return 1.0 if section_count >= constraint else 0.0
-
-        return 1.0
-
-    def _check_json(self, response: str, constraint: Any) -> float:
-        """Check if response contains valid JSON."""
-        # Try to extract JSON from response
-        json_pattern = r"\{[^{}]*\}|\[[^\[\]]*\]"
-        matches = re.findall(json_pattern, response, re.DOTALL)
-
-        for match in matches:
-            try:
-                json.loads(match)
-                return 1.0
-            except json.JSONDecodeError:
-                continue
-
-        # Try parsing entire response as JSON
-        try:
-            json.loads(response.strip())
-            return 1.0
-        except json.JSONDecodeError:
-            pass
-
-        return 0.0
-
-    def _check_language(self, response: str, constraint: Any) -> float:
-        """Check language constraints (basic heuristic)."""
-        # This is a simplified check - full language detection would need a library
-        if isinstance(constraint, dict):
-            lang = constraint.get("language", "").lower()
-        else:
-            lang = str(constraint).lower()
-
-        if lang in ["english", "en"]:
-            # Check for non-ASCII characters (crude check)
-            ascii_ratio = sum(1 for c in response if ord(c) < 128) / max(len(response), 1)
-            return 1.0 if ascii_ratio > 0.8 else 0.0
-
-        # For other languages, be lenient
-        return 1.0
-
-
-# Global IFEval checker instance
-_ifeval_checker = IFEvalChecker()
-
-
-def _compute_ifeval_scores(
-    indices: List[int],
-    solutions: List[str],
-    ground_truths: List[str],
-    extra_infos: List[Optional[Dict]],
-) -> Dict[int, float]:
-    """Compute IFEval instruction-following scores.
-
-    Args:
-        indices: Original indices in the batch.
-        solutions: List of solution strings.
-        ground_truths: List of ground truth answers (may be None for IF tasks).
-        extra_infos: List of extra_info dicts with constraint info.
-
-    Returns:
-        Dict mapping index to score.
-    """
-    results = {}
-
-    for idx, sol, gt, extra_info in zip(indices, solutions, ground_truths, extra_infos):
-        if sol is None:
-            results[idx] = 0.0
-            continue
-
-        # Extract constraint info from extra_info
-        constraint_type = None
-        constraint = None
-        if extra_info and isinstance(extra_info, dict):
-            constraint_type = extra_info.get("constraint_type")
-            constraint = extra_info.get("constraint")
-
-        # Check the constraint
-        score = _ifeval_checker.check_constraint(sol, constraint_type, constraint, extra_info)
-        results[idx] = score
-
-    return results
-
-
-# =============================================================================
-# Code Scoring (sandbox_fusion)
-# =============================================================================
-
-
-def _extract_code_from_response(completion: str) -> Optional[str]:
-    """Extract code from a model completion.
-
-    Handles various code block formats:
-    - ```python ... ```
-    - ```python3 ... ```
-    - ``` ... ``` (no language specifier)
-    - Multiple code blocks (uses the last Python block)
-    - Raw code without blocks
-
-    Args:
-        completion: The model's response potentially containing code blocks.
-
-    Returns:
-        Extracted code or None if no valid code found.
-    """
-    if completion is None:
-        return None
-
-    # Try to extract Python code block (handles python, python3, etc.)
-    # Use regex to match ```python followed by optional suffix (like "3") and whitespace
-    python_block_pattern = r"```python\d*\s*\n(.*?)```"
-    python_matches = re.findall(python_block_pattern, completion, re.DOTALL)
-    if python_matches:
-        # Use the last Python block (often the final/correct solution)
-        return python_matches[-1].strip()
-
-    # Try generic code block (``` without language specifier)
-    if "```" in completion:
-        parts = completion.split("```")
-        # Look for code blocks (odd indices after split)
-        for i in range(len(parts) - 1, 0, -2):  # Iterate backwards through code blocks
-            solution = parts[i]
-            if not solution.strip():
-                continue
-            # Remove potential language specifier on first line
-            if "\n" in solution:
-                first_line, rest = solution.split("\n", 1)
-                # Check if first line is just a language name (alphanumeric only)
-                first_line_stripped = first_line.strip()
-                if first_line_stripped and (first_line_stripped.isalpha() or first_line_stripped.isalnum()):
-                    # Skip if it looks like a language specifier
-                    if len(first_line_stripped) < 20:  # Language names are short
-                        solution = rest
-            return solution.strip()
-
-    # Return raw completion if no code blocks found
-    return completion.strip()
-
-
-def _compute_code_scores_sandbox(
-    indices: List[int],
-    solutions: List[str],
-    ground_truths: List[str],
-    extra_infos: List[Optional[Dict]],
-    sandbox_fusion_url: str,
-    concurrent_semaphore: Optional[threading.Semaphore] = None,
-    memory_limit_mb: int = DEFAULT_MEMORY_LIMIT_MB,
-    timeout: int = DEFAULT_SANDBOX_TIMEOUT,
-) -> Dict[int, float]:
-    """Compute code scores using sandbox_fusion.
-
-    Args:
-        indices: Original indices in the batch.
-        solutions: List of code solutions.
-        ground_truths: List of ground truths (test cases as JSON string).
-        extra_infos: List of extra_info dicts with problem context.
-        sandbox_fusion_url: URL of the sandbox_fusion service.
-        concurrent_semaphore: Semaphore for concurrency control.
-        memory_limit_mb: Memory limit for code execution.
-        timeout: Timeout for code execution.
-
-    Returns:
-        Dict mapping index to score.
-    """
-    from verl.utils.reward_score.sandbox_fusion import compute_score as sandbox_compute_score
-
-    results = {}
-
-    for idx, sol, gt, extra_info in zip(indices, solutions, ground_truths, extra_infos):
-        if sol is None:
-            results[idx] = 0.0
-            continue
-
-        # Extract code from solution
-        code = _extract_code_from_response(sol)
-        if not code:
-            results[idx] = 0.0
-            continue
-
-        # Parse test cases from ground_truth
-        test_cases = gt
-        if isinstance(gt, str):
-            try:
-                test_cases = json.loads(gt)
-            except json.JSONDecodeError:
-                # Try to construct test cases from extra_info
-                test_cases = _build_test_cases_from_extra_info(gt, extra_info)
-
-        if not test_cases or not isinstance(test_cases, dict):
-            # No valid test cases, fallback to string comparison
-            logger.debug(f"No valid test cases for index {idx}, using string match")
-            results[idx] = _basic_string_match(sol, str(gt)) if gt else 0.0
-            continue
-
-        try:
-            score, metadata = sandbox_compute_score(
-                sandbox_fusion_url=sandbox_fusion_url,
-                concurrent_semaphore=concurrent_semaphore,
-                memory_limit_mb=memory_limit_mb,
-                completion=sol,  # Pass full completion, sandbox_compute_score extracts code
-                test_cases=test_cases,
-                continuous=True,
-                timeout=timeout,
-            )
-            results[idx] = float(score)
-        except Exception as e:
-            logger.warning(f"Sandbox execution failed for index {idx}: {e}")
-            results[idx] = 0.0
-
-    return results
-
-
-def _build_test_cases_from_extra_info(
-    ground_truth: str,
-    extra_info: Optional[Dict],
-) -> Optional[Dict]:
-    """Build test cases dict from ground_truth and extra_info.
-
-    Args:
-        ground_truth: The ground truth string (may be expected output).
-        extra_info: Extra info that may contain input/output examples.
-
-    Returns:
-        Test cases dict with 'inputs' and 'outputs' keys, or None.
-    """
-    if not extra_info:
-        return None
-
-    # Try to extract test cases from common field names
-    inputs = extra_info.get("inputs", extra_info.get("input", []))
-    outputs = extra_info.get("outputs", extra_info.get("output", [ground_truth] if ground_truth else []))
-
-    if not isinstance(inputs, list):
-        inputs = [inputs] if inputs else [""]
-    if not isinstance(outputs, list):
-        outputs = [outputs] if outputs else []
-
-    # Ensure we have at least one test case
-    if not outputs and ground_truth:
-        outputs = [ground_truth]
-    if not inputs:
-        inputs = [""] * len(outputs)
-
-    if outputs:
-        return {"inputs": inputs, "outputs": outputs}
-
-    return None
-
-
-# =============================================================================
-# Other/Fallback Scoring
-# =============================================================================
-
-
-def _compute_other_scores(
-    indices: List[int],
-    solutions: List[str],
-    ground_truths: List[str],
-) -> Dict[int, float]:
-    """Compute scores for other/unknown dataset sources.
-
-    Uses math verification first, then falls back to string matching.
-
-    Args:
-        indices: Original indices in the batch.
-        solutions: List of solution strings.
-        ground_truths: List of ground truth answers.
-
-    Returns:
-        Dict mapping index to score.
-    """
-    results = {}
-
-    for idx, sol, gt in zip(indices, solutions, ground_truths):
-        if sol is None or gt is None:
-            results[idx] = 0.0
-            continue
-
-        # Try math verification first
-        try:
-            from verl.utils.reward_score import math_dapo
-
-            result = math_dapo.compute_score(sol, gt)
-            score = result.get("score", 0.0) if isinstance(result, dict) else float(result)
-            if score > 0:
-                results[idx] = score
-                continue
-        except Exception:
-            pass
-
-        # Fallback to basic string matching
-        results[idx] = _basic_string_match(sol, gt)
-
-    return results
-
-
-# =============================================================================
-# Main Interface
-# =============================================================================
-
-
 def compute_score(
     solution_str: str,
-    ground_truth: Any,
-    extra_info: Optional[Dict] = None,
-    sandbox_fusion_url: Optional[str] = None,
-    concurrent_semaphore: Optional[threading.Semaphore] = None,
-    memory_limit_mb: int = DEFAULT_MEMORY_LIMIT_MB,
-    timeout: int = DEFAULT_SANDBOX_TIMEOUT,
+    ground_truth,
+    extra_info: Optional[dict] = None,
     **kwargs,
 ) -> float:
     """Compute the score for a single Dolci-Think-RL solution.
 
-    NOTE: For batch processing, prefer using compute_score_batch() for efficiency,
-    especially for code tasks.
+    NOTE: For code tasks, prefer using compute_score_batch() for efficiency.
 
-    Routes to appropriate reward function based on dataset_source in extra_info:
-    - math: math_verify (verifiable)
-    - ifeval: IFEval constraint checking (verifiable)
-    - code/code_stdio: sandbox_fusion code execution
-    - other: math verification fallback then string matching
+    Routes to appropriate existing reward function based on dataset_source:
+    - math: math_verify.MathVerifier (verifiable)
+    - instruction_following: ifeval (verifiable)
+    - code: LLM-as-a-judge (inefficient for single calls, use batch)
+    - chat/default: basic string matching
 
     Args:
         solution_str: The model's generated solution.
         ground_truth: The expected ground truth answer.
         extra_info: Dict with 'dataset_source' to determine scoring method.
-        sandbox_fusion_url: URL of sandbox service for code tasks.
-        concurrent_semaphore: Semaphore for concurrency control.
-        memory_limit_mb: Memory limit for code execution.
-        timeout: Timeout for code execution.
-        **kwargs: Additional arguments.
+        **kwargs: Additional arguments passed to reward functions.
 
     Returns:
-        Score as a float (typically 0.0 to 1.0, may be -1.0 to 1.0 for math).
+        Score as a float.
     """
-    # Use batch function with single item
-    scores = compute_score_batch(
-        solution_strs=[solution_str],
-        ground_truths=[ground_truth],
-        extra_infos=[extra_info],
-        sandbox_fusion_url=sandbox_fusion_url,
-        concurrent_semaphore=concurrent_semaphore,
-        memory_limit_mb=memory_limit_mb,
-        timeout=timeout,
-        **kwargs,
-    )
-    return scores[0]
+    if solution_str is None:
+        return 0.0
+
+    # Handle ground_truth being a list (as in the dataset)
+    if isinstance(ground_truth, list):
+        ground_truth = ground_truth[0] if ground_truth else None
+
+    if ground_truth is None:
+        return 0.0
+
+    # Remove thinking section before reward computation
+    solution_str = remove_thinking_section(solution_str)
+
+    # Determine task type from extra_info
+    dataset_source = ""
+    if extra_info and isinstance(extra_info, dict):
+        dataset_source = extra_info.get("dataset_source", "").lower()
+
+    # Route to appropriate existing reward function
+    if dataset_source == "math":
+        from verl.utils.reward_score.math_verify import MathVerifier
+
+        verifier = MathVerifier()
+        result = verifier.compute_score(solution_str, ground_truth)
+        return result["score"]
+
+    elif dataset_source == "instruction_following" or dataset_source == "ifeval":
+        from verl.utils.reward_score import ifeval
+
+        result = ifeval.compute_score(solution_str, ground_truth, extra_info)
+        return result["score"]
+
+    elif dataset_source == "code" or dataset_source == "code_stdio":
+        # Single call - still use judge but with batch of 1
+        # For better performance, use compute_score_batch
+        scores = _compute_code_scores_batched([solution_str], [ground_truth], [extra_info], **kwargs)
+        return scores[0]
+
+    else:
+        # Default: try math first, then basic matching
+        try:
+            from verl.utils.reward_score.math_verify import MathVerifier
+
+            verifier = MathVerifier()
+            result = verifier.compute_score(solution_str, ground_truth)
+            if result["score"] > 0:
+                return result["score"]
+        except Exception:
+            pass
+
+        # Fallback to basic string matching
+        return _basic_string_match(solution_str, ground_truth)
 
 
 def compute_score_batch(
     solution_strs: List[str],
-    ground_truths: List[Any],
-    extra_infos: Optional[List[Optional[Dict]]] = None,
-    sandbox_fusion_url: Optional[str] = None,
-    concurrent_semaphore: Optional[threading.Semaphore] = None,
-    memory_limit_mb: int = DEFAULT_MEMORY_LIMIT_MB,
-    timeout: int = DEFAULT_SANDBOX_TIMEOUT,
-    max_workers: int = DEFAULT_MAX_WORKERS,
+    ground_truths: List,
+    extra_infos: Optional[List[dict]] = None,
     **kwargs,
 ) -> List[float]:
     """Compute scores for a batch of Dolci-Think-RL solutions.
 
-    Groups samples by dataset_source and processes each group IN PARALLEL:
-    - math: Processed with math_verify
-    - ifeval: Processed with IFEval constraint checker
-    - code/code_stdio: Batched together for sandbox_fusion execution
-    - other: Processed with math verification fallback
+    Groups samples by dataset_source and processes efficiently:
+    - math/IF/chat: processed individually (already fast)
+    - code: batched together for single LLM judge call
 
     Args:
         solution_strs: List of model solutions.
         ground_truths: List of ground truth answers.
         extra_infos: List of extra_info dicts with 'dataset_source'.
-        sandbox_fusion_url: URL of sandbox service for code tasks.
-        concurrent_semaphore: Semaphore for sandbox concurrency control.
-        memory_limit_mb: Memory limit for code execution.
-        timeout: Timeout for code execution.
-        max_workers: Maximum number of parallel workers for group processing.
-        **kwargs: Additional arguments.
+        **kwargs: Additional arguments (base_url, model for judge).
 
     Returns:
-        List of scores (same order as input).
+        List of scores.
     """
     n = len(solution_strs)
     if n == 0:
@@ -755,205 +213,270 @@ def compute_score_batch(
     logger.info(f"compute_score_batch called with {n} samples")
 
     # Remove thinking sections from all solutions upfront
-    cleaned_solutions = [remove_thinking_section(s) if s else "" for s in solution_strs]
-
-    # Normalize ground truths
-    normalized_gts = [_normalize_ground_truth(gt) for gt in ground_truths]
+    solution_strs = [remove_thinking_section(s) if s else "" for s in solution_strs]
 
     # Initialize results
     scores = [0.0] * n
 
     # Group indices by dataset_source
-    groups: Dict[str, Tuple[List[int], List[str], List[str], List[Optional[Dict]]]] = {
-        "math": ([], [], [], []),
-        "ifeval": ([], [], [], []),
-        "code": ([], [], [], []),
-        "other": ([], [], [], []),
-    }
+    math_indices = []
+    if_indices = []
+    code_indices = []
+    other_indices = []
 
     for i in range(n):
         extra_info = extra_infos[i] or {}
         dataset_source = extra_info.get("dataset_source", "").lower()
 
         if dataset_source == "math":
-            group_key = "math"
-        elif dataset_source == "ifeval":
-            group_key = "ifeval"
-        elif dataset_source in ("code", "code_stdio"):
-            group_key = "code"
+            math_indices.append(i)
+        elif dataset_source == "instruction_following" or dataset_source == "ifeval":
+            if_indices.append(i)
+        elif dataset_source == "code":
+            code_indices.append(i)
+        elif dataset_source == "code_stdio":
+            code_indices.append(i)  # same for now, soon will have separate executor
         else:
-            group_key = "other"
-
-        indices, sols, gts, extras = groups[group_key]
-        indices.append(i)
-        sols.append(cleaned_solutions[i])
-        gts.append(normalized_gts[i])
-        extras.append(extra_infos[i])
+            other_indices.append(i)
 
     # Log group sizes
-    for key, (indices, _, _, _) in groups.items():
-        if indices:
-            logger.info(f"  {key}: {len(indices)} samples")
+    if math_indices:
+        logger.info(f"  math: {len(math_indices)} samples")
+    if if_indices:
+        logger.info(f"  ifeval: {len(if_indices)} samples")
+    if code_indices:
+        logger.info(f"  code: {len(code_indices)} samples")
+    if other_indices:
+        logger.info(f"  other: {len(other_indices)} samples")
 
-    # Process groups in parallel using ThreadPoolExecutor
-    def process_math_group():
-        indices, sols, gts, _ = groups["math"]
-        if not indices:
-            return {}
-        return _compute_math_scores(indices, sols, gts)
+    # Process math (verifiable, fast)
+    if math_indices:
+        from verl.utils.reward_score.math_verify import MathVerifier
 
-    def process_ifeval_group():
-        indices, sols, gts, extras = groups["ifeval"]
-        if not indices:
-            return {}
-        return _compute_ifeval_scores(indices, sols, gts, extras)
+        verifier = MathVerifier()
 
-    def process_code_group():
-        indices, sols, gts, extras = groups["code"]
-        if not indices:
-            return {}
-        if sandbox_fusion_url:
-            return _compute_code_scores_sandbox(
-                indices,
-                sols,
-                gts,
-                extras,
-                sandbox_fusion_url=sandbox_fusion_url,
-                concurrent_semaphore=concurrent_semaphore,
-                memory_limit_mb=memory_limit_mb,
-                timeout=timeout,
-            )
-        else:
-            # Fallback to string matching if no sandbox URL
-            logger.warning("No sandbox_fusion_url provided for code tasks, using string match")
-            results = {}
-            for idx, sol, gt in zip(indices, sols, gts):
-                results[idx] = _basic_string_match(sol, str(gt)) if sol and gt else 0.0
-            return results
+        for i in math_indices:
+            gt = ground_truths[i]
+            if isinstance(gt, list):
+                gt = gt[0] if gt else None
+            if solution_strs[i] is not None and gt is not None:
+                try:
+                    result = verifier.compute_score(solution_strs[i], gt)
+                    scores[i] = result["score"]
+                except Exception as e:
+                    logger.debug(f"Math verification failed for index {i}: {e}")
+                    scores[i] = 0.0
 
-    def process_other_group():
-        indices, sols, gts, _ = groups["other"]
-        if not indices:
-            return {}
-        return _compute_other_scores(indices, sols, gts)
+    # Process IF (verifiable, fast)
+    if if_indices:
+        from verl.utils.reward_score import ifeval
 
-    # Execute all groups in parallel
-    group_results: Dict[int, float] = {}
+        for i in if_indices:
+            gt = ground_truths[i]
+            if isinstance(gt, list):
+                gt = gt[0] if gt else None
+            if solution_strs[i] is not None and gt is not None:
+                try:
+                    result = ifeval.compute_score(solution_strs[i], gt, extra_infos[i])
+                    scores[i] = result["score"]
+                except Exception as e:
+                    logger.debug(f"IFEval scoring failed for index {i}: {e}")
+                    scores[i] = 0.0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, max_workers)) as executor:
-        futures = {
-            executor.submit(process_math_group): "math",
-            executor.submit(process_ifeval_group): "ifeval",
-            executor.submit(process_code_group): "code",
-            executor.submit(process_other_group): "other",
-        }
+    # Process code in BATCH (LLM judge)
+    if code_indices:
+        code_solutions = [solution_strs[i] for i in code_indices]
+        code_gts = []
+        code_extras = []
+        for i in code_indices:
+            gt = ground_truths[i]
+            if isinstance(gt, list):
+                gt = gt[0] if gt else ""
+            code_gts.append(gt)
+            code_extras.append(extra_infos[i])
 
-        for future in concurrent.futures.as_completed(futures):
-            group_name = futures[future]
-            try:
-                result = future.result()
-                group_results.update(result)
-                logger.debug(f"Completed processing {group_name} group: {len(result)} results")
-            except Exception as e:
-                logger.error(f"Error processing {group_name} group: {e}")
-                # Mark failed group indices as 0.0
-                indices = groups[group_name][0]
-                for idx in indices:
-                    group_results[idx] = 0.0
+        code_scores = _compute_code_scores_batched(code_solutions, code_gts, code_extras, **kwargs)
+        for idx, i in enumerate(code_indices):
+            scores[i] = code_scores[idx]
 
-    # Assemble final scores in original order
-    for i in range(n):
-        scores[i] = group_results.get(i, 0.0)
+    # Process other (fallback)
+    if other_indices:
+        try:
+            from verl.utils.reward_score.math_verify import MathVerifier
+
+            verifier = MathVerifier()
+        except ImportError:
+            verifier = None
+
+        for i in other_indices:
+            gt = ground_truths[i]
+            if isinstance(gt, list):
+                gt = gt[0] if gt else None
+            if solution_strs[i] is None or gt is None:
+                continue
+            if verifier:
+                try:
+                    result = verifier.compute_score(solution_strs[i], gt)
+                    if result["score"] > 0:
+                        scores[i] = result["score"]
+                        continue
+                except Exception:
+                    pass
+            scores[i] = _basic_string_match(solution_strs[i], gt)
 
     return scores
 
 
-# =============================================================================
-# Convenience functions for direct access
-# =============================================================================
-
-
-def compute_math_score(
-    solution_str: str,
-    ground_truth: str,
+def compute_score_llm_judge_batch(
+    responses: List[str],
+    ground_truths: List[str],
+    prompts: Optional[List[str]] = None,
+    extra_infos: Optional[List[dict]] = None,
+    remove_thinking: bool = True,
+    fallback_to_string_match: bool = True,
     **kwargs,
-) -> float:
-    """Compute math score directly using math_verify.
+) -> List[float]:
+    """Compute rewards using batched LLM-as-a-judge.
+
+    Provides a direct interface to the LLM judge for arbitrary response/ground-truth
+    pairs without routing through dataset_source logic.
 
     Args:
-        solution_str: The model's solution.
-        ground_truth: The expected answer.
+        responses: List of model-generated responses to evaluate.
+        ground_truths: List of reference/ground-truth answers.
+        prompts: Optional list of original prompts/problems for context.
+            If not provided, attempts to extract from extra_infos.
+        extra_infos: Optional list of dicts containing additional context.
+            Used to extract prompts if 'prompts' arg not provided.
+            Looks for 'original_prompt' or 'problem' keys.
+        remove_thinking: If True, strips <think>...</think> sections from
+            responses before scoring. Defaults to True.
+        fallback_to_string_match: If True, falls back to basic string matching
+            when the LLM judge is unavailable or fails. Defaults to True.
+        **kwargs: Additional arguments passed to judge initialization
+            (base_url, model, max_concurrent).
 
     Returns:
-        Score as float.
+        List of float scores, one per response. Scores are typically in [0, 1].
+
+    Raises:
+        RuntimeError: If judge unavailable and fallback_to_string_match is False.
+
+    Example:
+        >>> scores = compute_score_llm_judge_batch(
+        ...     responses=["def add(a, b): return a + b", "def add(a, b): return a - b"],
+        ...     ground_truths=["Function should add two numbers", "Function should add two numbers"],
+        ...     prompts=["Write a function to add two numbers"] * 2,
+        ... )
     """
-    solution_str = remove_thinking_section(solution_str)
-    results = _compute_math_scores([0], [solution_str], [ground_truth])
-    return results.get(0, 0.0)
+    n = len(responses)
+    if n == 0:
+        return []
+
+    if len(ground_truths) != n:
+        raise ValueError(f"Length mismatch: responses ({n}) vs ground_truths ({len(ground_truths)})")
+
+    # Normalize ground_truths (handle list-wrapped values from datasets)
+    normalized_gts = []
+    for gt in ground_truths:
+        if isinstance(gt, list):
+            normalized_gts.append(gt[0] if gt else "")
+        else:
+            normalized_gts.append(str(gt) if gt is not None else "")
+    ground_truths = normalized_gts
+
+    # Optionally remove thinking sections
+    if remove_thinking:
+        responses = [remove_thinking_section(r) if r else "" for r in responses]
+    else:
+        responses = [r if r else "" for r in responses]
+
+    # Build prompts list
+    if prompts is None:
+        prompts = []
+        extra_infos = extra_infos or [None] * n
+        for extra_info in extra_infos:
+            prompt = ""
+            if extra_info and isinstance(extra_info, dict):
+                prompt = extra_info.get("original_prompt", "") or extra_info.get("problem", "")
+            prompts.append(prompt)
+    elif len(prompts) != n:
+        raise ValueError(f"Length mismatch: responses ({n}) vs prompts ({len(prompts)})")
+
+    # Get or create judge instance
+    judge = _get_judge(**kwargs)
+
+    if judge is None:
+        if not fallback_to_string_match:
+            raise RuntimeError(
+                "LLM judge unavailable and fallback_to_string_match is False. "
+                "Ensure judgev3 module is installed or enable fallback."
+            )
+        logger.warning("LLM judge unavailable, falling back to string matching")
+        return [_basic_string_match(resp, gt) for resp, gt in zip(responses, ground_truths)]
+
+    try:
+        logger.info(f"Computing LLM judge scores for {n} samples")
+        rewards = judge.compute_rewards(
+            prompts=prompts,
+            responses=responses,
+            reference_answers=ground_truths,
+        )
+        return [float(r) for r in rewards]
+
+    except Exception as e:
+        logger.warning(f"LLM judge call failed: {e}")
+        if not fallback_to_string_match:
+            raise RuntimeError(f"LLM judge failed and fallback disabled: {e}") from e
+        logger.warning("Falling back to string matching")
+        return [_basic_string_match(resp, gt) for resp, gt in zip(responses, ground_truths)]
 
 
-def compute_ifeval_score(
-    solution_str: str,
-    constraint_type: Optional[str] = None,
-    constraint: Optional[str] = None,
-    extra_info: Optional[Dict] = None,
+def _compute_code_scores_batched(
+    solution_strs: List[str],
+    ground_truths: List[str],
+    extra_infos: List[Optional[dict]],
     **kwargs,
-) -> float:
-    """Compute IFEval constraint score directly.
+) -> List[float]:
+    """Compute code rewards using batched LLM-as-a-judge.
 
     Args:
-        solution_str: The model's response.
-        constraint_type: Type of constraint.
-        constraint: The constraint specification.
-        extra_info: Additional context.
+        solution_strs: List of code solutions.
+        ground_truths: List of ground truth answers.
+        extra_infos: List of extra_info dicts with problem context.
+        **kwargs: Arguments for judge (base_url, model, max_concurrent).
 
     Returns:
-        Score as float (1.0 if constraint satisfied, 0.0 otherwise).
+        List of scores.
     """
-    solution_str = remove_thinking_section(solution_str)
-    if extra_info is None:
-        extra_info = {}
-    if constraint_type:
-        extra_info["constraint_type"] = constraint_type
-    if constraint:
-        extra_info["constraint"] = constraint
+    n = len(solution_strs)
+    if n == 0:
+        return []
 
-    results = _compute_ifeval_scores([0], [solution_str], [None], [extra_info])
-    return results.get(0, 0.0)
+    judge = _get_judge(**kwargs)
 
+    if judge is None:
+        # Fallback to basic matching
+        return [_basic_string_match(sol, str(gt)) if sol else 0.0 for sol, gt in zip(solution_strs, ground_truths)]
 
-def compute_code_score(
-    solution_str: str,
-    test_cases: Any,
-    sandbox_fusion_url: str,
-    concurrent_semaphore: Optional[threading.Semaphore] = None,
-    memory_limit_mb: int = DEFAULT_MEMORY_LIMIT_MB,
-    timeout: int = DEFAULT_SANDBOX_TIMEOUT,
-    **kwargs,
-) -> Tuple[float, List[Dict]]:
-    """Compute code score directly using sandbox_fusion.
+    try:
+        # Extract prompts from extra_info
+        prompts = []
+        for extra_info in extra_infos:
+            prompt = ""
+            if extra_info and isinstance(extra_info, dict):
+                prompt = extra_info.get("original_prompt", "") or extra_info.get("problem", "")
+            prompts.append(prompt)
 
-    Args:
-        solution_str: The model's code solution.
-        test_cases: Test cases (dict or JSON string with 'inputs'/'outputs').
-        sandbox_fusion_url: URL of the sandbox service.
-        concurrent_semaphore: Semaphore for concurrency control.
-        memory_limit_mb: Memory limit for execution.
-        timeout: Timeout for execution.
+        # Batch call to judge
+        rewards = judge.compute_rewards(
+            prompts=prompts,
+            responses=solution_strs,
+            reference_answers=[str(gt) for gt in ground_truths],
+        )
 
-    Returns:
-        Tuple of (score, metadata_list).
-    """
-    from verl.utils.reward_score.sandbox_fusion import compute_score as sandbox_compute_score
+        return [float(r) for r in rewards]
 
-    solution_str = remove_thinking_section(solution_str)
-
-    return sandbox_compute_score(
-        sandbox_fusion_url=sandbox_fusion_url,
-        concurrent_semaphore=concurrent_semaphore,
-        memory_limit_mb=memory_limit_mb,
-        completion=solution_str,
-        test_cases=test_cases,
-        continuous=True,
-        timeout=timeout,
-    )
+    except Exception as e:
+        logger.warning(f"Batched LLM judge failed: {e}, falling back to basic comparison")
+        return [_basic_string_match(sol, str(gt)) if sol else 0.0 for sol, gt in zip(solution_strs, ground_truths)]
