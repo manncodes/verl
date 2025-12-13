@@ -17,19 +17,24 @@ Reward scoring for allenai/Dolci-Think-RL dataset.
 Routes to appropriate existing reward functions based on dataset_source:
 - math: Uses math_verify.MathVerifier (verifiable)
 - instruction_following: Uses ifeval (verifiable)
-- code: Uses LLM-as-a-judge via StructuredJudge (BATCHED)
+- code/code_stdio: Uses sandbox_fusion for code execution (BATCHED)
 - chat: Uses basic verifiable matching
 
 Reference: https://huggingface.co/datasets/allenai/Dolci-Think-RL
 """
 
+import json
 import logging
-from typing import Any, List, Optional
+import os
+import threading
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Singleton instance for LLM judge
-_judge_instance: Optional[Any] = None
+# Default configuration
+DEFAULT_SANDBOX_TIMEOUT = 10
+DEFAULT_MEMORY_LIMIT_MB = 1024
+DEFAULT_MAX_WORKERS = max(32, os.cpu_count() * 4 if os.cpu_count() else 32)
 
 
 def remove_thinking_section(prediction: str) -> str:
@@ -47,44 +52,6 @@ def remove_thinking_section(prediction: str) -> str:
     # remove answer tags from the prediction
     prediction = prediction.replace("<answer>", "").replace("</answer>", "")
     return prediction.strip()
-
-
-def _get_judge(**kwargs) -> Any:
-    """Get or create the singleton StructuredJudge instance.
-
-    Implements lazy initialization to avoid creating the judge until needed.
-
-    Args:
-        **kwargs: Arguments for create_verl_judge (base_url, model, max_concurrent).
-
-    Returns:
-        StructuredJudge instance or None if unavailable.
-    """
-    global _judge_instance
-
-    if _judge_instance is not None:
-        return _judge_instance
-
-    try:
-        from verl.utils.reward_score.judgev3 import create_verl_judge
-
-        _judge_instance = create_verl_judge(
-            base_url=kwargs.get(
-                "base_url",
-                "http://qpn744-vllm-gptoss120b-svc.llm-pretraining.svc.cluster.local:8000/v1",
-            ),
-            model=kwargs.get("model", "openai/gpt-oss-120b"),
-            # max_concurrent=kwargs.get("max_concurrent", 128),
-        )
-        logger.info("Initialized singleton StructuredJudge instance")
-    except ImportError:
-        logger.warning("StructuredJudge not available (judgev3 module not found)")
-        return None
-    except Exception as e:
-        logger.warning(f"Failed to initialize StructuredJudge: {e}")
-        return None
-
-    return _judge_instance
 
 
 def _basic_string_match(solution_str: str, ground_truth: str) -> float:
@@ -107,6 +74,10 @@ def compute_score(
     solution_str: str,
     ground_truth,
     extra_info: Optional[dict] = None,
+    sandbox_fusion_url: Optional[str] = None,
+    concurrent_semaphore: Optional[threading.Semaphore] = None,
+    memory_limit_mb: int = DEFAULT_MEMORY_LIMIT_MB,
+    timeout: int = DEFAULT_SANDBOX_TIMEOUT,
     **kwargs,
 ) -> float:
     """Compute the score for a single Dolci-Think-RL solution.
@@ -116,13 +87,17 @@ def compute_score(
     Routes to appropriate existing reward function based on dataset_source:
     - math: math_verify.MathVerifier (verifiable)
     - instruction_following: ifeval (verifiable)
-    - code: LLM-as-a-judge (inefficient for single calls, use batch)
+    - code/code_stdio: sandbox_fusion code execution
     - chat/default: basic string matching
 
     Args:
         solution_str: The model's generated solution.
         ground_truth: The expected ground truth answer.
         extra_info: Dict with 'dataset_source' to determine scoring method.
+        sandbox_fusion_url: URL of sandbox service for code tasks.
+        concurrent_semaphore: Semaphore for sandbox concurrency control.
+        memory_limit_mb: Memory limit for code execution.
+        timeout: Timeout for code execution.
         **kwargs: Additional arguments passed to reward functions.
 
     Returns:
@@ -145,6 +120,9 @@ def compute_score(
     dataset_source = ""
     if extra_info and isinstance(extra_info, dict):
         dataset_source = extra_info.get("dataset_source", "").lower()
+        # Also check for sandbox_fusion_url in extra_info
+        if sandbox_fusion_url is None:
+            sandbox_fusion_url = extra_info.get("sandbox_fusion_url")
 
     # Route to appropriate existing reward function
     if dataset_source == "math":
@@ -161,10 +139,16 @@ def compute_score(
         return result["score"]
 
     elif dataset_source == "code" or dataset_source == "code_stdio":
-        # Single call - still use judge but with batch of 1
-        # For better performance, use compute_score_batch
-        scores = _compute_code_scores_batched([solution_str], [ground_truth], [extra_info], **kwargs)
-        return scores[0]
+        # Use sandbox_fusion for code execution
+        return _compute_code_score_sandbox(
+            solution_str=solution_str,
+            ground_truth=ground_truth,
+            extra_info=extra_info,
+            sandbox_fusion_url=sandbox_fusion_url,
+            concurrent_semaphore=concurrent_semaphore,
+            memory_limit_mb=memory_limit_mb,
+            timeout=timeout,
+        )
 
     else:
         # Default: try math first, then basic matching
@@ -182,23 +166,126 @@ def compute_score(
         return _basic_string_match(solution_str, ground_truth)
 
 
+def _compute_code_score_sandbox(
+    solution_str: str,
+    ground_truth,
+    extra_info: Optional[dict] = None,
+    sandbox_fusion_url: Optional[str] = None,
+    concurrent_semaphore: Optional[threading.Semaphore] = None,
+    memory_limit_mb: int = DEFAULT_MEMORY_LIMIT_MB,
+    timeout: int = DEFAULT_SANDBOX_TIMEOUT,
+) -> float:
+    """Compute code score using sandbox_fusion.
+
+    Args:
+        solution_str: The model's code solution.
+        ground_truth: Test cases (dict or JSON string with 'inputs'/'outputs').
+        extra_info: Additional context.
+        sandbox_fusion_url: URL of the sandbox service.
+        concurrent_semaphore: Semaphore for concurrency control.
+        memory_limit_mb: Memory limit for execution.
+        timeout: Timeout for execution.
+
+    Returns:
+        Score as float (0.0 to 1.0).
+    """
+    if not sandbox_fusion_url:
+        logger.warning("No sandbox_fusion_url provided for code task, falling back to string match")
+        return _basic_string_match(solution_str, str(ground_truth)) if ground_truth else 0.0
+
+    # Parse test cases from ground_truth
+    test_cases = ground_truth
+    if isinstance(ground_truth, str):
+        try:
+            test_cases = json.loads(ground_truth)
+        except json.JSONDecodeError:
+            # Try to construct test cases from extra_info
+            test_cases = _build_test_cases_from_extra_info(ground_truth, extra_info)
+
+    if not test_cases or not isinstance(test_cases, dict):
+        logger.debug("No valid test cases for code scoring, using string match")
+        return _basic_string_match(solution_str, str(ground_truth)) if ground_truth else 0.0
+
+    try:
+        from verl.utils.reward_score import sandbox_fusion
+
+        score, metadata = sandbox_fusion.compute_score(
+            sandbox_fusion_url=sandbox_fusion_url,
+            concurrent_semaphore=concurrent_semaphore,
+            memory_limit_mb=memory_limit_mb,
+            completion=solution_str,
+            test_cases=test_cases,
+            continuous=True,
+            timeout=timeout,
+        )
+        return float(score)
+    except Exception as e:
+        logger.warning(f"Sandbox execution failed: {e}")
+        return 0.0
+
+
+def _build_test_cases_from_extra_info(
+    ground_truth: str,
+    extra_info: Optional[dict],
+) -> Optional[dict]:
+    """Build test cases dict from ground_truth and extra_info.
+
+    Args:
+        ground_truth: The ground truth string (may be expected output).
+        extra_info: Extra info that may contain input/output examples.
+
+    Returns:
+        Test cases dict with 'inputs' and 'outputs' keys, or None.
+    """
+    if not extra_info:
+        return None
+
+    # Try to extract test cases from common field names
+    inputs = extra_info.get("inputs", extra_info.get("input", []))
+    outputs = extra_info.get("outputs", extra_info.get("output", [ground_truth] if ground_truth else []))
+
+    if not isinstance(inputs, list):
+        inputs = [inputs] if inputs else [""]
+    if not isinstance(outputs, list):
+        outputs = [outputs] if outputs else []
+
+    # Ensure we have at least one test case
+    if not outputs and ground_truth:
+        outputs = [ground_truth]
+    if not inputs:
+        inputs = [""] * len(outputs)
+
+    if outputs:
+        return {"inputs": inputs, "outputs": outputs}
+
+    return None
+
+
 def compute_score_batch(
     solution_strs: List[str],
     ground_truths: List,
     extra_infos: Optional[List[dict]] = None,
+    sandbox_fusion_url: Optional[str] = None,
+    concurrent_semaphore: Optional[threading.Semaphore] = None,
+    memory_limit_mb: int = DEFAULT_MEMORY_LIMIT_MB,
+    timeout: int = DEFAULT_SANDBOX_TIMEOUT,
     **kwargs,
 ) -> List[float]:
     """Compute scores for a batch of Dolci-Think-RL solutions.
 
     Groups samples by dataset_source and processes efficiently:
     - math/IF/chat: processed individually (already fast)
-    - code: batched together for single LLM judge call
+    - code/code_stdio: processed with sandbox_fusion
 
     Args:
         solution_strs: List of model solutions.
         ground_truths: List of ground truth answers.
         extra_infos: List of extra_info dicts with 'dataset_source'.
-        **kwargs: Additional arguments (base_url, model for judge).
+        sandbox_fusion_url: URL of sandbox service for code tasks.
+        concurrent_semaphore: Semaphore for sandbox concurrency control.
+        memory_limit_mb: Memory limit for code execution.
+        timeout: Timeout for code execution.
+        **kwargs: Additional arguments.
 
     Returns:
         List of scores.
@@ -283,21 +370,35 @@ def compute_score_batch(
                     logger.debug(f"IFEval scoring failed for index {i}: {e}")
                     scores[i] = 0.0
 
-    # Process code in BATCH (LLM judge)
+    # Process code with sandbox_fusion
     if code_indices:
-        code_solutions = [solution_strs[i] for i in code_indices]
-        code_gts = []
-        code_extras = []
+        # Get sandbox URL from first extra_info if not provided
+        if sandbox_fusion_url is None:
+            for i in code_indices:
+                if extra_infos[i] and extra_infos[i].get("sandbox_fusion_url"):
+                    sandbox_fusion_url = extra_infos[i].get("sandbox_fusion_url")
+                    break
+
         for i in code_indices:
             gt = ground_truths[i]
             if isinstance(gt, list):
                 gt = gt[0] if gt else ""
-            code_gts.append(gt)
-            code_extras.append(extra_infos[i])
 
-        code_scores = _compute_code_scores_batched(code_solutions, code_gts, code_extras, **kwargs)
-        for idx, i in enumerate(code_indices):
-            scores[i] = code_scores[idx]
+            if solution_strs[i] is not None:
+                try:
+                    score = _compute_code_score_sandbox(
+                        solution_str=solution_strs[i],
+                        ground_truth=gt,
+                        extra_info=extra_infos[i],
+                        sandbox_fusion_url=sandbox_fusion_url,
+                        concurrent_semaphore=concurrent_semaphore,
+                        memory_limit_mb=memory_limit_mb,
+                        timeout=timeout,
+                    )
+                    scores[i] = score
+                except Exception as e:
+                    logger.debug(f"Code scoring failed for index {i}: {e}")
+                    scores[i] = 0.0
 
     # Process other (fallback)
     if other_indices:
@@ -325,158 +426,3 @@ def compute_score_batch(
             scores[i] = _basic_string_match(solution_strs[i], gt)
 
     return scores
-
-
-def compute_score_llm_judge_batch(
-    responses: List[str],
-    ground_truths: List[str],
-    prompts: Optional[List[str]] = None,
-    extra_infos: Optional[List[dict]] = None,
-    remove_thinking: bool = True,
-    fallback_to_string_match: bool = True,
-    **kwargs,
-) -> List[float]:
-    """Compute rewards using batched LLM-as-a-judge.
-
-    Provides a direct interface to the LLM judge for arbitrary response/ground-truth
-    pairs without routing through dataset_source logic.
-
-    Args:
-        responses: List of model-generated responses to evaluate.
-        ground_truths: List of reference/ground-truth answers.
-        prompts: Optional list of original prompts/problems for context.
-            If not provided, attempts to extract from extra_infos.
-        extra_infos: Optional list of dicts containing additional context.
-            Used to extract prompts if 'prompts' arg not provided.
-            Looks for 'original_prompt' or 'problem' keys.
-        remove_thinking: If True, strips <think>...</think> sections from
-            responses before scoring. Defaults to True.
-        fallback_to_string_match: If True, falls back to basic string matching
-            when the LLM judge is unavailable or fails. Defaults to True.
-        **kwargs: Additional arguments passed to judge initialization
-            (base_url, model, max_concurrent).
-
-    Returns:
-        List of float scores, one per response. Scores are typically in [0, 1].
-
-    Raises:
-        RuntimeError: If judge unavailable and fallback_to_string_match is False.
-
-    Example:
-        >>> scores = compute_score_llm_judge_batch(
-        ...     responses=["def add(a, b): return a + b", "def add(a, b): return a - b"],
-        ...     ground_truths=["Function should add two numbers", "Function should add two numbers"],
-        ...     prompts=["Write a function to add two numbers"] * 2,
-        ... )
-    """
-    n = len(responses)
-    if n == 0:
-        return []
-
-    if len(ground_truths) != n:
-        raise ValueError(f"Length mismatch: responses ({n}) vs ground_truths ({len(ground_truths)})")
-
-    # Normalize ground_truths (handle list-wrapped values from datasets)
-    normalized_gts = []
-    for gt in ground_truths:
-        if isinstance(gt, list):
-            normalized_gts.append(gt[0] if gt else "")
-        else:
-            normalized_gts.append(str(gt) if gt is not None else "")
-    ground_truths = normalized_gts
-
-    # Optionally remove thinking sections
-    if remove_thinking:
-        responses = [remove_thinking_section(r) if r else "" for r in responses]
-    else:
-        responses = [r if r else "" for r in responses]
-
-    # Build prompts list
-    if prompts is None:
-        prompts = []
-        extra_infos = extra_infos or [None] * n
-        for extra_info in extra_infos:
-            prompt = ""
-            if extra_info and isinstance(extra_info, dict):
-                prompt = extra_info.get("original_prompt", "") or extra_info.get("problem", "")
-            prompts.append(prompt)
-    elif len(prompts) != n:
-        raise ValueError(f"Length mismatch: responses ({n}) vs prompts ({len(prompts)})")
-
-    # Get or create judge instance
-    judge = _get_judge(**kwargs)
-
-    if judge is None:
-        if not fallback_to_string_match:
-            raise RuntimeError(
-                "LLM judge unavailable and fallback_to_string_match is False. "
-                "Ensure judgev3 module is installed or enable fallback."
-            )
-        logger.warning("LLM judge unavailable, falling back to string matching")
-        return [_basic_string_match(resp, gt) for resp, gt in zip(responses, ground_truths)]
-
-    try:
-        logger.info(f"Computing LLM judge scores for {n} samples")
-        rewards = judge.compute_rewards(
-            prompts=prompts,
-            responses=responses,
-            reference_answers=ground_truths,
-        )
-        return [float(r) for r in rewards]
-
-    except Exception as e:
-        logger.warning(f"LLM judge call failed: {e}")
-        if not fallback_to_string_match:
-            raise RuntimeError(f"LLM judge failed and fallback disabled: {e}") from e
-        logger.warning("Falling back to string matching")
-        return [_basic_string_match(resp, gt) for resp, gt in zip(responses, ground_truths)]
-
-
-def _compute_code_scores_batched(
-    solution_strs: List[str],
-    ground_truths: List[str],
-    extra_infos: List[Optional[dict]],
-    **kwargs,
-) -> List[float]:
-    """Compute code rewards using batched LLM-as-a-judge.
-
-    Args:
-        solution_strs: List of code solutions.
-        ground_truths: List of ground truth answers.
-        extra_infos: List of extra_info dicts with problem context.
-        **kwargs: Arguments for judge (base_url, model, max_concurrent).
-
-    Returns:
-        List of scores.
-    """
-    n = len(solution_strs)
-    if n == 0:
-        return []
-
-    judge = _get_judge(**kwargs)
-
-    if judge is None:
-        # Fallback to basic matching
-        return [_basic_string_match(sol, str(gt)) if sol else 0.0 for sol, gt in zip(solution_strs, ground_truths)]
-
-    try:
-        # Extract prompts from extra_info
-        prompts = []
-        for extra_info in extra_infos:
-            prompt = ""
-            if extra_info and isinstance(extra_info, dict):
-                prompt = extra_info.get("original_prompt", "") or extra_info.get("problem", "")
-            prompts.append(prompt)
-
-        # Batch call to judge
-        rewards = judge.compute_rewards(
-            prompts=prompts,
-            responses=solution_strs,
-            reference_answers=[str(gt) for gt in ground_truths],
-        )
-
-        return [float(r) for r in rewards]
-
-    except Exception as e:
-        logger.warning(f"Batched LLM judge failed: {e}, falling back to basic comparison")
-        return [_basic_string_match(sol, str(gt)) if sol else 0.0 for sol, gt in zip(solution_strs, ground_truths)]

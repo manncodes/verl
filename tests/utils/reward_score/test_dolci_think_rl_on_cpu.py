@@ -17,12 +17,13 @@ Tests for the Dolci-Think-RL reward function.
 Tests all dataset source types:
 - math: Mathematical reasoning problems (uses math_verify.MathVerifier)
 - instruction_following: Instruction following with constraints (uses ifeval)
-- code/code_stdio: Code execution problems (uses LLM-as-a-judge)
+- code/code_stdio: Code execution problems (uses sandbox_fusion)
 - general-quality: General chat/QA responses
 
 Reference: https://huggingface.co/datasets/allenai/Dolci-Think-RL
 """
 
+import json
 import os
 import sys
 
@@ -77,6 +78,14 @@ try:
 except ImportError:
     IFEVAL_AVAILABLE = False
 
+# Check if sandbox_fusion is available
+try:
+    from verl.utils.reward_score import sandbox_fusion
+
+    SANDBOX_FUSION_AVAILABLE = True
+except ImportError:
+    SANDBOX_FUSION_AVAILABLE = False
+
 
 # =============================================================================
 # Test Data: Math Problems
@@ -110,6 +119,92 @@ MATH_TEST_CASES = [
         "ground_truth": "42",
         "expected_score": 1.0,
         "description": "Answer with multiple tags to strip",
+    },
+]
+
+
+# =============================================================================
+# Test Data: Code Problems (for sandbox_fusion)
+# =============================================================================
+
+CODE_TEST_CASES = [
+    # Case 1: Simple addition function with print output
+    {
+        "solution": "```python\ndef add(a, b):\n    return a + b\n\nprint(add(2, 3))\n```",
+        "test_cases": {"inputs": [""], "outputs": ["5"]},
+        "expected_score": 1.0,
+        "description": "IO: Simple addition with print",
+    },
+    # Case 2: Fibonacci with stdin input
+    {
+        "solution": """```python
+def fib(n):
+    if n <= 1:
+        return n
+    return fib(n-1) + fib(n-2)
+
+import sys
+n = int(sys.stdin.read().strip())
+print(fib(n))
+```""",
+        "test_cases": {"inputs": ["10"], "outputs": ["55"]},
+        "expected_score": 1.0,
+        "description": "IO: Fibonacci with stdin",
+    },
+    # Case 3: Wrong output
+    {
+        "solution": "```python\nprint('wrong')\n```",
+        "test_cases": {"inputs": [""], "outputs": ["correct"]},
+        "expected_score": 0.0,
+        "description": "IO: Wrong output",
+    },
+    # Case 4: Multiple input/output test cases
+    {
+        "solution": """```python
+import sys
+data = sys.stdin.read().strip()
+n = int(data)
+print(n * 2)
+```""",
+        "test_cases": {"inputs": ["5", "10", "0"], "outputs": ["10", "20", "0"]},
+        "expected_score": 1.0,
+        "description": "IO: Multiple test cases",
+    },
+    # Case 5: String reversal
+    {
+        "solution": """```python
+import sys
+s = sys.stdin.read().strip()
+print(s[::-1])
+```""",
+        "test_cases": {"inputs": ["hello", "world"], "outputs": ["olleh", "dlrow"]},
+        "expected_score": 1.0,
+        "description": "IO: String reversal",
+    },
+    # Case 6: Code with Python3 specifier
+    {
+        "solution": """```python3
+def factorial(n):
+    if n <= 1:
+        return 1
+    return n * factorial(n - 1)
+
+import sys
+n = int(sys.stdin.read().strip())
+print(factorial(n))
+```""",
+        "test_cases": {"inputs": ["5", "0", "3"], "outputs": ["120", "1", "6"]},
+        "expected_score": 1.0,
+        "description": "Block: python3 specifier",
+    },
+    # Case 7: Raw code without code blocks (fallback)
+    {
+        "solution": """import sys
+n = int(sys.stdin.read().strip())
+print(n ** 2)""",
+        "test_cases": {"inputs": ["4", "5"], "outputs": ["16", "25"]},
+        "expected_score": 1.0,
+        "description": "Block: Raw code no blocks",
     },
 ]
 
@@ -163,11 +258,20 @@ def dolci_module():
     return dolci_think_rl_module
 
 
+@pytest.fixture
+def sandbox_url():
+    """Get sandbox fusion URL from environment."""
+    return os.environ.get("SANDBOX_FUSION_URL")
+
+
 # Skip markers
 requires_verl = pytest.mark.skipif(not VERL_AVAILABLE, reason="verl package not fully installed")
 requires_dolci = pytest.mark.skipif(not DOLCI_AVAILABLE, reason="dolci_think_rl module not available")
 requires_math_verify = pytest.mark.skipif(not MATH_VERIFY_AVAILABLE, reason="math_verify module not available")
 requires_ifeval = pytest.mark.skipif(not IFEVAL_AVAILABLE, reason="ifeval module not available")
+requires_sandbox = pytest.mark.skipif(
+    not os.environ.get("SANDBOX_FUSION_URL"), reason="SANDBOX_FUSION_URL environment variable not set"
+)
 
 
 # =============================================================================
@@ -227,6 +331,31 @@ class TestBasicStringMatch:
         assert dolci_module._basic_string_match("  hello  ", "hello") == 1.0
 
 
+class TestBuildTestCasesFromExtraInfo:
+    """Tests for _build_test_cases_from_extra_info function."""
+
+    def test_with_inputs_outputs(self, dolci_module):
+        extra_info = {"inputs": ["1", "2"], "outputs": ["a", "b"]}
+        result = dolci_module._build_test_cases_from_extra_info("gt", extra_info)
+        assert result == {"inputs": ["1", "2"], "outputs": ["a", "b"]}
+
+    def test_with_single_values(self, dolci_module):
+        extra_info = {"input": "1", "output": "a"}
+        result = dolci_module._build_test_cases_from_extra_info("gt", extra_info)
+        assert result == {"inputs": ["1"], "outputs": ["a"]}
+
+    def test_empty_extra_info_returns_none(self, dolci_module):
+        """Empty extra_info returns None, leading to string match fallback."""
+        extra_info = {}
+        result = dolci_module._build_test_cases_from_extra_info("expected", extra_info)
+        # Empty dict is falsy, so returns None (code will fall back to string matching)
+        assert result is None
+
+    def test_none_extra_info(self, dolci_module):
+        result = dolci_module._build_test_cases_from_extra_info("gt", None)
+        assert result is None
+
+
 # =============================================================================
 # Integration Tests: Math Scoring (using math_verify.MathVerifier)
 # =============================================================================
@@ -272,6 +401,43 @@ class TestIFEvalScoring:
 
 
 # =============================================================================
+# Integration Tests: Code Scoring (using sandbox_fusion)
+# =============================================================================
+
+
+@requires_sandbox
+class TestCodeScoringSandbox:
+    """Tests for code scoring functionality using sandbox_fusion."""
+
+    @pytest.mark.parametrize("test_case", CODE_TEST_CASES, ids=lambda tc: tc["description"])
+    def test_code_cases(self, dolci_module, sandbox_url, test_case):
+        extra_info = {"dataset_source": "code"}
+        score = dolci_module.compute_score(
+            solution_str=test_case["solution"],
+            ground_truth=json.dumps(test_case["test_cases"]),
+            extra_info=extra_info,
+            sandbox_fusion_url=sandbox_url,
+        )
+        assert score == pytest.approx(test_case["expected_score"], abs=0.1)
+
+
+class TestCodeScoringFallback:
+    """Tests for code scoring fallback when sandbox unavailable."""
+
+    def test_code_fallback_to_string_match(self, dolci_module):
+        """Test that code scoring falls back to string matching when sandbox unavailable."""
+        extra_info = {"dataset_source": "code"}
+        # Without sandbox URL, should fall back to string matching
+        score = dolci_module.compute_score(
+            solution_str="def add(a, b): return a + b",
+            ground_truth="add",  # basic match
+            extra_info=extra_info,
+        )
+        assert isinstance(score, float)
+        assert score == 1.0  # "add" is in the solution
+
+
+# =============================================================================
 # Integration Tests: General Quality Scoring
 # =============================================================================
 
@@ -288,27 +454,6 @@ class TestGeneralScoring:
             extra_info=extra_info,
         )
         assert score == test_case["expected_score"]
-
-
-# =============================================================================
-# Integration Tests: Code Scoring (requires LLM judge)
-# =============================================================================
-
-
-class TestCodeScoring:
-    """Tests for code scoring functionality (requires LLM judge service)."""
-
-    def test_code_fallback_to_string_match(self, dolci_module):
-        """Test that code scoring falls back to string matching when judge unavailable."""
-        extra_info = {"dataset_source": "code", "problem": "Write a function to add two numbers"}
-        # Without judge service, should fall back to string matching
-        score = dolci_module.compute_score(
-            solution_str="def add(a, b): return a + b",
-            ground_truth="add",  # basic match
-            extra_info=extra_info,
-        )
-        assert isinstance(score, float)
-        assert 0.0 <= score <= 1.0
 
 
 # =============================================================================
@@ -406,6 +551,33 @@ class TestBatchProcessing:
         # All should pass (contain the answer)
         for score in scores:
             assert score == 1.0
+
+    @requires_sandbox
+    def test_batch_with_code(self, dolci_module, sandbox_url):
+        """Test batch processing with code samples."""
+        solutions = [
+            "```python\nprint(5)\n```",
+            "```python\nprint('hello')\n```",
+        ]
+        ground_truths = [
+            json.dumps({"inputs": [""], "outputs": ["5"]}),
+            json.dumps({"inputs": [""], "outputs": ["hello"]}),
+        ]
+        extra_infos = [
+            {"dataset_source": "code"},
+            {"dataset_source": "code"},
+        ]
+
+        scores = dolci_module.compute_score_batch(
+            solution_strs=solutions,
+            ground_truths=ground_truths,
+            extra_infos=extra_infos,
+            sandbox_fusion_url=sandbox_url,
+        )
+
+        assert len(scores) == 2
+        assert scores[0] == pytest.approx(1.0, abs=0.1)
+        assert scores[1] == pytest.approx(1.0, abs=0.1)
 
 
 # =============================================================================
@@ -531,42 +703,19 @@ class TestEdgeCases:
         )
         assert score == pytest.approx(1.0, abs=0.1)
 
-
-# =============================================================================
-# LLM Judge Batch Tests
-# =============================================================================
-
-
-class TestLLMJudgeBatch:
-    """Tests for compute_score_llm_judge_batch function."""
-
-    def test_llm_judge_batch_fallback(self, dolci_module):
-        """Test LLM judge batch falls back to string matching when unavailable."""
-        scores = dolci_module.compute_score_llm_judge_batch(
-            responses=["The answer is 42", "Wrong answer"],
-            ground_truths=["42", "correct"],
-            prompts=["What is the answer?", "What is the answer?"],
-            fallback_to_string_match=True,
+    def test_sandbox_url_from_extra_info(self, dolci_module):
+        """Test that sandbox_fusion_url can be passed via extra_info."""
+        extra_info = {
+            "dataset_source": "code",
+            "sandbox_fusion_url": "http://fake-url.com",  # Won't actually be called in fallback
+        }
+        # This will fail to connect but should not crash
+        score = dolci_module.compute_score(
+            solution_str="```python\nprint(1)\n```",
+            ground_truth=json.dumps({"inputs": [""], "outputs": ["1"]}),
+            extra_info=extra_info,
         )
-        assert len(scores) == 2
-        assert scores[0] == 1.0  # Contains "42"
-        assert scores[1] == 0.0  # Does not contain "correct"
-
-    def test_llm_judge_batch_empty(self, dolci_module):
-        """Test LLM judge batch with empty input."""
-        scores = dolci_module.compute_score_llm_judge_batch(
-            responses=[],
-            ground_truths=[],
-        )
-        assert scores == []
-
-    def test_llm_judge_batch_length_mismatch(self, dolci_module):
-        """Test LLM judge batch raises error on length mismatch."""
-        with pytest.raises(ValueError, match="Length mismatch"):
-            dolci_module.compute_score_llm_judge_batch(
-                responses=["a", "b"],
-                ground_truths=["x"],
-            )
+        assert isinstance(score, float)
 
 
 if __name__ == "__main__":
