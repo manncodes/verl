@@ -109,7 +109,7 @@ def _compute_math_scores(
     solutions: List[str],
     ground_truths: List[str],
 ) -> Dict[int, float]:
-    """Compute math scores using math_verify or math_dapo.
+    """Compute math scores using math_dapo (primary) or math_verify (fallback).
 
     Args:
         indices: Original indices in the batch.
@@ -121,23 +121,41 @@ def _compute_math_scores(
     """
     results = {}
 
-    # Try math_verify first (more accurate), fallback to math_dapo
+    # Try math_dapo first (always available), then math_verify (requires pip install math-verify)
     math_compute_score = None
+    math_module_name = None
+
+    # Priority 1: math_dapo (always available in verl)
     try:
-        from verl.utils.reward_score import math_verify
+        from verl.utils.reward_score import math_dapo
 
-        math_compute_score = math_verify.compute_score
-        logger.debug("Using math_verify for math scoring")
+        math_compute_score = math_dapo.compute_score
+        math_module_name = "math_dapo"
+        logger.debug("Using math_dapo for math scoring")
     except ImportError:
-        try:
-            from verl.utils.reward_score import math_dapo
+        pass
 
-            math_compute_score = math_dapo.compute_score
-            logger.debug("math_verify not available, using math_dapo")
+    # Priority 2: math_verify (requires pip install math-verify)
+    if math_compute_score is None:
+        try:
+            from verl.utils.reward_score import math_verify
+
+            # Test if math_verify is actually functional (math-verify package installed)
+            # The module exists but requires external package
+            if hasattr(math_verify, "compute_score"):
+                # Try a quick test to see if it works
+                try:
+                    _ = math_verify.compute_score("\\boxed{1}", "1")
+                    math_compute_score = math_verify.compute_score
+                    math_module_name = "math_verify"
+                    logger.debug("Using math_verify for math scoring")
+                except Exception as e:
+                    logger.debug(f"math_verify.compute_score test failed: {e}")
         except ImportError:
-            logger.error("Neither math_verify nor math_dapo available")
+            pass
 
     if math_compute_score is None:
+        logger.error("Neither math_dapo nor math_verify available for math scoring")
         for idx in indices:
             results[idx] = 0.0
         return results
@@ -154,7 +172,7 @@ def _compute_math_scores(
             else:
                 results[idx] = float(result)
         except Exception as e:
-            logger.debug(f"Math verification failed for index {idx}: {e}")
+            logger.debug(f"Math verification failed for index {idx} using {math_module_name}: {e}")
             results[idx] = 0.0
 
     return results
