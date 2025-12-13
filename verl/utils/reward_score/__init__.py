@@ -103,6 +103,18 @@ def default_compute_score(
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
 
+    elif data_source in ["allenai/Dolci-Think-RL", "dolci_think_rl", "dolci"]:
+        from . import dolci_think_rl
+
+        res = dolci_think_rl.compute_score(
+            solution_str=solution_str,
+            ground_truth=ground_truth,
+            extra_info=extra_info,
+            sandbox_fusion_url=sandbox_fusion_url,
+            concurrent_semaphore=concurrent_semaphore,
+            memory_limit_mb=memory_limit_mb,
+        )
+
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
