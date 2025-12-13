@@ -58,7 +58,22 @@ def compute_score(
                 if first_line.strip().isalpha():  # Simple check for language name
                     solution = rest
     else:
-        return 0.0, [{"error": "Invalid completion (missing code block)"}]
+        # Fallback: accept raw code if it looks like Python code
+        # Check for common Python patterns to avoid executing random text
+        stripped = completion.strip()
+        python_indicators = (
+            stripped.startswith("import "),
+            stripped.startswith("from "),
+            stripped.startswith("def "),
+            stripped.startswith("class "),
+            stripped.startswith("#"),
+            "print(" in stripped,
+            "import " in stripped,
+        )
+        if any(python_indicators):
+            solution = stripped
+        else:
+            return 0.0, [{"error": "Invalid completion (missing code block)"}]
 
     try:
         if not isinstance(test_cases, dict):
