@@ -168,9 +168,12 @@ def _compute_math_scores(
             result = math_compute_score(sol, gt)
             if isinstance(result, dict):
                 # math_dapo returns {"score": ..., "acc": ..., "pred": ...}
-                results[idx] = result.get("score", 0.0)
+                score = result.get("score", 0.0)
             else:
-                results[idx] = float(result)
+                score = float(result)
+            # Normalize negative scores to 0.0 for consistency across all data types
+            # math_dapo returns -1.0 for wrong answers, but we want 0.0/1.0 range
+            results[idx] = max(0.0, score)
         except Exception as e:
             logger.debug(f"Math verification failed for index {idx} using {math_module_name}: {e}")
             results[idx] = 0.0
@@ -452,6 +455,13 @@ def _compute_ifeval_scores(
 def _extract_code_from_response(completion: str) -> Optional[str]:
     """Extract code from a model completion.
 
+    Handles various code block formats:
+    - ```python ... ```
+    - ```python3 ... ```
+    - ``` ... ``` (no language specifier)
+    - Multiple code blocks (uses the last Python block)
+    - Raw code without blocks
+
     Args:
         completion: The model's response potentially containing code blocks.
 
@@ -461,21 +471,31 @@ def _extract_code_from_response(completion: str) -> Optional[str]:
     if completion is None:
         return None
 
-    # Try to extract Python code block
-    if "```python" in completion:
-        solution = completion.split("```python")[-1].split("```")[0]
-        return solution.strip()
+    # Try to extract Python code block (handles python, python3, etc.)
+    # Use regex to match ```python followed by optional suffix (like "3") and whitespace
+    python_block_pattern = r"```python\d*\s*\n(.*?)```"
+    python_matches = re.findall(python_block_pattern, completion, re.DOTALL)
+    if python_matches:
+        # Use the last Python block (often the final/correct solution)
+        return python_matches[-1].strip()
 
-    # Try generic code block
+    # Try generic code block (``` without language specifier)
     if "```" in completion:
         parts = completion.split("```")
-        if len(parts) >= 2:
-            solution = parts[1]
-            # Remove potential language specifier
+        # Look for code blocks (odd indices after split)
+        for i in range(len(parts) - 1, 0, -2):  # Iterate backwards through code blocks
+            solution = parts[i]
+            if not solution.strip():
+                continue
+            # Remove potential language specifier on first line
             if "\n" in solution:
                 first_line, rest = solution.split("\n", 1)
-                if first_line.strip().isalpha():
-                    solution = rest
+                # Check if first line is just a language name (alphanumeric only)
+                first_line_stripped = first_line.strip()
+                if first_line_stripped and (first_line_stripped.isalpha() or first_line_stripped.isalnum()):
+                    # Skip if it looks like a language specifier
+                    if len(first_line_stripped) < 20:  # Language names are short
+                        solution = rest
             return solution.strip()
 
     # Return raw completion if no code blocks found

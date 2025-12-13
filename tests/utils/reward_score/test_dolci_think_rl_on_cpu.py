@@ -86,7 +86,7 @@ MATH_TEST_CASES = [
     {
         "solution": "<think>Let me calculate...</think>\nThe answer is \\boxed{5}",
         "ground_truth": "4",
-        "expected_score": -1.0,  # math_dapo returns -1 for wrong
+        "expected_score": 0.0,  # Wrong answers get 0.0 (normalized from math_dapo's -1.0)
         "description": "Wrong math answer",
     },
     # Case 4: Answer with thinking tags that need removal
@@ -209,14 +209,17 @@ IFEVAL_TEST_CASES = [
 # =============================================================================
 
 CODE_TEST_CASES = [
-    # Case 1: Simple addition function
+    # ==========================================================================
+    # INPUT/OUTPUT BASED TEST CASES (stdin/stdout)
+    # ==========================================================================
+    # Case 1: Simple addition function with print output
     {
         "solution": "```python\ndef add(a, b):\n    return a + b\n\nprint(add(2, 3))\n```",
         "test_cases": {"inputs": [""], "outputs": ["5"]},
         "expected_score": 1.0,
-        "description": "Simple addition",
+        "description": "IO: Simple addition with print",
     },
-    # Case 2: Fibonacci
+    # Case 2: Fibonacci with stdin input
     {
         "solution": """```python
 def fib(n):
@@ -230,16 +233,16 @@ print(fib(n))
 ```""",
         "test_cases": {"inputs": ["10"], "outputs": ["55"]},
         "expected_score": 1.0,
-        "description": "Fibonacci function",
+        "description": "IO: Fibonacci with stdin",
     },
     # Case 3: Wrong output
     {
         "solution": "```python\nprint('wrong')\n```",
         "test_cases": {"inputs": [""], "outputs": ["correct"]},
         "expected_score": 0.0,
-        "description": "Wrong output",
+        "description": "IO: Wrong output",
     },
-    # Case 4: Multiple test cases
+    # Case 4: Multiple input/output test cases
     {
         "solution": """```python
 import sys
@@ -249,7 +252,7 @@ print(n * 2)
 ```""",
         "test_cases": {"inputs": ["5", "10", "0"], "outputs": ["10", "20", "0"]},
         "expected_score": 1.0,
-        "description": "Multiple test cases",
+        "description": "IO: Multiple test cases",
     },
     # Case 5: Partial pass (2/3 correct)
     {
@@ -264,7 +267,253 @@ else:
 ```""",
         "test_cases": {"inputs": ["5", "10", "0"], "outputs": ["10", "20", "0"]},
         "expected_score": 0.67,  # Approximately 2/3
-        "description": "Partial pass",
+        "description": "IO: Partial pass",
+    },
+    # Case 6: Multi-line input parsing
+    {
+        "solution": """```python
+import sys
+lines = sys.stdin.read().strip().split('\\n')
+a, b = int(lines[0]), int(lines[1])
+print(a + b)
+```""",
+        "test_cases": {"inputs": ["3\n5", "10\n20"], "outputs": ["8", "30"]},
+        "expected_score": 1.0,
+        "description": "IO: Multi-line input",
+    },
+    # Case 7: String manipulation with input
+    {
+        "solution": """```python
+import sys
+s = sys.stdin.read().strip()
+print(s[::-1])
+```""",
+        "test_cases": {"inputs": ["hello", "world", "python"], "outputs": ["olleh", "dlrow", "nohtyp"]},
+        "expected_score": 1.0,
+        "description": "IO: String reversal",
+    },
+    # ==========================================================================
+    # ASSERT-BASED TEST CASES
+    # ==========================================================================
+    # Case 8: Simple assert test
+    {
+        "solution": """```python
+def add(a, b):
+    return a + b
+```""",
+        "test_cases": {
+            "inputs": ["", ""],
+            "outputs": [None, None],
+            "assert_case": [
+                "assert add(2, 3) == 5",
+                "assert add(-1, 1) == 0",
+            ],
+        },
+        "expected_score": 1.0,
+        "description": "Assert: Simple function test",
+    },
+    # Case 9: Assert with failing case
+    {
+        "solution": """```python
+def multiply(a, b):
+    return a + b  # Bug: should be a * b
+```""",
+        "test_cases": {
+            "inputs": ["", ""],
+            "outputs": [None, None],
+            "assert_case": [
+                "assert multiply(2, 3) == 6",
+                "assert multiply(4, 5) == 20",
+            ],
+        },
+        "expected_score": 0.0,
+        "description": "Assert: Failing assertion",
+    },
+    # Case 10: Class-based solution with asserts
+    {
+        "solution": """```python
+class Solution:
+    def twoSum(self, nums, target):
+        seen = {}
+        for i, num in enumerate(nums):
+            complement = target - num
+            if complement in seen:
+                return [seen[complement], i]
+            seen[num] = i
+        return []
+```""",
+        "test_cases": {
+            "inputs": ["", ""],
+            "outputs": [None, None],
+            "fn_name": "twoSum",
+            "assert_case": [
+                "assert Solution().twoSum([2, 7, 11, 15], 9) == [0, 1]",
+                "assert Solution().twoSum([3, 2, 4], 6) == [1, 2]",
+            ],
+        },
+        "expected_score": 1.0,
+        "description": "Assert: Class method test",
+    },
+    # Case 11: Multiple assertions mixed pass/fail
+    {
+        "solution": """```python
+def is_even(n):
+    return n % 2 == 0
+```""",
+        "test_cases": {
+            "inputs": ["", "", ""],
+            "outputs": [None, None, None],
+            "assert_case": [
+                "assert is_even(2) == True",
+                "assert is_even(3) == False",
+                "assert is_even(0) == True",
+            ],
+        },
+        "expected_score": 1.0,
+        "description": "Assert: Multiple passing assertions",
+    },
+    # ==========================================================================
+    # CODE BLOCK FORMAT VARIATIONS
+    # ==========================================================================
+    # Case 12: Code without language specifier
+    {
+        "solution": """```
+def greet(name):
+    return f"Hello, {name}!"
+
+print(greet("World"))
+```""",
+        "test_cases": {"inputs": [""], "outputs": ["Hello, World!"]},
+        "expected_score": 1.0,
+        "description": "Block: No language specifier",
+    },
+    # Case 13: Code with extra whitespace
+    {
+        "solution": """
+
+```python
+
+def square(n):
+    return n * n
+
+print(square(5))
+
+```
+
+""",
+        "test_cases": {"inputs": [""], "outputs": ["25"]},
+        "expected_score": 1.0,
+        "description": "Block: Extra whitespace",
+    },
+    # Case 14: Multiple code blocks (should use last python block)
+    {
+        "solution": """Here's my approach:
+
+```python
+# First attempt (wrong)
+def bad_solution():
+    return 0
+```
+
+After thinking more:
+
+```python
+# Correct solution
+print(42)
+```""",
+        "test_cases": {"inputs": [""], "outputs": ["42"]},
+        "expected_score": 1.0,
+        "description": "Block: Multiple blocks uses last",
+    },
+    # Case 15: Inline code explanation with code block
+    {
+        "solution": """<think>
+Let me think about this problem step by step.
+The function should return the sum of two numbers.
+</think>
+
+Here's my solution:
+
+```python
+import sys
+
+# Read input
+data = sys.stdin.read().strip().split()
+a, b = int(data[0]), int(data[1])
+
+# Calculate and print result
+result = a + b
+print(result)
+```
+
+This solution handles the input correctly.""",
+        "test_cases": {"inputs": ["3 5", "10 20"], "outputs": ["8", "30"]},
+        "expected_score": 1.0,
+        "description": "Block: With thinking and explanation",
+    },
+    # Case 16: Code with Python3 specifier
+    {
+        "solution": """```python3
+def factorial(n):
+    if n <= 1:
+        return 1
+    return n * factorial(n - 1)
+
+import sys
+n = int(sys.stdin.read().strip())
+print(factorial(n))
+```""",
+        "test_cases": {"inputs": ["5", "0", "3"], "outputs": ["120", "1", "6"]},
+        "expected_score": 1.0,
+        "description": "Block: python3 specifier",
+    },
+    # Case 17: Raw code without code blocks (fallback)
+    {
+        "solution": """import sys
+n = int(sys.stdin.read().strip())
+print(n ** 2)""",
+        "test_cases": {"inputs": ["4", "5"], "outputs": ["16", "25"]},
+        "expected_score": 1.0,
+        "description": "Block: Raw code no blocks",
+    },
+    # ==========================================================================
+    # EDGE CASES
+    # ==========================================================================
+    # Case 18: Empty code block
+    {
+        "solution": "```python\n```",
+        "test_cases": {"inputs": [""], "outputs": ["42"]},
+        "expected_score": 0.0,
+        "description": "Edge: Empty code block",
+    },
+    # Case 19: Code with runtime error (division by zero)
+    {
+        "solution": """```python
+print(1 / 0)
+```""",
+        "test_cases": {"inputs": [""], "outputs": ["inf"]},
+        "expected_score": 0.0,
+        "description": "Edge: Runtime error",
+    },
+    # Case 20: Code with syntax error
+    {
+        "solution": """```python
+def broken(
+    print("missing closing paren"
+```""",
+        "test_cases": {"inputs": [""], "outputs": ["anything"]},
+        "expected_score": 0.0,
+        "description": "Edge: Syntax error",
+    },
+    # Case 21: List/array output comparison
+    {
+        "solution": """```python
+import json
+print(json.dumps([1, 2, 3]))
+```""",
+        "test_cases": {"inputs": [""], "outputs": ["[1, 2, 3]"]},
+        "expected_score": 1.0,
+        "description": "Edge: JSON array output",
     },
 ]
 
