@@ -35,3 +35,25 @@ try:
     __all__.append("RateLimitedRewardLoopManager")
 except ImportError:
     pass  # Optional dependency, may not be available
+
+# Import Prime Intellect reward managers
+try:
+    from verl.workers.reward_manager.prime_intellect import (
+        PrimeIntellectRewardManager,  # noqa: F401
+        AsyncPrimeIntellectRewardManager,  # noqa: F401
+    )
+
+    __all__.extend(["PrimeIntellectRewardManager", "AsyncPrimeIntellectRewardManager"])
+except ImportError:
+    pass  # Optional dependency
+
+# Import Prime Intellect reward loop managers
+try:
+    from verl.experimental.reward.reward_loop.prime_intellect import (
+        PrimeIntellectRewardLoopManager,  # noqa: F401
+        PrimeIntellectEnvRewardLoopManager,  # noqa: F401
+    )
+
+    __all__.extend(["PrimeIntellectRewardLoopManager", "PrimeIntellectEnvRewardLoopManager"])
+except ImportError:
+    pass  # Optional dependency

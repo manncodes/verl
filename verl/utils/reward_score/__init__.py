@@ -103,6 +103,18 @@ def default_compute_score(
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
 
+    elif data_source.startswith("prime_intellect/") or data_source.startswith("prime_env/"):
+        # Prime Intellect environments and sandboxes integration
+        from verl.utils.prime_intellect import compute_score as pi_compute_score
+
+        res = pi_compute_score(
+            data_source=data_source,
+            solution_str=solution_str,
+            ground_truth=ground_truth,
+            extra_info=extra_info,
+            **kwargs,
+        )
+
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 

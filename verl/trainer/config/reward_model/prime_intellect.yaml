@@ -1,0 +1,69 @@
+# Prime Intellect Reward Model Configuration
+#
+# This configuration enables reward computation using Prime Intellect's
+# environments and sandboxes for RL training.
+#
+# Features:
+#   - Remote code execution via Prime Intellect Sandboxes
+#   - Integration with Prime Intellect Environments Hub
+#   - Support for verifiers environments and rubrics
+#   - Async batch processing for high throughput
+#
+# Usage:
+#   Merge this config into your training config:
+#   python train.py +reward_model=prime_intellect
+#
+# Environment Variables:
+#   PRIME_API_KEY: Your Prime Intellect API key (required)
+#
+# See also:
+#   - https://docs.primeintellect.ai/sandboxes/sdk
+#   - https://github.com/PrimeIntellect-ai/verifiers
+
+# Disable traditional reward model (using Prime Intellect services instead)
+enable: False
+
+# Override the reward manager to use Prime Intellect
+reward_manager: prime_intellect
+
+# Prime Intellect specific configuration
+prime_intellect:
+  # API key for Prime Intellect services
+  # Can also be set via PRIME_API_KEY environment variable
+  api_key: ${oc.env:PRIME_API_KEY,null}
+
+  # Maximum concurrent requests to Prime Intellect API
+  max_concurrent: 100
+
+  # Rate limit in requests per minute (null for unlimited)
+  max_rpm: null
+
+  # Timeout for individual executions in seconds
+  timeout: 60
+
+  # Default Docker image for sandbox execution
+  docker_image: python:3.11-slim
+
+  # Maximum workers for parallel processing
+  max_workers: 16
+
+  # Environment name for verifiers (optional)
+  # If set, uses a specific environment from the Environments Hub
+  # Example: "will/wordle", "primeintellect/math-python"
+  environment_name: null
+
+# Cloud sandbox fusion configuration (for fallback)
+sandbox_fusion:
+  url: null
+  max_concurrent: 64
+  memory_limit_mb: 1024
+
+# Profiler configuration (inherited)
+profiler:
+  _target_: verl.utils.profiler.ProfilerConfig
+  tool: ${oc.select:global_profiler.tool,null}
+  enable: False
+  all_ranks: False
+  ranks: []
+  save_path: ${oc.select:global_profiler.save_path,null}
+  tool_config: ${oc.select:actor_rollout_ref.actor.profiler.tool_config,null}
