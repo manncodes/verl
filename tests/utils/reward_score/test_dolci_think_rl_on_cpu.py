@@ -464,20 +464,377 @@ requires_llm_judge = pytest.mark.skipif(
 )
 
 
-@requires_llm_judge
-class TestGeneralQualityScoring:
-    """Tests for general-quality scoring with LLM judge."""
+# =============================================================================
+# Integration Tests: LLM as Judge (Real API calls)
+# =============================================================================
 
-    def test_general_quality_basic(self, dolci_module):
-        """Test general-quality scoring calls LLM judge."""
-        extra_info = {"dataset_source": "general-quality"}
+
+@pytest.fixture
+def llm_judge_url():
+    """Get LLM judge URL from environment."""
+    return os.environ.get("LLM_JUDGE_URL")
+
+
+@pytest.fixture
+def llm_judge_model():
+    """Get LLM judge model from environment."""
+    return os.environ.get("LLM_JUDGE_MODEL", "openai/gpt-oss-120b")
+
+
+@requires_llm_judge
+class TestLLMJudgeSingleScoring:
+    """Tests for single LLM judge scoring with real API calls."""
+
+    def test_correct_answer_high_score(self, dolci_module, llm_judge_url, llm_judge_model):
+        """Test that correct answers receive high scores."""
         score = dolci_module.compute_score(
             solution_str="The capital of France is Paris.",
             ground_truth="Paris",
-            extra_info=extra_info,
+            extra_info={
+                "dataset_source": "general-quality",
+                "original_prompt": "What is the capital of France?",
+            },
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
         )
         assert isinstance(score, float)
         assert 0.0 <= score <= 1.0
+        # Correct answer should get a reasonably high score
+        assert score >= 0.5
+
+    def test_wrong_answer_low_score(self, dolci_module, llm_judge_url, llm_judge_model):
+        """Test that wrong answers receive low scores."""
+        score = dolci_module.compute_score(
+            solution_str="The capital of France is Berlin.",
+            ground_truth="Paris",
+            extra_info={
+                "dataset_source": "general-quality",
+                "original_prompt": "What is the capital of France?",
+            },
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+        # Wrong answer should get a low score
+        assert score <= 0.5
+
+    def test_partial_answer_medium_score(self, dolci_module, llm_judge_url, llm_judge_model):
+        """Test that partial answers receive medium scores."""
+        score = dolci_module.compute_score(
+            solution_str="Paris is in France and is known for the Eiffel Tower.",
+            ground_truth="Paris is the capital of France, known for landmarks like the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral.",
+            extra_info={
+                "dataset_source": "general-quality",
+                "original_prompt": "Tell me about Paris.",
+            },
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+
+    def test_general_quality_dataset_source(self, dolci_module, llm_judge_url, llm_judge_model):
+        """Test general-quality dataset routing to LLM judge."""
+        score = dolci_module.compute_score(
+            solution_str="Python is a high-level programming language known for readability.",
+            ground_truth="Python is a popular programming language used for web development, data science, and automation.",
+            extra_info={"dataset_source": "general-quality"},
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+
+    def test_general_quality_ref_dataset_source(self, dolci_module, llm_judge_url, llm_judge_model):
+        """Test general-quality_ref dataset routing to LLM judge."""
+        score = dolci_module.compute_score(
+            solution_str="Machine learning is a subset of AI.",
+            ground_truth="Machine learning is a branch of artificial intelligence that enables computers to learn from data.",
+            extra_info={"dataset_source": "general-quality_ref"},
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+
+    def test_thinking_tags_removed(self, dolci_module, llm_judge_url, llm_judge_model):
+        """Test that thinking tags are properly removed before judging."""
+        score = dolci_module.compute_score(
+            solution_str="<think>Let me reason through this...</think>The answer is 42.",
+            ground_truth="42",
+            extra_info={
+                "dataset_source": "general-quality",
+                "original_prompt": "What is the answer to life, the universe, and everything?",
+            },
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+        # Should get a good score since thinking is stripped
+        assert score >= 0.5
+
+    def test_empty_solution_low_score(self, dolci_module, llm_judge_url, llm_judge_model):
+        """Test that empty solution gets low score."""
+        score = dolci_module.compute_score(
+            solution_str="",
+            ground_truth="The correct answer is 42.",
+            extra_info={"dataset_source": "general-quality"},
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+        assert isinstance(score, float)
+        assert score == 0.0  # Empty solution returns 0 before API call
+
+    def test_none_solution_returns_zero(self, dolci_module, llm_judge_url, llm_judge_model):
+        """Test that None solution returns 0."""
+        score = dolci_module.compute_score(
+            solution_str=None,
+            ground_truth="reference",
+            extra_info={"dataset_source": "general-quality"},
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+        assert score == 0.0
+
+    def test_none_ground_truth_returns_zero(self, dolci_module, llm_judge_url, llm_judge_model):
+        """Test that None ground_truth returns 0."""
+        score = dolci_module.compute_score(
+            solution_str="test response",
+            ground_truth=None,
+            extra_info={"dataset_source": "general-quality"},
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+        assert score == 0.0
+
+    def test_list_ground_truth(self, dolci_module, llm_judge_url, llm_judge_model):
+        """Test that list ground_truth is handled (uses first element)."""
+        score = dolci_module.compute_score(
+            solution_str="The capital of France is Paris.",
+            ground_truth=["Paris", "paris", "PARIS"],
+            extra_info={"dataset_source": "general-quality"},
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+
+    def test_unicode_content(self, dolci_module, llm_judge_url, llm_judge_model):
+        """Test LLM judge with unicode content."""
+        score = dolci_module.compute_score(
+            solution_str="日本の首都は東京です。",
+            ground_truth="東京",
+            extra_info={
+                "dataset_source": "general-quality",
+                "original_prompt": "日本の首都はどこですか?",
+            },
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+
+    def test_long_response(self, dolci_module, llm_judge_url, llm_judge_model):
+        """Test LLM judge with long response (should be truncated)."""
+        long_response = "This is a test. " * 500  # ~8000 chars
+        score = dolci_module.compute_score(
+            solution_str=long_response,
+            ground_truth="A summary of the topic.",
+            extra_info={"dataset_source": "general-quality"},
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+
+
+@requires_llm_judge
+class TestLLMJudgeBatchScoring:
+    """Tests for batch LLM judge scoring with real API calls."""
+
+    def test_batch_scoring(self, dolci_module, llm_judge_url, llm_judge_model):
+        """Test batch scoring with LLM judge."""
+        solutions = [
+            "The capital of France is Paris.",
+            "Water boils at 100 degrees Celsius.",
+            "The sun rises in the west.",  # Wrong
+        ]
+        ground_truths = [
+            "Paris",
+            "100°C or 212°F at sea level",
+            "The sun rises in the east.",
+        ]
+        extra_infos = [
+            {"dataset_source": "general-quality", "original_prompt": "What is the capital of France?"},
+            {"dataset_source": "general-quality", "original_prompt": "At what temperature does water boil?"},
+            {"dataset_source": "general-quality", "original_prompt": "Where does the sun rise?"},
+        ]
+
+        scores = dolci_module.compute_score_batch(
+            solution_strs=solutions,
+            ground_truths=ground_truths,
+            extra_infos=extra_infos,
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+
+        assert len(scores) == 3
+        assert all(isinstance(s, float) for s in scores)
+        assert all(0.0 <= s <= 1.0 for s in scores)
+        # First two should score higher than the wrong answer
+        assert scores[0] >= scores[2] or scores[1] >= scores[2]
+
+    def test_batch_with_none_values(self, dolci_module, llm_judge_url, llm_judge_model):
+        """Test batch scoring with None values."""
+        solutions = [None, "The answer is correct.", ""]
+        ground_truths = ["expected", "correct", None]
+        extra_infos = [
+            {"dataset_source": "general-quality"},
+            {"dataset_source": "general-quality"},
+            {"dataset_source": "general-quality"},
+        ]
+
+        scores = dolci_module.compute_score_batch(
+            solution_strs=solutions,
+            ground_truths=ground_truths,
+            extra_infos=extra_infos,
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+
+        assert len(scores) == 3
+        assert scores[0] == 0.0  # None solution
+        assert isinstance(scores[1], float)
+        assert scores[2] == 0.0  # None ground_truth
+
+    def test_batch_parallel_execution(self, dolci_module, llm_judge_url, llm_judge_model):
+        """Test that batch processing runs efficiently in parallel."""
+        import time
+
+        n_samples = 5
+        solutions = [f"Response number {i}" for i in range(n_samples)]
+        ground_truths = [f"Reference {i}" for i in range(n_samples)]
+        extra_infos = [{"dataset_source": "general-quality"} for _ in range(n_samples)]
+
+        start = time.time()
+        scores = dolci_module.compute_score_batch(
+            solution_strs=solutions,
+            ground_truths=ground_truths,
+            extra_infos=extra_infos,
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+        elapsed = time.time() - start
+
+        assert len(scores) == n_samples
+        assert all(isinstance(s, float) for s in scores)
+        # Parallel execution should complete reasonably fast
+        # (less than 60s for 5 samples if parallel, much longer if sequential)
+        assert elapsed < 120.0
+
+    def test_empty_batch(self, dolci_module, llm_judge_url, llm_judge_model):
+        """Test empty batch returns empty list."""
+        scores = dolci_module.compute_score_batch(
+            solution_strs=[],
+            ground_truths=[],
+            extra_infos=[],
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+        assert scores == []
+
+
+@requires_llm_judge
+class TestLLMJudgeDirectAPI:
+    """Tests for direct _call_llm_judge function."""
+
+    def test_call_llm_judge_direct(self, dolci_module, llm_judge_url, llm_judge_model):
+        """Test direct call to _call_llm_judge."""
+        score = dolci_module._call_llm_judge(
+            prompt="What is 2 + 2?",
+            response="4",
+            reference="4",
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+        assert score >= 0.5  # Should be high for correct answer
+
+    def test_compute_llm_judge_score_direct(self, dolci_module, llm_judge_url, llm_judge_model):
+        """Test direct call to _compute_llm_judge_score."""
+        score = dolci_module._compute_llm_judge_score(
+            solution_str="The Earth orbits the Sun.",
+            ground_truth="Earth revolves around the Sun.",
+            extra_info={"original_prompt": "Describe Earth's motion."},
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+
+
+@requires_llm_judge
+class TestLLMJudgeQualityVariation:
+    """Tests verifying LLM judge differentiates answer quality."""
+
+    def test_quality_ordering(self, dolci_module, llm_judge_url, llm_judge_model):
+        """Test that LLM judge orders answers by quality."""
+        prompt = "Explain what machine learning is."
+        reference = "Machine learning is a subset of artificial intelligence that enables systems to learn and improve from experience without being explicitly programmed."
+
+        # Excellent answer - comprehensive and accurate
+        excellent = "Machine learning is a branch of artificial intelligence where computers learn patterns from data to make predictions or decisions, improving automatically through experience without explicit programming."
+
+        # Good answer - correct but less detailed
+        good = "Machine learning is AI that learns from data."
+
+        # Poor answer - partially correct but vague
+        poor = "It's something computers do with data."
+
+        # Wrong answer
+        wrong = "Machine learning is a type of database management system."
+
+        score_excellent = dolci_module.compute_score(
+            solution_str=excellent,
+            ground_truth=reference,
+            extra_info={"dataset_source": "general-quality", "original_prompt": prompt},
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+
+        score_good = dolci_module.compute_score(
+            solution_str=good,
+            ground_truth=reference,
+            extra_info={"dataset_source": "general-quality", "original_prompt": prompt},
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+
+        score_poor = dolci_module.compute_score(
+            solution_str=poor,
+            ground_truth=reference,
+            extra_info={"dataset_source": "general-quality", "original_prompt": prompt},
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+
+        score_wrong = dolci_module.compute_score(
+            solution_str=wrong,
+            ground_truth=reference,
+            extra_info={"dataset_source": "general-quality", "original_prompt": prompt},
+            llm_judge_url=llm_judge_url,
+            llm_judge_model=llm_judge_model,
+        )
+
+        # Verify ordering (with some tolerance for LLM variability)
+        assert score_excellent >= score_good - 0.1, f"Excellent ({score_excellent}) should be >= Good ({score_good})"
+        assert score_good >= score_poor - 0.1, f"Good ({score_good}) should be >= Poor ({score_poor})"
+        assert score_poor >= score_wrong - 0.1, f"Poor ({score_poor}) should be >= Wrong ({score_wrong})"
+        # Wrong should be notably lower than excellent
+        assert score_wrong < score_excellent, f"Wrong ({score_wrong}) should be < Excellent ({score_excellent})"
 
 
 # =============================================================================
