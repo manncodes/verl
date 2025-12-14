@@ -18,7 +18,7 @@ The function implemented in this file should be used by trainer with different d
 implement PPO-like algorithms.
 """
 
-__all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
+__all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator", "get_global_entropy_top_mask"]
 
 from collections import defaultdict
 from enum import Enum
@@ -34,6 +34,48 @@ from verl.utils import as_torch_index, group_mean_std
 from verl.utils.import_utils import deprecated
 from verl.workers.config import ActorConfig
 
+
+def get_global_entropy_top_mask(entropy: torch.Tensor, response_mask: torch.Tensor, top_ratio: float = 0.2):
+    """
+    Select the top `top_ratio` high-entropy tokens among all response tokens in a batch.
+
+    This implements the core idea from "Beyond the 80/20 Rule: High-Entropy Minority Tokens
+    Drive Effective Reinforcement Learning for LLM Reasoning" (https://arxiv.org/abs/2506.01939).
+    The paper shows that focusing policy gradient updates on only the top 20% highest-entropy
+    tokens (the "forking tokens" that steer reasoning) improves RL training efficiency.
+
+    Args:
+        entropy: [B, S] tensor of token entropies.
+        response_mask: [B, S] tensor (1 = response token, 0 = non-response).
+        top_ratio: fraction of response tokens to keep (e.g., 0.2 = top 20%).
+
+    Returns:
+        entropy_top_mask: [B, S] binary mask (1 = selected top entropy token)
+    """
+    # Flatten
+    flat_entropy = entropy.flatten()
+    flat_mask = response_mask.flatten().bool()
+
+    # Filter to response tokens only
+    response_entropy = flat_entropy[flat_mask]
+    if response_entropy.numel() == 0:
+        return torch.zeros_like(entropy, dtype=torch.long)
+
+    # Top-k selection (ceiling to ensure at least 1 token is selected)
+    top_k = max(1, int(len(response_entropy) * top_ratio + 0.9999))
+    _, topk_idx = torch.topk(response_entropy, k=top_k)
+
+    # Map back to original flat indices
+    response_positions = flat_mask.nonzero(as_tuple=False).squeeze(1)
+    top_positions = response_positions[topk_idx]
+
+    # Build mask
+    flat_out = torch.zeros_like(flat_entropy, dtype=torch.long)
+    flat_out[top_positions] = 1
+
+    return flat_out.view_as(entropy)
+
+
 PolicyLossFn = Callable[
     [
         torch.Tensor,  # old_log_prob
@@ -42,7 +84,8 @@ PolicyLossFn = Callable[
         torch.Tensor,  # response_mask
         str,  # loss_agg_mode
         Optional[DictConfig | ActorConfig],  # config
-        torch.Tensor | None,  # rollout_log_probs
+        torch.Tensor | None,  # rollout_is_weights
+        torch.Tensor | None,  # entropy_top_mask (for Beyond 80/20 Rule)
     ],
     tuple[torch.Tensor, dict[str, Any]],
 ]
@@ -912,6 +955,7 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    entropy_top_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -932,8 +976,12 @@ def compute_policy_loss_vanilla(
             Aggregation mode for `agg_loss`. Defaults to "token-mean".
         config: `(verl.trainer.config.ActorConfig)`:
             config for the actor.
-        rollout_log_probs: `(torch.Tensor)`:
-            log probabilities of actions under the rollout policy, shape (batch_size, response_length).
+        rollout_is_weights: `(torch.Tensor)`:
+            Importance sampling weights for rollout correction, shape (batch_size, response_length).
+        entropy_top_mask: `(torch.Tensor)`:
+            Binary mask for high-entropy token selection (Beyond 80/20 Rule),
+            shape (batch_size, response_length). When provided, only tokens with mask=1
+            contribute to the policy gradient loss.
     """
 
     assert config is not None
@@ -985,8 +1033,15 @@ def compute_policy_loss_vanilla(
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
 
+    # Apply entropy top mask if provided (Beyond 80/20 Rule)
+    # When entropy_top_mask is set, only compute gradients for high-entropy tokens
+    if entropy_top_mask is not None:
+        effective_mask = response_mask * entropy_top_mask
+    else:
+        effective_mask = response_mask
+
     pg_loss = agg_loss(
-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+        loss_mat=pg_losses, loss_mask=effective_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
     )
 
     pg_metrics = {
@@ -994,6 +1049,12 @@ def compute_policy_loss_vanilla(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+
+    # Add entropy token ratio metric if mask is provided
+    if entropy_top_mask is not None:
+        entropy_token_ratio = effective_mask.sum().item() / max(response_mask.sum().item(), 1)
+        pg_metrics["actor/entropy_token_ratio"] = entropy_token_ratio
+
     return pg_loss, pg_metrics
 
 
@@ -1006,6 +1067,7 @@ def compute_policy_loss_gspo(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    entropy_top_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for GSPO.
@@ -1023,7 +1085,11 @@ def compute_policy_loss_gspo(
             Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
         loss_agg_mode (str, optional):
             Aggregation mode for `agg_loss`. For GSPO, it is recommended to use "seq-mean-token-mean".
+        entropy_top_mask (torch.Tensor, optional):
+            Binary mask for high-entropy token selection (Beyond 80/20 Rule). Currently unused in GSPO.
     """
+    # Note: entropy_top_mask is accepted for interface compatibility but not used in GSPO
+    # as GSPO operates at the sequence level rather than token level
 
     assert config is not None
     assert isinstance(config, ActorConfig)
@@ -1082,6 +1148,7 @@ def compute_policy_loss_gpg(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    entropy_top_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Adapted from
     https://github.com/AMAP-ML/GPG/blob/main/VisualThinker-R1-Zero/src/open-r1-multimodal/src/open_r1/trainer/grpo_trainer.py#L495
@@ -1092,6 +1159,8 @@ def compute_policy_loss_gpg(
             shape: (bs, response_length)
         response_mask: `(torch.Tensor)`
             shape: (bs, response_length)
+        entropy_top_mask: `(torch.Tensor, optional)`
+            Binary mask for high-entropy token selection (Beyond 80/20 Rule).
     return:
         pg_loss: `a scalar torch.Tensor`
             policy gradient loss computed via GPG
@@ -1103,10 +1172,22 @@ def compute_policy_loss_gpg(
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
 
+    # Apply entropy top mask if provided (Beyond 80/20 Rule)
+    if entropy_top_mask is not None:
+        effective_mask = response_mask * entropy_top_mask
+    else:
+        effective_mask = response_mask
+
     pg_loss = agg_loss(
-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+        loss_mat=pg_losses, loss_mask=effective_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
     )
-    return pg_loss, {}
+
+    pg_metrics = {}
+    if entropy_top_mask is not None:
+        entropy_token_ratio = effective_mask.sum().item() / max(response_mask.sum().item(), 1)
+        pg_metrics["actor/entropy_token_ratio"] = entropy_token_ratio
+
+    return pg_loss, pg_metrics
 
 
 @register_policy_loss("clip_cov")
@@ -1118,6 +1199,7 @@ def compute_policy_loss_clip_cov(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    entropy_top_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
@@ -1204,13 +1286,24 @@ def compute_policy_loss_clip_cov(
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
 
+    # Apply entropy top mask if provided (Beyond 80/20 Rule)
+    if entropy_top_mask is not None:
+        effective_mask = response_mask * entropy_top_mask
+    else:
+        effective_mask = response_mask
+
     pg_loss = agg_loss(
-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+        loss_mat=pg_losses, loss_mask=effective_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
     )
     pg_metrics = {
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
         "actor/ppo_kl": ppo_kl.detach().item(),
     }
+
+    if entropy_top_mask is not None:
+        entropy_token_ratio = effective_mask.sum().item() / max(response_mask.sum().item(), 1)
+        pg_metrics["actor/entropy_token_ratio"] = entropy_token_ratio
+
     return pg_loss, pg_metrics
 
 
@@ -1223,6 +1316,7 @@ def compute_policy_loss_kl_cov(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    entropy_top_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
@@ -1285,12 +1379,23 @@ def compute_policy_loss_kl_cov(
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
 
+    # Apply entropy top mask if provided (Beyond 80/20 Rule)
+    if entropy_top_mask is not None:
+        effective_mask = response_mask * entropy_top_mask
+    else:
+        effective_mask = response_mask
+
     pg_loss = agg_loss(
-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+        loss_mat=pg_losses, loss_mask=effective_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
     )
     pg_metrics = {
         "actor/ppo_kl": ppo_kl_abs.detach().item(),
     }
+
+    if entropy_top_mask is not None:
+        entropy_token_ratio = effective_mask.sum().item() / max(response_mask.sum().item(), 1)
+        pg_metrics["actor/entropy_token_ratio"] = entropy_token_ratio
+
     return pg_loss, pg_metrics
 
 
@@ -1303,6 +1408,7 @@ def compute_policy_loss_geo_mean(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    entropy_top_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for GMPO.
@@ -1321,7 +1427,12 @@ def compute_policy_loss_geo_mean(
             Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
         loss_agg_mode (str, optional):
             not used
+        entropy_top_mask (torch.Tensor, optional):
+            Binary mask for high-entropy token selection (Beyond 80/20 Rule). Currently unused in geo_mean
+            as it operates at sequence level.
     """
+    # Note: entropy_top_mask is accepted for interface compatibility but not used in geo_mean
+    # as geo_mean operates at the sequence level rather than token level
 
     assert config is not None
     assert not isinstance(config, AlgoConfig)
@@ -1732,6 +1843,7 @@ def compute_policy_loss_rollout_correction_wrapper(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    entropy_top_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Wrapper for compute_policy_loss_with_rollout_correction to match PolicyLossFn interface.
 
@@ -1744,6 +1856,8 @@ def compute_policy_loss_rollout_correction_wrapper(
         advantages: Advantage estimates
         response_mask: Valid token mask
         loss_agg_mode: Loss aggregation mode
+        entropy_top_mask: Binary mask for high-entropy token selection (Beyond 80/20 Rule).
+            Currently unused in rollout_correction.
         config: Actor config containing rollout_correction settings
         rollout_is_weights: Pre-computed IS weights (ignored, computed internally)
     """

@@ -27,7 +27,7 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, get_global_entropy_top_mask, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -456,7 +456,11 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 
-                    calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
+                    # Check if entropy calculation is needed (for entropy loss or entropy_top_ratio mask)
+                    entropy_top_ratio = self.config.get("entropy_top_ratio", None)
+                    calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0) or (
+                        entropy_top_ratio is not None
+                    )
 
                     if self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
@@ -476,6 +480,16 @@ class DataParallelPPOActor(BasePPOActor):
                             old_log_prob = log_prob.detach()
                         else:
                             old_log_prob = model_inputs["old_log_probs"]
+
+                    # Compute entropy top mask if entropy_top_ratio is set (Beyond 80/20 Rule)
+                    # This focuses policy gradient on only the top high-entropy tokens
+                    entropy_top_mask = None
+                    if entropy_top_ratio is not None and entropy is not None:
+                        if not (0 < entropy_top_ratio <= 1):
+                            raise ValueError(f"entropy_top_ratio must be in (0, 1], got {entropy_top_ratio}")
+                        entropy_top_mask = get_global_entropy_top_mask(
+                            entropy=entropy, response_mask=response_mask, top_ratio=entropy_top_ratio
+                        )
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
@@ -497,6 +511,7 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
+                        entropy_top_mask=entropy_top_mask,
                     )
                     micro_batch_metrics.update(pg_metrics)
 

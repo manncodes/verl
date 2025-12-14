@@ -165,6 +165,13 @@ class ActorConfig(BaseConfig):
     # global_batch_size: global batch size
     global_batch_info: dict = field(default_factory=dict)
 
+    # Beyond the 80/20 Rule: High-Entropy Minority Tokens for RL
+    # See: https://arxiv.org/abs/2506.01939
+    # When set, only the top `entropy_top_ratio` fraction of high-entropy tokens
+    # will contribute to the policy gradient loss. For example, 0.2 means only
+    # the top 20% highest-entropy tokens are used for training.
+    entropy_top_ratio: Optional[float] = None
+
     def __post_init__(self):
         """Validate actor configuration parameters."""
         assert self.strategy != MISSING
