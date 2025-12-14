@@ -16,9 +16,8 @@ Tests for the Dolci-Think-RL reward function.
 
 Tests all dataset source types:
 - math: Mathematical reasoning problems (uses math_verify.MathVerifier)
-- instruction_following: Instruction following with constraints (uses ifeval)
 - code/code_stdio: Code execution problems (uses sandbox_fusion)
-- general-quality: General chat/QA responses
+- general-quality: General chat/QA responses (uses LLM-as-a-judge)
 
 Reference: https://huggingface.co/datasets/allenai/Dolci-Think-RL
 """
@@ -69,14 +68,6 @@ try:
     MATH_VERIFY_AVAILABLE = True
 except ImportError:
     MATH_VERIFY_AVAILABLE = False
-
-# Check if ifeval is available
-try:
-    from verl.utils.reward_score import ifeval
-
-    IFEVAL_AVAILABLE = True
-except ImportError:
-    IFEVAL_AVAILABLE = False
 
 # Check if sandbox_fusion is available
 try:
@@ -268,7 +259,6 @@ def sandbox_url():
 requires_verl = pytest.mark.skipif(not VERL_AVAILABLE, reason="verl package not fully installed")
 requires_dolci = pytest.mark.skipif(not DOLCI_AVAILABLE, reason="dolci_think_rl module not available")
 requires_math_verify = pytest.mark.skipif(not MATH_VERIFY_AVAILABLE, reason="math_verify module not available")
-requires_ifeval = pytest.mark.skipif(not IFEVAL_AVAILABLE, reason="ifeval module not available")
 requires_sandbox = pytest.mark.skipif(
     not os.environ.get("SANDBOX_FUSION_URL"), reason="SANDBOX_FUSION_URL environment variable not set"
 )
@@ -375,29 +365,6 @@ class TestMathScoring:
         )
         # Allow some tolerance for different verifiers
         assert score == pytest.approx(test_case["expected_score"], abs=0.1)
-
-
-# =============================================================================
-# Integration Tests: IFEval Scoring (using ifeval module)
-# =============================================================================
-
-
-@requires_ifeval
-class TestIFEvalScoring:
-    """Tests for IFEval scoring functionality using ifeval module."""
-
-    def test_ifeval_basic(self, dolci_module):
-        """Test basic ifeval scoring."""
-        extra_info = {"dataset_source": "instruction_following"}
-        # The actual test depends on what ifeval.compute_score expects
-        # This is a basic smoke test
-        score = dolci_module.compute_score(
-            solution_str="I love Python and machine learning.",
-            ground_truth="Python",  # ifeval may use this differently
-            extra_info=extra_info,
-        )
-        assert isinstance(score, float)
-        assert 0.0 <= score <= 1.0
 
 
 # =============================================================================

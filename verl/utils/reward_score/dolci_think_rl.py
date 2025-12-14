@@ -16,7 +16,6 @@ Reward scoring for allenai/Dolci-Think-RL dataset.
 
 Routes to appropriate existing reward functions based on dataset_source:
 - math: Uses math_verify.MathVerifier (verifiable)
-- instruction_following/ifeval: Uses ifeval (verifiable)
 - code/code_stdio: Uses sandbox_fusion for code execution (PARALLEL)
 - general-quality/general-quality_ref: Uses LLM-as-a-judge (PARALLEL)
 - other: Falls back to math verification then string matching
@@ -336,7 +335,6 @@ def compute_score(
 
     Routes to appropriate existing reward function based on dataset_source:
     - math: math_verify.MathVerifier (verifiable)
-    - instruction_following/ifeval: ifeval (verifiable)
     - code/code_stdio: sandbox_fusion code execution
     - general-quality/general-quality_ref: LLM-as-a-judge
     - other: Falls back to math then string matching
@@ -385,12 +383,6 @@ def compute_score(
 
         verifier = MathVerifier()
         result = verifier.compute_score(solution_str, ground_truth)
-        return result["score"]
-
-    elif dataset_source == "instruction_following" or dataset_source == "ifeval":
-        from verl.utils.reward_score import ifeval
-
-        result = ifeval.compute_score(solution_str, ground_truth, extra_info)
         return result["score"]
 
     elif dataset_source == "code" or dataset_source == "code_stdio":
@@ -445,7 +437,7 @@ def compute_score_batch(
     """Compute scores for a batch of Dolci-Think-RL solutions.
 
     Groups samples by dataset_source and processes EFFICIENTLY IN PARALLEL:
-    - math/IF: processed individually (already fast)
+    - math: processed individually (already fast)
     - code/code_stdio: processed in PARALLEL with sandbox_fusion
     - general-quality/general-quality_ref: processed in PARALLEL with LLM judge
     - other: Falls back to math then string matching
@@ -483,7 +475,6 @@ def compute_score_batch(
 
     # Group indices by dataset_source
     math_indices = []
-    if_indices = []
     code_indices = []
     general_quality_indices = []
     other_indices = []
@@ -494,8 +485,6 @@ def compute_score_batch(
 
         if dataset_source == "math":
             math_indices.append(i)
-        elif dataset_source == "instruction_following" or dataset_source == "ifeval":
-            if_indices.append(i)
         elif dataset_source == "code" or dataset_source == "code_stdio":
             code_indices.append(i)
         elif dataset_source in ("general-quality", "general-quality_ref"):
@@ -506,8 +495,6 @@ def compute_score_batch(
     # Log group sizes
     if math_indices:
         logger.info(f"  math: {len(math_indices)} samples")
-    if if_indices:
-        logger.info(f"  ifeval: {len(if_indices)} samples")
     if code_indices:
         logger.info(f"  code: {len(code_indices)} samples (parallel)")
     if general_quality_indices:
@@ -531,22 +518,6 @@ def compute_score_batch(
                     scores[i] = result["score"]
                 except Exception as e:
                     logger.debug(f"Math verification failed for index {i}: {e}")
-                    scores[i] = 0.0
-
-    # Process IF (verifiable, fast - sequential is fine)
-    if if_indices:
-        from verl.utils.reward_score import ifeval
-
-        for i in if_indices:
-            gt = ground_truths[i]
-            if isinstance(gt, list):
-                gt = gt[0] if gt else None
-            if solution_strs[i] is not None and gt is not None:
-                try:
-                    result = ifeval.compute_score(solution_strs[i], gt, extra_infos[i])
-                    scores[i] = result["score"]
-                except Exception as e:
-                    logger.debug(f"IFEval scoring failed for index {i}: {e}")
                     scores[i] = 0.0
 
     # Process code with sandbox_fusion - PARALLEL
