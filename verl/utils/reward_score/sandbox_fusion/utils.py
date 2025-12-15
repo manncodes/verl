@@ -421,8 +421,21 @@ if __name__ == '__main__':
                         metadata["status"] = "timeout"  # Runtime timeout
                         result_status = -3
                     else:  # Includes Error and Finished with non-zero return_code
-                        metadata["status"] = "runtime_error"
-                        result_status = -2
+                        # Parse stderr to distinguish AssertionError (wrong answer) from real runtime errors
+                        stderr_content = metadata.get("stderr", "") or ""
+
+                        if "AssertionError" in stderr_content:
+                            # AssertionError means the code ran but produced wrong output
+                            metadata["status"] = "wrong_answer"
+                            result_status = False  # Same as wrong_answer in Success path
+                        elif "NameError" in stderr_content:
+                            # NameError often means function name mismatch
+                            metadata["status"] = "name_error"
+                            result_status = -5  # New code for name errors
+                        else:
+                            # Other runtime errors (IndexError, TypeError, etc.)
+                            metadata["status"] = "runtime_error"
+                            result_status = -2
                 else:
                     # Other Failed status with run_result, classify as unknown failure
                     logger.warning(f"Unknown run_status '{metadata['run_status']}' or state within Failed API status.")
@@ -482,8 +495,14 @@ def check_correctness(
 
     Returns:
         A tuple (results, metadata_list).
-        results: A list containing the test result for each input/output pair
-                 (True/False/-1 api/sandbox err, -2 runtime err, -3 timeout, -4 compile err).
+        results: A list containing the test result for each input/output pair:
+                 - True: passed (output matches expected)
+                 - False: wrong answer (AssertionError or output mismatch)
+                 - -1: API/sandbox error
+                 - -2: runtime error (IndexError, TypeError, etc.)
+                 - -3: timeout (Time Limit Exceeded)
+                 - -4: compile error
+                 - -5: name error (function not found, likely name mismatch)
                  Results are ordered corresponding to the inputs.
         metadata_list: A list containing metadata dictionaries for each test case,
                        ordered corresponding to the inputs.
