@@ -19,6 +19,7 @@ import threading
 import time
 import traceback
 import uuid
+from tqdm import tqdm
 from typing import Any, Optional
 
 import requests
@@ -29,6 +30,19 @@ INITIAL_RETRY_DELAY = 1
 API_TIMEOUT = 10
 
 logger = logging.getLogger(__name__)
+
+
+
+###############################################################
+import os
+if "KUBERNETES_SERVICE_HOST" in os.environ and os.getenv("KUBERNETES_SERVICE_HOST") != "":
+    if os.getenv("NO_PROXY"):
+        os.environ["NO_PROXY"] += ",.svc.cluster.local"
+    if os.getenv("no_proxy"):
+        os.environ["no_proxy"] += ",.svc.cluster.local"
+###############################################################
+
+
 
 # Define supported languages list (optional, for documentation or validation)
 SUPPORTED_LANGUAGES = [
@@ -527,7 +541,7 @@ def check_correctness(
         }
 
         # Process results as they complete
-        for future in concurrent.futures.as_completed(future_to_index):
+        for future in tqdm(concurrent.futures.as_completed(future_to_index), desc="sandbox fusion", total=len(future_to_index)):
             index = future_to_index[future]
             try:
                 result_status, metadata = future.result()
