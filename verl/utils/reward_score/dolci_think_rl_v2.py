@@ -790,4 +790,17 @@ def compute_score_batch(
     domain_summary = " | ".join([f"{k}: {v['mean']:.4f} (n={v['count']})" for k, v in domain_stats.items()])
     logger.info(f"Domain rewards: {domain_summary} | overall: {overall_mean:.4f} (n={len(scores)})")
 
+    # Lazy wandb logging for domain-wise rewards
+    try:
+        import wandb
+        if wandb.run is not None:
+            wandb_metrics = {}
+            for domain, stats in domain_stats.items():
+                wandb_metrics[f"train/Dolci-Think-RL/{domain}/reward/mean@1"] = stats["mean"]
+                wandb_metrics[f"train/Dolci-Think-RL/{domain}/reward/count"] = stats["count"]
+            wandb_metrics["train/Dolci-Think-RL/overall/reward/mean@1"] = overall_mean
+            wandb.log(wandb_metrics, commit=False)
+    except Exception:
+        pass  # Silently ignore if wandb not available or not initialized
+
     return scores
