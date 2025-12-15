@@ -202,6 +202,55 @@ def _basic_string_match(solution_str: str, ground_truth: str) -> float:
 # =============================================================================
 
 
+def _extract_fn_name_from_asserts(ground_truth: Any) -> Optional[str]:
+    """
+    Extract the expected function name from assert-style test cases.
+
+    This helps identify what function the model should implement, which can be
+    used for validation or to provide better error messages.
+
+    Args:
+        ground_truth: List of assert strings, e.g. ["assert add(1,2)==3", ...]
+
+    Returns:
+        Function name if found, None otherwise.
+    """
+    if not ground_truth:
+        return None
+    if not isinstance(ground_truth, list) or len(ground_truth) == 0:
+        return None
+
+    first_item = ground_truth[0]
+    if not isinstance(first_item, str):
+        return None
+
+    first_item = first_item.strip()
+    if not first_item.startswith("assert"):
+        return None
+
+    # Pattern 1: assert fn_name(...) - most common
+    match = re.search(r'assert\s+(\w+)\s*\(', first_item)
+    if match:
+        fn_name = match.group(1)
+        # Filter out built-in functions and keywords
+        if fn_name not in ('True', 'False', 'None', 'not', 'len', 'str', 'int',
+                           'float', 'list', 'dict', 'set', 'tuple', 'sorted',
+                           'abs', 'sum', 'min', 'max', 'round', 'type', 'all', 'any'):
+            return fn_name
+
+    # Pattern 2: assert Solution().method_name(...) - LeetCode style
+    match = re.search(r'assert\s+\w+\(\)\s*\.\s*(\w+)\s*\(', first_item)
+    if match:
+        return match.group(1)
+
+    # Pattern 3: assert obj.method_name(...) - instance method
+    match = re.search(r'assert\s+\w+\s*\.\s*(\w+)\s*\(', first_item)
+    if match:
+        return match.group(1)
+
+    return None
+
+
 def _convert_to_sandbox_format(ground_truth: Any) -> Optional[dict]:
     """
     Converts the normalized ground truth (from preprocessor) into
@@ -230,11 +279,16 @@ def _convert_to_sandbox_format(ground_truth: Any) -> Optional[dict]:
         # Sub-case A: List of Assert Strings (Unit Tests)
         if isinstance(first_item, str):
             # Sandbox fusion requires "inputs" array to match length of "assert_case"
-            return {
+            result = {
                 "assert_case": ground_truth,
                 "inputs": [""] * len(ground_truth),
-                "outputs": [None] * len(ground_truth) 
+                "outputs": [None] * len(ground_truth)
             }
+            # Extract and include the expected function name
+            fn_name = _extract_fn_name_from_asserts(ground_truth)
+            if fn_name:
+                result["fn_name"] = fn_name
+            return result
             
         # Sub-case B: List of IO Dictionaries (Standard Input/Output)
         elif isinstance(first_item, dict) and 'input' in first_item:
