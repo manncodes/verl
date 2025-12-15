@@ -745,4 +745,49 @@ def compute_score_batch(
             
             scores[i] = _basic_string_match(solution_strs[i], gt)
 
+    # -------------------------------------------------------------------------
+    # 6. Log domain-wise mean rewards
+    # -------------------------------------------------------------------------
+    domain_stats = {}
+
+    if math_indices:
+        math_scores = [scores[i] for i in math_indices]
+        domain_stats["math"] = {
+            "count": len(math_indices),
+            "mean": sum(math_scores) / len(math_scores),
+        }
+
+    if if_indices:
+        if_scores = [scores[i] for i in if_indices]
+        domain_stats["ifeval"] = {
+            "count": len(if_indices),
+            "mean": sum(if_scores) / len(if_scores),
+        }
+
+    if code_indices:
+        code_scores = [scores[i] for i in code_indices]
+        domain_stats["code"] = {
+            "count": len(code_indices),
+            "mean": sum(code_scores) / len(code_scores),
+        }
+
+    if general_quality_indices:
+        gq_scores = [scores[i] for i in general_quality_indices]
+        domain_stats["general_quality"] = {
+            "count": len(general_quality_indices),
+            "mean": sum(gq_scores) / len(gq_scores),
+        }
+
+    if other_indices:
+        other_scores = [scores[i] for i in other_indices]
+        domain_stats["other"] = {
+            "count": len(other_indices),
+            "mean": sum(other_scores) / len(other_scores),
+        }
+
+    # Print domain-wise rewards
+    overall_mean = sum(scores) / len(scores) if scores else 0.0
+    domain_summary = " | ".join([f"{k}: {v['mean']:.4f} (n={v['count']})" for k, v in domain_stats.items()])
+    logger.info(f"Domain rewards: {domain_summary} | overall: {overall_mean:.4f} (n={len(scores)})")
+
     return scores
