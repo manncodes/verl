@@ -291,6 +291,60 @@ def get_reward_style(dataset_source: str) -> str:
         return "rule"
     return "model"
 
+
+def extract_fn_name_from_asserts(ground_truth: Any) -> Optional[str]:
+    """
+    Extract the expected function name from assert-style test cases.
+
+    Args:
+        ground_truth: Normalized ground truth (list of assert strings or IO dicts)
+
+    Returns:
+        Function name if found, None otherwise.
+
+    Examples:
+        - "assert closest_points_on_ellipse([...]) == [...]" -> "closest_points_on_ellipse"
+        - "assert Solution().twoSum([...]) == [...]" -> "twoSum"
+    """
+    if not ground_truth:
+        return None
+
+    if not isinstance(ground_truth, list) or len(ground_truth) == 0:
+        return None
+
+    first_item = ground_truth[0]
+
+    # Only process assert-style test cases (strings starting with "assert")
+    if not isinstance(first_item, str):
+        return None
+
+    first_item = first_item.strip()
+    if not first_item.startswith("assert"):
+        return None
+
+    # Pattern 1: assert fn_name(...) - direct function call
+    # e.g., "assert closest_points_on_ellipse([(0, 0)]) == [(1.0, 0.0)]"
+    match = re.search(r'assert\s+(\w+)\s*\(', first_item)
+    if match:
+        fn_name = match.group(1)
+        # Skip common non-function patterns
+        if fn_name not in ('True', 'False', 'None', 'not', 'len', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple'):
+            return fn_name
+
+    # Pattern 2: assert Solution().method_name(...) - class method call
+    # e.g., "assert Solution().twoSum([2,7,11,15], 9) == [0,1]"
+    match = re.search(r'assert\s+\w+\(\)\s*\.\s*(\w+)\s*\(', first_item)
+    if match:
+        return match.group(1)
+
+    # Pattern 3: assert obj.method_name(...) - instance method call
+    # e.g., "assert solution.solve([1,2,3]) == 6"
+    match = re.search(r'assert\s+\w+\s*\.\s*(\w+)\s*\(', first_item)
+    if match:
+        return match.group(1)
+
+    return None
+
 def validate_abilities(abilities: Optional[list], arg_name: str) -> Optional[Set[str]]:
     if abilities is None:
         return None
@@ -408,20 +462,30 @@ if __name__ == "__main__":
             ability = get_ability_from_source(dataset_source)
             reward_style = get_reward_style(dataset_source)
 
+            # --- CODE TASKS: Extract and append function name requirement ---
+            fn_name = None
+            if dataset_source in ("code", "code_stdio"):
+                fn_name = extract_fn_name_from_asserts(clean_gt)
+                if fn_name:
+                    # Append instruction to use the exact function name
+                    prompt_text = prompt_text.rstrip()
+                    prompt_text += f"\n\n**IMPORTANT: Implement your solution as a function named `{fn_name}`.**"
+
             data = {
                 "data_source": data_source,
                 "prompt": [{"role": "user", "content": prompt_text}],
                 "ability": ability,
                 "reward_model": {
                     "style": reward_style,
-                    "ground_truth": ground_truth_str, # Now strictly a string
+                    "ground_truth": ground_truth_str,  # Now strictly a string
                 },
                 "extra_info": {
                     "split": split,
                     "index": idx,
-                    "original_prompt": prompt_text,
+                    "original_prompt": example.get("prompt", ""),  # Keep original without fn_name suffix
                     "dataset_source": dataset_source,
                     "custom_id": example.get("custom_id"),
+                    "fn_name": fn_name,  # Store extracted function name for debugging
                 },
             }
             return data
