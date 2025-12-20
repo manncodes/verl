@@ -1,0 +1,261 @@
+# Cascaded RL Configuration
+# Following Nemotron-Cascade methodology: https://arxiv.org/abs/2512.13607
+#
+# Pipeline: RLHF → IF-RL → Math-RL → Code-RL → SWE-RL
+# Algorithm: GRPO with on-policy training (no KL penalty)
+
+defaults:
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+# ==============================================================================
+# Cascade RL Specific Configuration
+# ==============================================================================
+cascade:
+  checkpoint_dir: ./cascaded_rl_checkpoints
+  resume_from_stage: null  # Set to stage name to resume (e.g., "math_rl")
+  validate_after_stage: true
+  log_stage_transitions: true
+
+  # Training stages - executed sequentially
+  stages:
+    # Stage 1: RLHF - General preference alignment
+    - name: rlhf
+      domain: rlhf
+      train_files:
+        - data/rlhf_train.parquet
+      val_files:
+        - data/rlhf_val.parquet
+      total_training_steps: 800
+      train_batch_size: 128
+      rollout_n: 8
+      learning_rate: 2e-6
+      temperature: 0.6
+      top_p: 0.95
+      max_new_tokens: 4096
+      use_kl_in_reward: false
+      use_kl_loss: false
+
+    # Stage 2: IF-RL - Instruction Following
+    - name: if_rl
+      domain: instruction_following
+      train_files:
+        - data/if_train.parquet
+      val_files:
+        - data/if_val.parquet
+      total_training_steps: 500
+      train_batch_size: 128
+      rollout_n: 8
+      learning_rate: 2e-6
+      temperature: 0.6
+      top_p: 0.95
+      max_new_tokens: 4096
+
+    # Stage 3: Math-RL - Mathematical Reasoning
+    - name: math_rl
+      domain: math
+      train_files:
+        - data/math_train.parquet
+      val_files:
+        - data/math_val.parquet
+      total_training_steps: 500
+      train_batch_size: 128
+      rollout_n: 8
+      learning_rate: 2e-6
+      temperature: 0.6
+      top_p: 0.95
+      max_new_tokens: 16384  # Longer for chain-of-thought
+
+    # Stage 4: Code-RL - Code Generation
+    - name: code_rl
+      domain: code
+      train_files:
+        - data/code_train.parquet
+      val_files:
+        - data/code_val.parquet
+      total_training_steps: 500
+      train_batch_size: 128
+      rollout_n: 8
+      learning_rate: 2e-6
+      temperature: 0.7  # Higher for code exploration
+      top_p: 0.95
+      max_new_tokens: 16384
+
+    # Stage 5: SWE-RL - Software Engineering
+    - name: swe_rl
+      domain: swe
+      train_files:
+        - data/swe_train.parquet
+      val_files:
+        - data/swe_val.parquet
+      total_training_steps: 300
+      train_batch_size: 64  # Smaller for longer sequences
+      rollout_n: 4
+      learning_rate: 1e-6  # Lower LR for fine-tuning
+      temperature: 0.6
+      top_p: 0.95
+      max_new_tokens: 32768
+
+# ==============================================================================
+# Model Configuration
+# ==============================================================================
+actor_rollout_ref:
+  hybrid_engine: true
+
+  model:
+    path: Qwen/Qwen3-8B  # Base model path
+    override_config: {}
+    external_lib: null
+    enable_gradient_checkpointing: false
+    lora_rank: 0
+    lora_adapter_path: null
+
+  actor:
+    strategy: fsdp
+    ppo_epochs: 1
+    ppo_mini_batch_size: 128
+    use_kl_loss: false  # GRPO: no KL loss
+    kl_loss_coef: 0.0
+    kl_loss_type: k1
+    entropy_coef: 0.0
+    clip_ratio: 0.2
+    policy_loss: vanilla
+    loss_agg_mode: token-mean
+
+    optim:
+      lr: 2e-6
+      betas: [0.9, 0.999]
+      weight_decay: 0.01
+      warmup_ratio: 0.1
+      lr_scheduler: cosine
+
+    checkpoint:
+      save_freq: -1
+
+  rollout:
+    mode: sync
+    n: 8  # Rollouts per prompt (for GRPO group baseline)
+    temperature: 0.6
+    top_p: 0.95
+    max_new_tokens: 8192
+    prompt_length: 4096
+    response_length: 8192
+
+    val_kwargs:
+      n: 1
+      do_sample: false
+
+    multi_turn:
+      enable: false
+
+  ref:
+    enable: false  # GRPO doesn't need reference policy
+
+# ==============================================================================
+# Algorithm Configuration
+# ==============================================================================
+algorithm:
+  adv_estimator: grpo  # Group Relative Policy Optimization
+  gamma: 1.0
+  lam: 1.0
+  use_kl_in_reward: false  # GRPO: no KL penalty
+  kl_penalty: kl
+  norm_adv_by_std_in_grpo: true  # Normalize advantages by std in group
+
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.0
+
+  rollout_correction:
+    bypass_mode: true  # Use rollout log probs directly
+
+# ==============================================================================
+# Critic Configuration (Optional - GRPO doesn't need critic)
+# ==============================================================================
+critic:
+  enable: false  # Disabled for GRPO
+
+# ==============================================================================
+# Reward Model Configuration
+# ==============================================================================
+reward_model:
+  enable: false  # Using rule-based rewards
+  enable_resource_pool: false
+  launch_reward_fn_async: false
+
+# ==============================================================================
+# Data Configuration
+# ==============================================================================
+data:
+  # Note: train_files and val_files are overridden per stage
+  train_files: []
+  val_files: []
+  train_batch_size: 128
+  val_batch_size: 64
+  gen_batch_size: 128
+  dataloader_num_workers: 4
+  filter_overlong_prompts: true
+  truncation: error
+
+# ==============================================================================
+# Trainer Configuration
+# ==============================================================================
+trainer:
+  total_epochs: 1
+  total_training_steps: null  # Overridden per stage
+  project_name: cascaded_rl
+  experiment_name: cascade_training
+  logger: wandb  # or tensorboard, swanlab
+  device: cuda
+
+  # Checkpointing
+  default_local_dir: ./checkpoints
+  default_hdfs_dir: null
+  save_freq: 100
+  test_freq: 50
+  log_val_generations: 10
+  val_before_train: true
+  val_only: false
+
+  # Resumption
+  resume_mode: auto  # auto, disable, resume_path
+  resume_from_path: null
+  del_local_ckpt_after_load: false
+
+  # Load balancing
+  balance_batch: true
+
+  # ESI (Elastic Server Instance) settings
+  esi_redundant_time: 600
+
+  # Warmup
+  critic_warmup: 0
+
+# ==============================================================================
+# Resource Pool Configuration
+# ==============================================================================
+resource_pool:
+  spec:
+    default: [8]  # Number of GPUs per node
+  mapping:
+    ActorRolloutRef: default
+    Critic: default
+
+# ==============================================================================
+# Profiler Configuration
+# ==============================================================================
+global_profiler:
+  steps: null  # e.g., [10, 20] to profile specific steps
+  tool: null  # torch_profiler, nsys
+  profile_continuous_steps: false
+
+# ==============================================================================
+# Hydra Configuration
+# ==============================================================================
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
