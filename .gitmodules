@@ -1,0 +1,3 @@
+[submodule "verl/third_party/memorization_kfac"]
+	path = verl/third_party/memorization_kfac
+	url = https://github.com/goodfire-ai/memorization_kfac.git
