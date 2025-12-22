@@ -25,12 +25,20 @@ Usage:
     # CLI
     python reward_hacking_detector.py analyze /path/to/rollout_data_dir
     python reward_hacking_detector.py diff /path/to/rollout_data_dir --step1 100 --step2 200
-    python reward_hacking_detector.py report /path/to/rollout_data_dir --output report.html
+    python reward_hacking_detector.py visualize /path/to/rollout_data_dir --output dashboard.html
+    python reward_hacking_detector.py visualize /path/to/rollout_data_dir --type diversity
 
     # Python API
-    from scripts.reward_hacking_detector import RewardHackingDetector
+    from scripts.reward_hacking_detector import RewardHackingDetector, HackingVisualizer
     detector = RewardHackingDetector("/path/to/rollout_data_dir")
     results = detector.analyze()
+
+    # Visualization (requires plotly: pip install plotly)
+    visualizer = HackingVisualizer(detector)
+    fig = visualizer.create_dashboard("dashboard.html")  # Full dashboard
+    fig = visualizer.plot_score_trends()  # Individual plots
+    fig = visualizer.plot_diversity_metrics()
+    fig = visualizer.plot_indicator_heatmap()
 """
 
 from __future__ import annotations
@@ -55,6 +63,15 @@ try:
 except ImportError:
     typer = None
     HAS_TYPER = False
+
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    HAS_PLOTLY = True
+except ImportError:
+    go = None
+    make_subplots = None
+    HAS_PLOTLY = False
 
 
 # =============================================================================
@@ -1372,6 +1389,564 @@ class RewardHackingDetector:
         return report
 
 
+# =============================================================================
+# Visualization with Plotly
+# =============================================================================
+
+class HackingVisualizer:
+    """Plotly-based visualization for reward hacking analysis."""
+
+    def __init__(self, detector: RewardHackingDetector):
+        if not HAS_PLOTLY:
+            raise ImportError(
+                "Plotly is required for visualization. "
+                "Install with: pip install plotly"
+            )
+        self.detector = detector
+
+    def plot_score_trends(
+        self,
+        title: str = "Score Trends Over Training Steps",
+        show_std: bool = True,
+    ) -> "go.Figure":
+        """Plot mean scores and standard deviations over steps.
+
+        Returns a Plotly figure showing score progression with optional
+        error bands for standard deviation.
+        """
+        if not self.detector.step_stats:
+            raise ValueError("No step stats available. Run analyze() first.")
+
+        steps, means, stds = zip(*self.detector.step_stats)
+
+        fig = go.Figure()
+
+        # Main mean line
+        fig.add_trace(go.Scatter(
+            x=list(steps),
+            y=list(means),
+            mode='lines+markers',
+            name='Mean Score',
+            line=dict(color='#2196F3', width=2),
+            marker=dict(size=6),
+        ))
+
+        # Standard deviation band
+        if show_std:
+            upper = [m + s for m, s in zip(means, stds)]
+            lower = [m - s for m, s in zip(means, stds)]
+
+            fig.add_trace(go.Scatter(
+                x=list(steps) + list(reversed(steps)),
+                y=upper + list(reversed(lower)),
+                fill='toself',
+                fillcolor='rgba(33, 150, 243, 0.2)',
+                line=dict(color='rgba(255,255,255,0)'),
+                name='±1 Std Dev',
+                showlegend=True,
+            ))
+
+        # Mark anomalies
+        trend_anomalies = [
+            ind for ind in self.detector.indicators
+            if ind.indicator_type == "score_trend"
+        ]
+        if trend_anomalies:
+            anomaly_steps = [a.step for a in trend_anomalies]
+            anomaly_scores = [
+                means[steps.index(s)] if s in steps else 0
+                for s in anomaly_steps
+            ]
+            fig.add_trace(go.Scatter(
+                x=anomaly_steps,
+                y=anomaly_scores,
+                mode='markers',
+                name='Trend Anomalies',
+                marker=dict(color='red', size=12, symbol='x'),
+            ))
+
+        fig.update_layout(
+            title=title,
+            xaxis_title="Training Step",
+            yaxis_title="Score",
+            template="plotly_white",
+            hovermode="x unified",
+        )
+
+        return fig
+
+    def plot_diversity_metrics(
+        self,
+        title: str = "Diversity Metrics Over Training",
+    ) -> "go.Figure":
+        """Plot diversity metrics (Self-BLEU, distinct-n, Jaccard) over steps.
+
+        Returns a Plotly figure with multiple traces for different diversity
+        metrics, useful for detecting mode collapse.
+        """
+        if not self.detector.diversity_metrics_by_step:
+            raise ValueError("No diversity metrics available. Run analyze() first.")
+
+        steps = sorted(self.detector.diversity_metrics_by_step.keys())
+
+        metrics_data = {
+            'self_bleu_4': [],
+            'distinct_1': [],
+            'distinct_2': [],
+            'jaccard_similarity': [],
+        }
+
+        for step in steps:
+            m = self.detector.diversity_metrics_by_step[step]
+            metrics_data['self_bleu_4'].append(m.self_bleu_4)
+            metrics_data['distinct_1'].append(m.distinct_1)
+            metrics_data['distinct_2'].append(m.distinct_2)
+            metrics_data['jaccard_similarity'].append(m.jaccard_similarity)
+
+        fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=(
+                'Self-BLEU-4 (lower is better)',
+                'Jaccard Similarity (lower is better)',
+                'Distinct-1 (higher is better)',
+                'Distinct-2 (higher is better)',
+            ),
+        )
+
+        # Self-BLEU (higher = more similar = bad)
+        fig.add_trace(
+            go.Scatter(x=steps, y=metrics_data['self_bleu_4'],
+                      mode='lines+markers', name='Self-BLEU-4',
+                      line=dict(color='#F44336')),
+            row=1, col=1
+        )
+        # Add threshold line
+        fig.add_hline(y=0.7, line_dash="dash", line_color="orange",
+                     annotation_text="Mode collapse threshold", row=1, col=1)
+
+        # Jaccard similarity
+        fig.add_trace(
+            go.Scatter(x=steps, y=metrics_data['jaccard_similarity'],
+                      mode='lines+markers', name='Jaccard',
+                      line=dict(color='#FF9800')),
+            row=1, col=2
+        )
+        fig.add_hline(y=0.6, line_dash="dash", line_color="orange",
+                     annotation_text="High similarity threshold", row=1, col=2)
+
+        # Distinct-1
+        fig.add_trace(
+            go.Scatter(x=steps, y=metrics_data['distinct_1'],
+                      mode='lines+markers', name='Distinct-1',
+                      line=dict(color='#4CAF50')),
+            row=2, col=1
+        )
+
+        # Distinct-2
+        fig.add_trace(
+            go.Scatter(x=steps, y=metrics_data['distinct_2'],
+                      mode='lines+markers', name='Distinct-2',
+                      line=dict(color='#2196F3')),
+            row=2, col=2
+        )
+        fig.add_hline(y=0.1, line_dash="dash", line_color="orange",
+                     annotation_text="Low diversity threshold", row=2, col=2)
+
+        fig.update_layout(
+            title=title,
+            template="plotly_white",
+            height=600,
+            showlegend=False,
+        )
+
+        return fig
+
+    def plot_indicator_heatmap(
+        self,
+        title: str = "Reward Hacking Indicators by Step",
+    ) -> "go.Figure":
+        """Create a heatmap of indicator counts by type and step.
+
+        Returns a Plotly heatmap showing the density of different
+        indicator types across training steps.
+        """
+        if not self.detector.indicators:
+            raise ValueError("No indicators available. Run analyze() first.")
+
+        # Collect indicator types and steps
+        indicator_types = list(set(ind.indicator_type for ind in self.detector.indicators))
+        steps = sorted(set(ind.step for ind in self.detector.indicators))
+
+        # Build count matrix
+        counts = {t: {s: 0 for s in steps} for t in indicator_types}
+        for ind in self.detector.indicators:
+            counts[ind.indicator_type][ind.step] += 1
+
+        # Convert to matrix
+        z_matrix = []
+        for t in indicator_types:
+            z_matrix.append([counts[t][s] for s in steps])
+
+        fig = go.Figure(data=go.Heatmap(
+            z=z_matrix,
+            x=[str(s) for s in steps],
+            y=indicator_types,
+            colorscale='Reds',
+            hovertemplate='Step %{x}<br>Type: %{y}<br>Count: %{z}<extra></extra>',
+        ))
+
+        fig.update_layout(
+            title=title,
+            xaxis_title="Training Step",
+            yaxis_title="Indicator Type",
+            template="plotly_white",
+        )
+
+        return fig
+
+    def plot_severity_timeline(
+        self,
+        title: str = "Indicator Severity Timeline",
+    ) -> "go.Figure":
+        """Plot indicators over time colored by severity.
+
+        Returns a scatter plot showing when indicators occurred,
+        with color indicating severity level.
+        """
+        if not self.detector.indicators:
+            raise ValueError("No indicators available. Run analyze() first.")
+
+        severity_colors = {
+            'low': '#4CAF50',
+            'medium': '#FF9800',
+            'high': '#F44336',
+        }
+
+        fig = go.Figure()
+
+        for severity in ['low', 'medium', 'high']:
+            inds = [i for i in self.detector.indicators if i.severity == severity]
+            if inds:
+                fig.add_trace(go.Scatter(
+                    x=[i.step for i in inds],
+                    y=[i.indicator_type for i in inds],
+                    mode='markers',
+                    name=severity.capitalize(),
+                    marker=dict(
+                        color=severity_colors[severity],
+                        size=10 if severity == 'high' else 8,
+                        symbol='circle' if severity != 'high' else 'x',
+                    ),
+                    text=[i.description[:50] for i in inds],
+                    hovertemplate='Step %{x}<br>%{y}<br>%{text}<extra></extra>',
+                ))
+
+        fig.update_layout(
+            title=title,
+            xaxis_title="Training Step",
+            yaxis_title="Indicator Type",
+            template="plotly_white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+
+        return fig
+
+    def plot_length_distribution(
+        self,
+        steps: Optional[list[int]] = None,
+        title: str = "Output Length Distribution Over Steps",
+    ) -> "go.Figure":
+        """Plot output length statistics over training steps.
+
+        Returns a Plotly figure showing length mean/std and near-max ratio.
+        """
+        if not self.detector.length_metrics_by_step:
+            raise ValueError("No length metrics available. Run analyze() first.")
+
+        if steps is None:
+            steps = sorted(self.detector.length_metrics_by_step.keys())
+
+        means = []
+        stds = []
+        near_max_ratios = []
+
+        for step in steps:
+            if step in self.detector.length_metrics_by_step:
+                m = self.detector.length_metrics_by_step[step]
+                means.append(m.mean_length)
+                stds.append(m.std_length)
+                near_max_ratios.append(m.near_max_ratio)
+            else:
+                means.append(0)
+                stds.append(0)
+                near_max_ratios.append(0)
+
+        fig = make_subplots(
+            rows=2, cols=1,
+            subplot_titles=('Mean Output Length', 'Near-Max Length Ratio'),
+            shared_xaxes=True,
+        )
+
+        # Mean length with error bars
+        fig.add_trace(
+            go.Scatter(
+                x=steps, y=means,
+                mode='lines+markers',
+                name='Mean Length',
+                line=dict(color='#2196F3'),
+                error_y=dict(type='data', array=stds, visible=True),
+            ),
+            row=1, col=1
+        )
+
+        # Near-max ratio (length hacking indicator)
+        fig.add_trace(
+            go.Scatter(
+                x=steps, y=near_max_ratios,
+                mode='lines+markers',
+                name='Near-Max Ratio',
+                line=dict(color='#F44336'),
+                fill='tozeroy',
+                fillcolor='rgba(244, 67, 54, 0.2)',
+            ),
+            row=2, col=1
+        )
+        fig.add_hline(y=0.5, line_dash="dash", line_color="orange",
+                     annotation_text="Length hacking threshold", row=2, col=1)
+
+        fig.update_layout(
+            title=title,
+            template="plotly_white",
+            height=500,
+            xaxis2_title="Training Step",
+        )
+
+        return fig
+
+    def plot_grpo_metrics(
+        self,
+        title: str = "GRPO Group Dynamics",
+    ) -> "go.Figure":
+        """Plot GRPO-specific metrics over training.
+
+        Returns a Plotly figure showing winner concentration and
+        identical output ratio - indicators of GRPO-specific issues.
+        """
+        if not self.detector.grpo_metrics_by_step:
+            raise ValueError("No GRPO metrics available. Run analyze() first.")
+
+        steps = sorted(self.detector.grpo_metrics_by_step.keys())
+        winner_conc = []
+        same_output = []
+        adv_var = []
+
+        for step in steps:
+            m = self.detector.grpo_metrics_by_step[step]
+            winner_conc.append(m.get('winner_concentration', 0))
+            same_output.append(m.get('same_output_ratio', 0))
+            adv_var.append(m.get('advantage_variance', 0))
+
+        fig = make_subplots(
+            rows=2, cols=1,
+            subplot_titles=(
+                'Winner Concentration & Same Output Ratio',
+                'Intra-Group Advantage Variance'
+            ),
+            shared_xaxes=True,
+        )
+
+        fig.add_trace(
+            go.Scatter(x=steps, y=winner_conc,
+                      mode='lines+markers', name='Winner Concentration',
+                      line=dict(color='#9C27B0')),
+            row=1, col=1
+        )
+        fig.add_trace(
+            go.Scatter(x=steps, y=same_output,
+                      mode='lines+markers', name='Same Output Ratio',
+                      line=dict(color='#F44336')),
+            row=1, col=1
+        )
+        fig.add_hline(y=0.8, line_dash="dash", line_color="orange",
+                     annotation_text="High concentration", row=1, col=1)
+
+        fig.add_trace(
+            go.Scatter(x=steps, y=adv_var,
+                      mode='lines+markers', name='Advantage Variance',
+                      line=dict(color='#2196F3'),
+                      fill='tozeroy', fillcolor='rgba(33, 150, 243, 0.2)'),
+            row=2, col=1
+        )
+
+        fig.update_layout(
+            title=title,
+            template="plotly_white",
+            height=500,
+            xaxis2_title="Training Step",
+        )
+
+        return fig
+
+    def plot_compression_ratio(
+        self,
+        title: str = "Compression Ratio Distribution by Step",
+    ) -> "go.Figure":
+        """Plot compression ratio statistics as box plots per step.
+
+        Low compression ratio indicates high repetition.
+        """
+        # We need to re-compute compression metrics per sample
+        # This is expensive, so we'll use a sampling approach or
+        # rely on cached data if available
+
+        steps = sorted(self.detector.repetition_metrics_by_step.keys())
+
+        fig = go.Figure()
+
+        # Use token repetition ratio as a proxy (already computed)
+        for step in steps:
+            metrics = self.detector.repetition_metrics_by_step.get(step, [])
+            if metrics:
+                ratios = [m.token_repetition_ratio for m in metrics]
+                fig.add_trace(go.Box(
+                    y=ratios,
+                    name=str(step),
+                    marker_color='#2196F3',
+                ))
+
+        fig.update_layout(
+            title=title,
+            xaxis_title="Training Step",
+            yaxis_title="Token Diversity Ratio",
+            template="plotly_white",
+            showlegend=False,
+        )
+
+        # Add threshold line
+        fig.add_hline(y=0.3, line_dash="dash", line_color="red",
+                     annotation_text="Suspicious threshold")
+
+        return fig
+
+    def create_dashboard(
+        self,
+        output_html: Optional[str] = None,
+    ) -> "go.Figure":
+        """Create a comprehensive dashboard with all visualizations.
+
+        Returns a combined figure, optionally saving to HTML file.
+        """
+        from plotly.subplots import make_subplots
+
+        fig = make_subplots(
+            rows=3, cols=2,
+            subplot_titles=(
+                'Score Trends', 'Diversity (Self-BLEU-4)',
+                'Indicator Severity', 'Length Distribution',
+                'GRPO Winner Concentration', 'Token Diversity',
+            ),
+            specs=[
+                [{"type": "scatter"}, {"type": "scatter"}],
+                [{"type": "scatter"}, {"type": "scatter"}],
+                [{"type": "scatter"}, {"type": "box"}],
+            ],
+            vertical_spacing=0.1,
+            horizontal_spacing=0.08,
+        )
+
+        # Score trends (row 1, col 1)
+        if self.detector.step_stats:
+            steps, means, stds = zip(*self.detector.step_stats)
+            fig.add_trace(
+                go.Scatter(x=list(steps), y=list(means),
+                          mode='lines+markers', name='Mean Score',
+                          line=dict(color='#2196F3')),
+                row=1, col=1
+            )
+
+        # Diversity - Self-BLEU (row 1, col 2)
+        if self.detector.diversity_metrics_by_step:
+            div_steps = sorted(self.detector.diversity_metrics_by_step.keys())
+            bleu_vals = [self.detector.diversity_metrics_by_step[s].self_bleu_4 for s in div_steps]
+            fig.add_trace(
+                go.Scatter(x=div_steps, y=bleu_vals,
+                          mode='lines+markers', name='Self-BLEU-4',
+                          line=dict(color='#F44336')),
+                row=1, col=2
+            )
+            fig.add_hline(y=0.7, line_dash="dash", line_color="orange", row=1, col=2)
+
+        # Severity timeline (row 2, col 1)
+        severity_colors = {'low': '#4CAF50', 'medium': '#FF9800', 'high': '#F44336'}
+        for severity in ['low', 'medium', 'high']:
+            inds = [i for i in self.detector.indicators if i.severity == severity]
+            if inds:
+                fig.add_trace(
+                    go.Scatter(
+                        x=[i.step for i in inds],
+                        y=[i.indicator_type for i in inds],
+                        mode='markers', name=severity,
+                        marker=dict(color=severity_colors[severity], size=6),
+                    ),
+                    row=2, col=1
+                )
+
+        # Length near-max ratio (row 2, col 2)
+        if self.detector.length_metrics_by_step:
+            len_steps = sorted(self.detector.length_metrics_by_step.keys())
+            near_max = [self.detector.length_metrics_by_step[s].near_max_ratio for s in len_steps]
+            fig.add_trace(
+                go.Scatter(x=len_steps, y=near_max,
+                          mode='lines+markers', name='Near-Max Ratio',
+                          line=dict(color='#FF9800')),
+                row=2, col=2
+            )
+            fig.add_hline(y=0.5, line_dash="dash", line_color="red", row=2, col=2)
+
+        # GRPO winner concentration (row 3, col 1)
+        if self.detector.grpo_metrics_by_step:
+            grpo_steps = sorted(self.detector.grpo_metrics_by_step.keys())
+            winner_conc = [self.detector.grpo_metrics_by_step[s].get('winner_concentration', 0) for s in grpo_steps]
+            fig.add_trace(
+                go.Scatter(x=grpo_steps, y=winner_conc,
+                          mode='lines+markers', name='Winner Conc.',
+                          line=dict(color='#9C27B0')),
+                row=3, col=1
+            )
+
+        # Token diversity box plots (row 3, col 2)
+        if self.detector.repetition_metrics_by_step:
+            rep_steps = sorted(self.detector.repetition_metrics_by_step.keys())
+            # Sample every N steps if too many
+            sample_steps = rep_steps[::max(1, len(rep_steps) // 10)]
+            for step in sample_steps:
+                metrics = self.detector.repetition_metrics_by_step.get(step, [])
+                if metrics:
+                    ratios = [m.token_repetition_ratio for m in metrics]
+                    fig.add_trace(
+                        go.Box(y=ratios, name=str(step), marker_color='#2196F3',
+                              showlegend=False),
+                        row=3, col=2
+                    )
+
+        fig.update_layout(
+            title="Reward Hacking Analysis Dashboard",
+            template="plotly_white",
+            height=900,
+            showlegend=False,
+        )
+
+        if output_html:
+            fig.write_html(output_html)
+            print(f"Dashboard saved to {output_html}")
+
+        return fig
+
+    def show(self, fig: "go.Figure"):
+        """Show a figure (opens in browser or notebook)."""
+        fig.show()
+
+
 # CLI Interface functions (defined separately for testability)
 def _cli_analyze(rollout_dir, start_step=None, end_step=None, verbose=True, output=None):
     """Analyze rollout data for reward hacking indicators."""
@@ -1540,6 +2115,62 @@ def _cli_sample(rollout_dir, step, sample_idx):
     return sample, metrics
 
 
+def _cli_visualize(
+    rollout_dir,
+    output_html="dashboard.html",
+    plot_type="dashboard",
+    start_step=None,
+    end_step=None,
+    verbose=True,
+    show=False,
+):
+    """Generate Plotly visualizations of analysis results."""
+    if not HAS_PLOTLY:
+        print("Error: Plotly is required for visualization.")
+        print("Install with: pip install plotly")
+        return None
+
+    # Run analysis first
+    detector = RewardHackingDetector(rollout_dir)
+    log_step(f"Loading and analyzing rollouts from {rollout_dir}", verbose)
+    detector.analyze(start_step=start_step, end_step=end_step, verbose=verbose)
+
+    # Create visualizer
+    visualizer = HackingVisualizer(detector)
+
+    plot_funcs = {
+        "dashboard": lambda: visualizer.create_dashboard(output_html),
+        "scores": visualizer.plot_score_trends,
+        "diversity": visualizer.plot_diversity_metrics,
+        "heatmap": visualizer.plot_indicator_heatmap,
+        "timeline": visualizer.plot_severity_timeline,
+        "length": visualizer.plot_length_distribution,
+        "grpo": visualizer.plot_grpo_metrics,
+        "compression": visualizer.plot_compression_ratio,
+    }
+
+    if plot_type not in plot_funcs:
+        print(f"Unknown plot type: {plot_type}")
+        print(f"Available: {', '.join(plot_funcs.keys())}")
+        return None
+
+    log_step(f"Generating {plot_type} visualization...", verbose)
+
+    if plot_type == "dashboard":
+        fig = visualizer.create_dashboard(output_html)
+        print(f"Dashboard saved to {output_html}")
+    else:
+        fig = plot_funcs[plot_type]()
+        if output_html:
+            fig.write_html(output_html)
+            print(f"Plot saved to {output_html}")
+
+    if show:
+        fig.show()
+
+    return fig
+
+
 # Typer CLI wrapper (only if typer is installed)
 def _build_typer_app():
     """Build the typer CLI app."""
@@ -1585,6 +2216,34 @@ def _build_typer_app():
     ):
         """Inspect a specific sample for repetition patterns."""
         result = _cli_sample(rollout_dir, step, sample_idx)
+        if result is None:
+            raise typer.Exit(1)
+
+    @app.command()
+    def visualize(
+        rollout_dir: Path = typer.Argument(..., help="Path to rollout data directory"),
+        output: Path = typer.Option(
+            "dashboard.html", "--output", "-o", help="Output HTML file"
+        ),
+        plot_type: str = typer.Option(
+            "dashboard", "--type", "-t",
+            help="Plot type: dashboard, scores, diversity, heatmap, timeline, length, grpo, compression"
+        ),
+        start_step: Optional[int] = typer.Option(None, "--start", help="Start step"),
+        end_step: Optional[int] = typer.Option(None, "--end", help="End step"),
+        verbose: bool = typer.Option(True, "--verbose/--quiet", "-v/-q", help="Verbose output"),
+        show: bool = typer.Option(False, "--show", "-s", help="Open in browser after saving"),
+    ):
+        """Generate Plotly visualizations of reward hacking analysis."""
+        result = _cli_visualize(
+            rollout_dir,
+            output_html=str(output),
+            plot_type=plot_type,
+            start_step=start_step,
+            end_step=end_step,
+            verbose=verbose,
+            show=show,
+        )
         if result is None:
             raise typer.Exit(1)
 
