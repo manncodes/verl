@@ -386,6 +386,331 @@ class ScoreAnalyzer:
         return anomalies
 
 
+# =============================================================================
+# NEW ANALYZERS: Compression, Diversity, Length, GRPO-specific
+# =============================================================================
+
+import zlib
+
+
+@dataclass
+class CompressionMetrics:
+    """Metrics from compression-based analysis."""
+
+    original_size: int = 0
+    compressed_size: int = 0
+    compression_ratio: float = 1.0  # compressed/original, lower = more repetitive
+    is_suspicious: bool = False
+
+    @classmethod
+    def from_text(cls, text: str, threshold: float = 0.3) -> "CompressionMetrics":
+        """Create metrics from text. Low ratio = high repetition."""
+        if not text:
+            return cls()
+
+        original = text.encode("utf-8")
+        compressed = zlib.compress(original, level=9)
+
+        ratio = len(compressed) / len(original)
+
+        return cls(
+            original_size=len(original),
+            compressed_size=len(compressed),
+            compression_ratio=ratio,
+            is_suspicious=ratio < threshold,
+        )
+
+
+@dataclass
+class DiversityMetrics:
+    """Metrics for output diversity across samples."""
+
+    num_samples: int = 0
+    vocab_size: int = 0
+    avg_output_length: float = 0.0
+    self_bleu_2: float = 0.0  # 2-gram self-BLEU
+    self_bleu_4: float = 0.0  # 4-gram self-BLEU
+    jaccard_similarity: float = 0.0  # Average pairwise Jaccard
+    distinct_1: float = 0.0  # Distinct unigrams / total unigrams
+    distinct_2: float = 0.0  # Distinct bigrams / total bigrams
+
+    @property
+    def is_mode_collapse(self) -> bool:
+        """Check if metrics indicate mode collapse."""
+        # High self-BLEU = low diversity = mode collapse
+        if self.self_bleu_4 > 0.7:
+            return True
+        # High Jaccard = outputs too similar
+        if self.jaccard_similarity > 0.6:
+            return True
+        # Low distinct-2 = repetitive vocabulary
+        if self.num_samples > 5 and self.distinct_2 < 0.1:
+            return True
+        return False
+
+
+@dataclass
+class LengthMetrics:
+    """Metrics for output length analysis."""
+
+    mean_length: float = 0.0
+    std_length: float = 0.0
+    min_length: int = 0
+    max_length: int = 0
+    near_max_ratio: float = 0.0  # Fraction of outputs near max length
+    length_entropy: float = 0.0  # Entropy of length distribution
+
+    @property
+    def is_length_hacking(self) -> bool:
+        """Check if lengths indicate length exploitation."""
+        # Most outputs at max length = budget stuffing
+        if self.near_max_ratio > 0.5:
+            return True
+        # Very low length variance = formulaic outputs
+        if self.mean_length > 50 and self.std_length < 5:
+            return True
+        return False
+
+
+class CompressionAnalyzer:
+    """Analyzes text using compression ratios (LZ-based)."""
+
+    def __init__(self, suspicious_threshold: float = 0.3):
+        self.suspicious_threshold = suspicious_threshold
+
+    def analyze(self, text: str) -> CompressionMetrics:
+        """Analyze single text for compression-based repetition."""
+        return CompressionMetrics.from_text(text, self.suspicious_threshold)
+
+    def analyze_batch(self, texts: list[str]) -> list[CompressionMetrics]:
+        """Analyze multiple texts."""
+        return [self.analyze(t) for t in texts]
+
+    def combined_compression(self, texts: list[str]) -> float:
+        """Compress all texts together - high similarity = low ratio."""
+        if not texts:
+            return 1.0
+
+        combined = "\n".join(texts).encode("utf-8")
+        compressed = zlib.compress(combined, level=9)
+
+        return len(compressed) / len(combined)
+
+
+class DiversityAnalyzer:
+    """Analyzes diversity across multiple outputs (mode collapse detection)."""
+
+    def __init__(self, ngram_sizes: tuple[int, ...] = (2, 4)):
+        self.ngram_sizes = ngram_sizes
+
+    def analyze(self, outputs: list[str]) -> DiversityMetrics:
+        """Analyze diversity across a list of outputs."""
+        if not outputs:
+            return DiversityMetrics()
+
+        tokenized = [self._tokenize(o) for o in outputs]
+        all_tokens = [t for tokens in tokenized for t in tokens]
+
+        metrics = DiversityMetrics(
+            num_samples=len(outputs),
+            vocab_size=len(set(all_tokens)),
+            avg_output_length=sum(len(o) for o in outputs) / len(outputs),
+        )
+
+        # Distinct-n metrics
+        if all_tokens:
+            metrics.distinct_1 = len(set(all_tokens)) / len(all_tokens)
+
+            bigrams = list(zip(all_tokens[:-1], all_tokens[1:]))
+            if bigrams:
+                metrics.distinct_2 = len(set(bigrams)) / len(bigrams)
+
+        # Self-BLEU (approximate)
+        metrics.self_bleu_2 = self._self_bleu(tokenized, n=2)
+        metrics.self_bleu_4 = self._self_bleu(tokenized, n=4)
+
+        # Jaccard similarity
+        metrics.jaccard_similarity = self._avg_jaccard(tokenized)
+
+        return metrics
+
+    def _tokenize(self, text: str) -> list[str]:
+        """Simple whitespace tokenization."""
+        return text.lower().split()
+
+    def _get_ngrams(self, tokens: list[str], n: int) -> set[tuple]:
+        """Get n-grams as a set."""
+        if len(tokens) < n:
+            return set()
+        return set(tuple(tokens[i:i+n]) for i in range(len(tokens) - n + 1))
+
+    def _self_bleu(self, tokenized_outputs: list[list[str]], n: int = 4) -> float:
+        """Compute approximate self-BLEU using n-gram overlap."""
+        if len(tokenized_outputs) < 2:
+            return 0.0
+
+        ngram_sets = [self._get_ngrams(tokens, n) for tokens in tokenized_outputs]
+
+        overlaps = []
+        for i, ng_i in enumerate(ngram_sets):
+            if not ng_i:
+                continue
+            # Compare to all other outputs
+            others = set().union(*[ng for j, ng in enumerate(ngram_sets) if j != i])
+            if others:
+                overlap = len(ng_i & others) / len(ng_i)
+                overlaps.append(overlap)
+
+        return sum(overlaps) / len(overlaps) if overlaps else 0.0
+
+    def _avg_jaccard(self, tokenized_outputs: list[list[str]]) -> float:
+        """Compute average pairwise Jaccard similarity."""
+        if len(tokenized_outputs) < 2:
+            return 0.0
+
+        sets = [set(tokens) for tokens in tokenized_outputs]
+        similarities = []
+
+        for i in range(len(sets)):
+            for j in range(i + 1, len(sets)):
+                intersection = len(sets[i] & sets[j])
+                union = len(sets[i] | sets[j])
+                if union > 0:
+                    similarities.append(intersection / union)
+
+        return sum(similarities) / len(similarities) if similarities else 0.0
+
+
+class LengthAnalyzer:
+    """Analyzes output lengths for exploitation patterns."""
+
+    def __init__(self, near_max_threshold: float = 0.9):
+        self.near_max_threshold = near_max_threshold
+
+    def analyze(self, outputs: list[str]) -> LengthMetrics:
+        """Analyze length distribution of outputs."""
+        if not outputs:
+            return LengthMetrics()
+
+        lengths = [len(o) for o in outputs]
+
+        mean = sum(lengths) / len(lengths)
+        variance = sum((l - mean) ** 2 for l in lengths) / len(lengths)
+        std = variance ** 0.5
+
+        max_len = max(lengths)
+        near_max_count = sum(1 for l in lengths if l >= max_len * self.near_max_threshold)
+
+        # Compute entropy of length distribution (binned)
+        length_entropy = self._length_entropy(lengths)
+
+        return LengthMetrics(
+            mean_length=mean,
+            std_length=std,
+            min_length=min(lengths),
+            max_length=max_len,
+            near_max_ratio=near_max_count / len(lengths),
+            length_entropy=length_entropy,
+        )
+
+    def _length_entropy(self, lengths: list[int], num_bins: int = 10) -> float:
+        """Compute entropy of length distribution."""
+        if not lengths:
+            return 0.0
+
+        min_l, max_l = min(lengths), max(lengths)
+        if min_l == max_l:
+            return 0.0  # All same length
+
+        bin_size = (max_l - min_l) / num_bins
+        bins = [0] * num_bins
+
+        for l in lengths:
+            bin_idx = min(int((l - min_l) / bin_size), num_bins - 1)
+            bins[bin_idx] += 1
+
+        # Compute entropy
+        total = len(lengths)
+        entropy = 0.0
+        for count in bins:
+            if count > 0:
+                p = count / total
+                entropy -= p * (p if np is None else float(np.log2(p)))
+
+        # Normalize by max entropy
+        max_entropy = float(np.log2(num_bins)) if np else 3.32  # log2(10)
+        return entropy / max_entropy if max_entropy > 0 else 0.0
+
+
+class GRPOAnalyzer:
+    """GRPO-specific analysis for advantage and group dynamics."""
+
+    def analyze_groups(
+        self,
+        samples: list[Sample],
+        group_key: str = "request_id",
+    ) -> dict:
+        """Analyze GRPO group dynamics."""
+        # Group samples by key (typically request_id or uid)
+        groups: dict[str, list[Sample]] = defaultdict(list)
+
+        for s in samples:
+            key = getattr(s, group_key, None) or s.extra.get(group_key, str(s.sample_idx))
+            groups[key].append(s)
+
+        results = {
+            "num_groups": len(groups),
+            "avg_group_size": sum(len(g) for g in groups.values()) / max(1, len(groups)),
+            "winner_concentration": 0.0,
+            "advantage_variance": 0.0,
+            "same_output_ratio": 0.0,
+        }
+
+        if len(groups) < 2:
+            return results
+
+        # Analyze each group
+        winner_positions = []
+        intra_group_variances = []
+        same_output_groups = 0
+
+        for group_id, group_samples in groups.items():
+            if len(group_samples) < 2:
+                continue
+
+            scores = [s.score for s in group_samples]
+
+            # Winner position (which index wins)
+            winner_idx = scores.index(max(scores))
+            winner_positions.append(winner_idx)
+
+            # Score variance within group
+            mean_score = sum(scores) / len(scores)
+            variance = sum((s - mean_score) ** 2 for s in scores) / len(scores)
+            intra_group_variances.append(variance)
+
+            # Check if outputs are identical
+            outputs = [s.output for s in group_samples]
+            if len(set(outputs)) == 1:
+                same_output_groups += 1
+
+        # Winner concentration (does same position always win?)
+        if winner_positions:
+            counts = Counter(winner_positions)
+            results["winner_concentration"] = max(counts.values()) / len(winner_positions)
+
+        # Average intra-group variance
+        if intra_group_variances:
+            results["advantage_variance"] = sum(intra_group_variances) / len(intra_group_variances)
+
+        # Ratio of groups with identical outputs
+        multi_sample_groups = sum(1 for g in groups.values() if len(g) > 1)
+        if multi_sample_groups > 0:
+            results["same_output_ratio"] = same_output_groups / multi_sample_groups
+
+        return results
+
+
 class RewardHackingDetector:
     """Main class for detecting reward hacking in rollout data."""
 
@@ -394,15 +719,26 @@ class RewardHackingDetector:
         rollout_dir: str | Path,
         repetition_analyzer: Optional[RepetitionAnalyzer] = None,
         score_analyzer: Optional[ScoreAnalyzer] = None,
+        compression_analyzer: Optional[CompressionAnalyzer] = None,
+        diversity_analyzer: Optional[DiversityAnalyzer] = None,
+        length_analyzer: Optional[LengthAnalyzer] = None,
+        grpo_analyzer: Optional[GRPOAnalyzer] = None,
     ):
         self.loader = RolloutLoader(rollout_dir)
         self.repetition_analyzer = repetition_analyzer or RepetitionAnalyzer()
         self.score_analyzer = score_analyzer or ScoreAnalyzer()
+        self.compression_analyzer = compression_analyzer or CompressionAnalyzer()
+        self.diversity_analyzer = diversity_analyzer or DiversityAnalyzer()
+        self.length_analyzer = length_analyzer or LengthAnalyzer()
+        self.grpo_analyzer = grpo_analyzer or GRPOAnalyzer()
 
         # Results storage
         self.indicators: list[HackingIndicator] = []
         self.step_stats: list[tuple[int, float, float]] = []  # (step, mean, std)
         self.repetition_metrics_by_step: dict[int, list[RepetitionMetrics]] = {}
+        self.diversity_metrics_by_step: dict[int, DiversityMetrics] = {}
+        self.length_metrics_by_step: dict[int, LengthMetrics] = {}
+        self.grpo_metrics_by_step: dict[int, dict] = {}
 
     @property
     def steps(self) -> list[int]:
@@ -438,6 +774,21 @@ class RewardHackingDetector:
 
         self.repetition_metrics_by_step[step] = repetition_metrics
 
+        # Analyze compression for each sample
+        for sample in samples:
+            comp_metrics = self.compression_analyzer.analyze(sample.output)
+            if comp_metrics.is_suspicious:
+                indicators.append(HackingIndicator(
+                    step=step,
+                    sample_idx=sample.sample_idx,
+                    indicator_type="compression",
+                    severity="high" if comp_metrics.compression_ratio < 0.2 else "medium",
+                    description=f"Low compression ratio {comp_metrics.compression_ratio:.2f} "
+                               f"({comp_metrics.compressed_size}/{comp_metrics.original_size} bytes)",
+                    sample=sample,
+                    metrics={"compression_ratio": comp_metrics.compression_ratio},
+                ))
+
         # Analyze scores for anomalies
         score_anomalies = self.score_analyzer.analyze_step(samples)
         for anomaly in score_anomalies:
@@ -450,6 +801,73 @@ class RewardHackingDetector:
                            f"(z-score: {anomaly.zscore:.2f}, expected: {anomaly.expected_range})",
                 sample=samples[anomaly.sample_idx] if anomaly.sample_idx < len(samples) else None,
                 metrics={"score": anomaly.score, "zscore": anomaly.zscore},
+            ))
+
+        # Analyze diversity across all outputs in this step
+        outputs = [s.output for s in samples]
+        diversity_metrics = self.diversity_analyzer.analyze(outputs)
+        self.diversity_metrics_by_step[step] = diversity_metrics
+
+        if diversity_metrics.is_mode_collapse:
+            indicators.append(HackingIndicator(
+                step=step,
+                sample_idx=-1,  # Step-level indicator
+                indicator_type="mode_collapse",
+                severity="high" if diversity_metrics.self_bleu_4 > 0.8 else "medium",
+                description=f"Mode collapse detected: self-BLEU-4={diversity_metrics.self_bleu_4:.2f}, "
+                           f"Jaccard={diversity_metrics.jaccard_similarity:.2f}, "
+                           f"distinct-2={diversity_metrics.distinct_2:.2f}",
+                metrics={
+                    "self_bleu_4": diversity_metrics.self_bleu_4,
+                    "jaccard_similarity": diversity_metrics.jaccard_similarity,
+                    "distinct_2": diversity_metrics.distinct_2,
+                    "vocab_size": diversity_metrics.vocab_size,
+                },
+            ))
+
+        # Analyze length distribution
+        length_metrics = self.length_analyzer.analyze(outputs)
+        self.length_metrics_by_step[step] = length_metrics
+
+        if length_metrics.is_length_hacking:
+            indicators.append(HackingIndicator(
+                step=step,
+                sample_idx=-1,
+                indicator_type="length_hacking",
+                severity="medium",
+                description=f"Length exploitation: {length_metrics.near_max_ratio:.0%} outputs near max length "
+                           f"(mean={length_metrics.mean_length:.0f}, std={length_metrics.std_length:.1f})",
+                metrics={
+                    "mean_length": length_metrics.mean_length,
+                    "std_length": length_metrics.std_length,
+                    "near_max_ratio": length_metrics.near_max_ratio,
+                },
+            ))
+
+        # GRPO-specific analysis
+        grpo_metrics = self.grpo_analyzer.analyze_groups(samples)
+        self.grpo_metrics_by_step[step] = grpo_metrics
+
+        if grpo_metrics["winner_concentration"] > 0.8 and grpo_metrics["num_groups"] > 5:
+            indicators.append(HackingIndicator(
+                step=step,
+                sample_idx=-1,
+                indicator_type="grpo_concentration",
+                severity="medium",
+                description=f"GRPO winner concentration: {grpo_metrics['winner_concentration']:.0%} "
+                           f"(same position wins across {grpo_metrics['num_groups']} groups)",
+                metrics=grpo_metrics,
+            ))
+
+        if grpo_metrics["same_output_ratio"] > 0.3:
+            indicators.append(HackingIndicator(
+                step=step,
+                sample_idx=-1,
+                indicator_type="grpo_identical_outputs",
+                severity="high" if grpo_metrics["same_output_ratio"] > 0.5 else "medium",
+                description=f"GRPO identical outputs: {grpo_metrics['same_output_ratio']:.0%} of groups "
+                           f"have identical responses",
+                metrics=grpo_metrics,
             ))
 
         # Calculate step statistics
@@ -479,6 +897,9 @@ class RewardHackingDetector:
         self.indicators = []
         self.step_stats = []
         self.repetition_metrics_by_step = {}
+        self.diversity_metrics_by_step = {}
+        self.length_metrics_by_step = {}
+        self.grpo_metrics_by_step = {}
 
         steps_to_analyze = [
             s for s in self.steps
