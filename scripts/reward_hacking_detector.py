@@ -37,10 +37,12 @@ from __future__ import annotations
 
 import json
 import re
+import sys
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 try:
     import numpy as np
@@ -53,6 +55,87 @@ try:
 except ImportError:
     typer = None
     HAS_TYPER = False
+
+
+# =============================================================================
+# Progress Tracking Utilities
+# =============================================================================
+
+class ProgressTracker:
+    """Simple progress tracker with timing information."""
+
+    def __init__(self, total: int, desc: str = "", disable: bool = False):
+        self.total = total
+        self.desc = desc
+        self.disable = disable
+        self.current = 0
+        self.start_time = time.time()
+        self.last_print_time = 0
+        self.print_interval = 0.5  # Print at most every 0.5 seconds
+
+    def update(self, n: int = 1, extra_info: str = ""):
+        """Update progress by n steps."""
+        self.current += n
+
+        if self.disable:
+            return
+
+        current_time = time.time()
+        if current_time - self.last_print_time < self.print_interval and self.current < self.total:
+            return
+
+        self.last_print_time = current_time
+        self._print_progress(extra_info)
+
+    def _print_progress(self, extra_info: str = ""):
+        """Print progress bar to stderr."""
+        elapsed = time.time() - self.start_time
+        pct = self.current / max(1, self.total) * 100
+
+        # Estimate remaining time
+        if self.current > 0:
+            rate = self.current / elapsed
+            remaining = (self.total - self.current) / rate if rate > 0 else 0
+            eta_str = f"ETA: {remaining:.1f}s"
+        else:
+            eta_str = "ETA: --"
+
+        # Build progress bar
+        bar_width = 30
+        filled = int(bar_width * self.current / max(1, self.total))
+        bar = "█" * filled + "░" * (bar_width - filled)
+
+        # Format output
+        info = f" | {extra_info}" if extra_info else ""
+        line = f"\r{self.desc}: [{bar}] {self.current}/{self.total} ({pct:.1f}%) {eta_str}{info}"
+
+        # Pad to overwrite previous line
+        sys.stderr.write(line.ljust(120) + "\r")
+        sys.stderr.flush()
+
+        if self.current >= self.total:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+    def finish(self, message: str = ""):
+        """Mark as complete with optional message."""
+        self.current = self.total
+        elapsed = time.time() - self.start_time
+
+        if not self.disable:
+            final_msg = f"{self.desc}: Done in {elapsed:.2f}s"
+            if message:
+                final_msg += f" | {message}"
+            sys.stderr.write(f"\r{final_msg.ljust(120)}\n")
+            sys.stderr.flush()
+
+
+def log_step(message: str, verbose: bool = True):
+    """Log a step message with timestamp."""
+    if verbose:
+        timestamp = time.strftime("%H:%M:%S")
+        sys.stderr.write(f"[{timestamp}] {message}\n")
+        sys.stderr.flush()
 
 
 @dataclass
@@ -893,7 +976,16 @@ class RewardHackingDetector:
         end_step: Optional[int] = None,
         verbose: bool = False,
     ) -> dict:
-        """Analyze all steps for reward hacking indicators."""
+        """Analyze all steps for reward hacking indicators.
+
+        Args:
+            start_step: First step to analyze (inclusive)
+            end_step: Last step to analyze (inclusive)
+            verbose: Enable progress tracking and detailed logging
+        """
+        analysis_start = time.time()
+
+        # Reset state
         self.indicators = []
         self.step_stats = []
         self.repetition_metrics_by_step = {}
@@ -907,12 +999,44 @@ class RewardHackingDetector:
         ]
 
         if verbose:
-            print(f"Analyzing {len(steps_to_analyze)} steps...")
+            log_step(f"Starting analysis of {len(steps_to_analyze)} steps "
+                    f"(steps {steps_to_analyze[0]} to {steps_to_analyze[-1]})", verbose)
+
+        # Progress tracker for steps
+        progress = ProgressTracker(
+            total=len(steps_to_analyze),
+            desc="Analyzing steps",
+            disable=not verbose
+        )
+
+        # Track running totals for progress info
+        total_samples = 0
+        total_indicators = 0
 
         for step in steps_to_analyze:
-            self.analyze_step(step, verbose=verbose)
+            step_start = time.time()
+
+            indicators = self.analyze_step(step, verbose=False)  # Don't double-log
+
+            # Update totals
+            samples_in_step = len(self.loader.load_step(step, use_cache=True))
+            total_samples += samples_in_step
+            total_indicators += len(indicators)
+
+            # Update progress with current stats
+            step_time = time.time() - step_start
+            progress.update(
+                1,
+                extra_info=f"step {step}: {samples_in_step} samples, "
+                          f"{len(indicators)} issues, {step_time:.2f}s"
+            )
+
+        progress.finish(f"{total_samples} total samples, {total_indicators} indicators found")
 
         # Analyze cross-step trends
+        if verbose:
+            log_step("Analyzing cross-step trends...", verbose)
+
         trend_anomalies = self.score_analyzer.analyze_trend(self.step_stats)
         for anomaly in trend_anomalies:
             self.indicators.append(HackingIndicator(
@@ -926,17 +1050,66 @@ class RewardHackingDetector:
                 metrics=anomaly,
             ))
 
+        analysis_time = time.time() - analysis_start
+
+        if verbose:
+            log_step(f"Analysis complete in {analysis_time:.2f}s", verbose)
+            self._print_analysis_summary()
+
         return self.get_summary()
 
-    def diff_steps(self, step1: int, step2: int, match_by: str = "index") -> DiffResult:
+    def _print_analysis_summary(self):
+        """Print a summary of analysis results to stderr."""
+        summary = self.get_summary()
+
+        sys.stderr.write("\n" + "=" * 60 + "\n")
+        sys.stderr.write("ANALYSIS SUMMARY\n")
+        sys.stderr.write("=" * 60 + "\n")
+        sys.stderr.write(f"Total indicators: {summary['total_indicators']}\n")
+        sys.stderr.write(f"Steps with issues: {summary['steps_with_issues']}\n")
+
+        if summary['by_type']:
+            sys.stderr.write("\nBy Type:\n")
+            for t, count in sorted(summary['by_type'].items(), key=lambda x: -x[1]):
+                sys.stderr.write(f"  {t}: {count}\n")
+
+        if summary['by_severity']:
+            sys.stderr.write("\nBy Severity:\n")
+            for s in ['high', 'medium', 'low']:
+                if s in summary['by_severity']:
+                    sys.stderr.write(f"  {s}: {summary['by_severity'][s]}\n")
+
+        if summary['most_affected_steps']:
+            sys.stderr.write("\nMost Affected Steps:\n")
+            for step, count in summary['most_affected_steps'][:5]:
+                sys.stderr.write(f"  Step {step}: {count} indicators\n")
+
+        sys.stderr.write("=" * 60 + "\n\n")
+        sys.stderr.flush()
+
+    def diff_steps(
+        self,
+        step1: int,
+        step2: int,
+        match_by: str = "index",
+        verbose: bool = False,
+    ) -> DiffResult:
         """Compare rollouts between two steps to identify changes.
 
         Args:
             step1: First step to compare
             step2: Second step to compare
             match_by: How to match samples - "index" (positional) or "request_id"
+            verbose: Enable progress tracking
         """
+        diff_start = time.time()
+
+        if verbose:
+            log_step(f"Loading step {step1}...", verbose)
         samples1 = self.loader.load_step(step1)
+
+        if verbose:
+            log_step(f"Loading step {step2}...", verbose)
         samples2 = self.loader.load_step(step2)
 
         result = DiffResult(step1=step1, step2=step2, samples_compared=0)
@@ -947,18 +1120,34 @@ class RewardHackingDetector:
             map2 = {s.request_id: s for s in samples2 if s.request_id}
             common_ids = set(map1.keys()) & set(map2.keys())
 
+            if verbose:
+                log_step(f"Comparing {len(common_ids)} matched samples by request_id...", verbose)
+
+            progress = ProgressTracker(len(common_ids), "Comparing samples", disable=not verbose)
+
             for rid in common_ids:
                 s1, s2 = map1[rid], map2[rid]
                 self._compare_samples(s1, s2, result)
+                progress.update(1)
 
+            progress.finish()
             result.samples_compared = len(common_ids)
         else:
             # Match by index position
-            for i in range(min(len(samples1), len(samples2))):
+            num_to_compare = min(len(samples1), len(samples2))
+
+            if verbose:
+                log_step(f"Comparing {num_to_compare} samples by index...", verbose)
+
+            progress = ProgressTracker(num_to_compare, "Comparing samples", disable=not verbose)
+
+            for i in range(num_to_compare):
                 s1, s2 = samples1[i], samples2[i]
                 self._compare_samples(s1, s2, result)
+                progress.update(1)
 
-            result.samples_compared = min(len(samples1), len(samples2))
+            progress.finish()
+            result.samples_compared = num_to_compare
 
         # Compute summary statistics
         if result.score_changes:
@@ -971,6 +1160,12 @@ class RewardHackingDetector:
                 "samples_with_score_decrease": sum(1 for c in changes if c < 0),
                 "new_repetition_cases": len(result.new_repetitions),
             }
+
+        diff_time = time.time() - diff_start
+        if verbose:
+            log_step(f"Diff complete in {diff_time:.2f}s: "
+                    f"{result.samples_compared} samples, "
+                    f"{len(result.new_repetitions)} new repetitions", verbose)
 
         return result
 
@@ -1178,13 +1373,12 @@ class RewardHackingDetector:
 
 
 # CLI Interface functions (defined separately for testability)
-def _cli_analyze(rollout_dir, start_step=None, end_step=None, verbose=False, output=None):
+def _cli_analyze(rollout_dir, start_step=None, end_step=None, verbose=True, output=None):
     """Analyze rollout data for reward hacking indicators."""
     detector = RewardHackingDetector(rollout_dir)
 
-    print(f"Loading rollouts from {rollout_dir}")
-    print(f"Found {len(detector.steps)} steps: {detector.steps[0]} to {detector.steps[-1]}")
-    print("")
+    log_step(f"Loading rollouts from {rollout_dir}", verbose)
+    log_step(f"Found {len(detector.steps)} steps: {detector.steps[0]} to {detector.steps[-1]}", verbose)
 
     results = detector.analyze(start_step=start_step, end_step=end_step, verbose=verbose)
 
@@ -1215,12 +1409,12 @@ def _cli_analyze(rollout_dir, start_step=None, end_step=None, verbose=False, out
     return results
 
 
-def _cli_diff(rollout_dir, step1, step2, match_by="index"):
+def _cli_diff(rollout_dir, step1, step2, match_by="index", verbose=True):
     """Diff rollouts between two steps."""
     detector = RewardHackingDetector(rollout_dir)
 
-    print(f"Comparing step {step1} vs step {step2}...")
-    result = detector.diff_steps(step1, step2, match_by=match_by)
+    log_step(f"Comparing step {step1} vs step {step2}...", verbose)
+    result = detector.diff_steps(step1, step2, match_by=match_by, verbose=verbose)
 
     print(f"\nSamples compared: {result.samples_compared}")
     print("")
@@ -1246,18 +1440,23 @@ def _cli_diff(rollout_dir, step1, step2, match_by="index"):
     return result
 
 
-def _cli_watch(rollout_dir, last_n=5):
+def _cli_watch(rollout_dir, last_n=5, verbose=True):
     """Quick check of the most recent steps for hacking indicators."""
+    watch_start = time.time()
     detector = RewardHackingDetector(rollout_dir)
 
     steps = detector.steps[-last_n:]
-    print(f"Checking last {len(steps)} steps: {steps}")
-    print("")
+    log_step(f"Checking last {len(steps)} steps: {steps}", verbose)
 
     all_indicators = []
+    progress = ProgressTracker(len(steps), "Scanning steps", disable=not verbose)
+
     for step in steps:
+        step_start = time.time()
         indicators = detector.analyze_step(step)
         all_indicators.extend(indicators)
+        step_time = time.time() - step_start
+
         high = sum(1 for i in indicators if i.severity == "high")
         med = sum(1 for i in indicators if i.severity == "medium")
         low = sum(1 for i in indicators if i.severity == "low")
@@ -1266,10 +1465,28 @@ def _cli_watch(rollout_dir, last_n=5):
 
         # Simple status line without rich dependency
         prefix = "[!]" if high > 0 else ("[?]" if indicators else "[ ]")
+
+        progress.update(1, extra_info=f"step {step}: {status}")
+
+    progress.finish()
+
+    # Print summary
+    print("\n" + "=" * 50)
+    print("WATCH RESULTS")
+    print("=" * 50)
+
+    for step in steps:
+        step_indicators = [i for i in all_indicators if i.step == step]
+        high = sum(1 for i in step_indicators if i.severity == "high")
+        med = sum(1 for i in step_indicators if i.severity == "medium")
+        low = sum(1 for i in step_indicators if i.severity == "low")
+
+        status = "OK" if not step_indicators else f"H:{high} M:{med} L:{low}"
+        prefix = "[!]" if high > 0 else ("[?]" if step_indicators else "[ ]")
         print(f"{prefix} Step {step}: {status}")
 
         # Show high-severity details
-        for ind in [i for i in indicators if i.severity == "high"][:3]:
+        for ind in [i for i in step_indicators if i.severity == "high"][:3]:
             print(f"    -> {ind.description[:70]}")
 
     return all_indicators
