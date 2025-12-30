@@ -1,0 +1,104 @@
+# Critique-GRPO Configuration
+# Based on: https://arxiv.org/abs/2506.03106
+#
+# This configuration extends the base PPO trainer with critique-based refinement.
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# Data configuration
+data:
+  gen_batch_size: ${data.train_batch_size}
+
+# Reward model configuration
+reward_model:
+  reward_manager: critique_grpo
+  overlong_buffer:
+    enable: False
+    len: 0
+    penalty_factor: 0.0
+    log: False
+
+# Algorithm configuration for GRPO
+algorithm:
+  # Use GRPO advantage estimator
+  adv_estimator: grpo
+
+  # Do not normalize by std (Dr.GRPO variant)
+  norm_adv_by_std_in_grpo: False
+
+  # Filter groups configuration
+  filter_groups:
+    _target_: verl.trainer.config.FilterGroupsConfig
+    enable: False
+    metric: null
+    max_num_gen_batches: 0
+
+# Actor, Rollout, and Reference model configuration
+actor_rollout_ref:
+  actor:
+    # Use KL loss during training
+    use_kl_loss: False
+
+    # Off-policy learning configuration (for refinements)
+    use_off_policy_loss: True
+    off_policy_normalize: False
+    off_policy_reshape: "p_div_p_0.1"
+    off_policy_loss_impl: token
+
+    # Loss configuration
+    loss_remove_token_mean: True
+    loss_remove_clip: True
+
+  rollout:
+    # Critique-GRPO specific settings
+    # Type of critique: "simple", "simple_gt", or "text"
+    critique_type: simple_gt
+
+    # Number of refinements to include per prompt
+    n_prefix: 1
+
+    # Maximum length for refinement responses
+    max_refinement_length: 6144
+
+    # Validation temperature settings
+    val_kwargs:
+      top_k: 1
+      top_p: 1.0
+      temperature: 0.6
+
+# Trainer configuration
+trainer:
+  project_name: critique-grpo
+  experiment_name: critique_grpo_training
+
+  # Number of warmup steps before updating critic
+  critic_warmup: 0
+
+  # Logging configuration
+  logger: ["console", "wandb"]
+
+# Ray initialization kwargs
+ray_kwargs:
+  ray_init:
+    address: null
+    runtime_env:
+      env_vars:
+        TOKENIZERS_PARALLELISM: "true"
+        NCCL_DEBUG: "WARN"
+        VLLM_LOGGING_LEVEL: "WARN"
+
+# Global profiler configuration
+global_profiler:
+  tool: null
+  steps: null
+  profile_continuous_steps: False
+  global_tool_config:
+    nsys:
+      controller_nsight_options: {}
+      worker_nsight_options: {}
