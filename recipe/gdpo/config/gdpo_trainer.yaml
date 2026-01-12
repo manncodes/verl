@@ -1,0 +1,26 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  gen_batch_size: ${data.train_batch_size}
+
+algorithm:
+  # GDPO (Group reward-Decoupled normalization Policy Optimization)
+  # See: https://arxiv.org/abs/2601.05242
+  adv_estimator: gdpo
+
+  # Whether to normalize advantages by std (applies to each reward independently in GDPO)
+  norm_adv_by_std_in_grpo: True
+
+  # Weights for multi-reward GDPO
+  # Maps reward names to their weights. Rewards are stored in batch with 'reward_' prefix.
+  # Example: {"correctness": 1.0, "format": 0.5}
+  gdpo_reward_weights: null
+
+trainer:
+  project_name: verl-gdpo

@@ -96,6 +96,7 @@ class AdvantageEstimator(str, Enum):
 
     GAE = "gae"
     GRPO = "grpo"
+    GDPO = "gdpo"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
     REMAX = "remax"
@@ -353,6 +354,153 @@ def compute_grpo_vectorized_outcome_advantage(
             scalars = scores - mean_g[g]
         advantages = scalars.unsqueeze(-1) * response_mask
         return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.GDPO)
+def compute_gdpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    reward_weights: Optional[dict[str, float]] = None,
+    multi_reward_tensors: Optional[dict[str, torch.Tensor]] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute advantage for GDPO (Group reward-Decoupled normalization Policy Optimization).
+
+    GDPO addresses the issue where directly applying GRPO to normalize distinct rollout
+    reward combinations causes them to collapse into identical advantage values.
+
+    Key difference from GRPO:
+    - GRPO: Aggregate rewards first → Normalize the combined reward
+        combined_reward = w1*r1 + w2*r2 + ...
+        normalized_adv = (combined_reward - group_mean) / group_std
+
+    - GDPO: Normalize each reward independently → Then aggregate
+        normalized_r1 = (r1 - group_mean(r1)) / group_std(r1)
+        normalized_r2 = (r2 - group_mean(r2)) / group_std(r2)
+        combined_adv = w1*normalized_r1 + w2*normalized_r2 + ...
+
+    See: https://arxiv.org/abs/2601.05242 for more details.
+
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape is (bs, response_length). Combined reward tensor (used when multi_reward_tensors is None).
+        response_mask: `(torch.Tensor)`
+            shape is (bs, response_length)
+        index: `(np.ndarray)`
+            index array for grouping
+        epsilon: `(float)`
+            small value to avoid division by zero
+        norm_adv_by_std_in_grpo: `(bool)`
+            whether to scale the advantage by std. If True, uses GRPO-style normalization.
+            If False, uses Dr.GRPO-style (https://arxiv.org/abs/2503.20783).
+        config: `(Optional[AlgoConfig])`
+            algorithm configuration object. Should contain gdpo_reward_weights if using multi-reward.
+        reward_weights: `(Optional[dict[str, float]])`
+            Dictionary mapping reward names to weights. If None, uses config.gdpo_reward_weights
+            or falls back to single-reward mode.
+        multi_reward_tensors: `(Optional[dict[str, torch.Tensor]])`
+            Dictionary mapping reward names to reward tensors. Each tensor shape is (bs, response_length).
+            If None, uses token_level_rewards as a single combined reward (equivalent to GRPO).
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape is (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape is (bs, response_length)
+    """
+    # Get reward weights from config if not provided
+    if reward_weights is None and config is not None:
+        reward_weights = config.get("gdpo_reward_weights", None)
+
+    with torch.no_grad():
+        # If we have multi-reward tensors, normalize each independently then combine
+        if multi_reward_tensors is not None and len(multi_reward_tensors) > 0:
+            normalized_advantages = []
+
+            for reward_name, reward_tensor in multi_reward_tensors.items():
+                # Sum token-level rewards to get outcome reward
+                scores = reward_tensor.sum(dim=-1)
+
+                # Compute group-wise mean and std
+                id2score = defaultdict(list)
+                id2mean = {}
+                id2std = {}
+                bsz = scores.shape[0]
+
+                for i in range(bsz):
+                    id2score[index[i]].append(scores[i])
+
+                for idx in id2score:
+                    if len(id2score[idx]) == 1:
+                        id2mean[idx] = torch.tensor(0.0, device=scores.device)
+                        id2std[idx] = torch.tensor(1.0, device=scores.device)
+                    elif len(id2score[idx]) > 1:
+                        scores_tensor = torch.stack(id2score[idx])
+                        id2mean[idx] = torch.mean(scores_tensor)
+                        id2std[idx] = torch.std(scores_tensor)
+                    else:
+                        raise ValueError(f"no score in prompt index: {idx}")
+
+                # Normalize each score
+                normalized_scores = scores.clone()
+                for i in range(bsz):
+                    if norm_adv_by_std_in_grpo:
+                        normalized_scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+                    else:
+                        normalized_scores[i] = scores[i] - id2mean[index[i]]
+
+                # Get weight for this reward
+                weight = 1.0
+                if reward_weights is not None and reward_name in reward_weights:
+                    weight = reward_weights[reward_name]
+
+                normalized_advantages.append(normalized_scores * weight)
+
+            # Sum all normalized advantages
+            combined_scores = sum(normalized_advantages)
+
+            # Apply batch-wise whitening (optional, as per GDPO paper)
+            combined_scores = combined_scores.unsqueeze(-1) * response_mask
+
+            return combined_scores, combined_scores
+
+        else:
+            # Single reward mode: falls back to standard GRPO behavior
+            # but with the option to be called with pre-separated rewards in the future
+            scores = token_level_rewards.sum(dim=-1)
+
+            id2score = defaultdict(list)
+            id2mean = {}
+            id2std = {}
+            bsz = scores.shape[0]
+
+            for i in range(bsz):
+                id2score[index[i]].append(scores[i])
+
+            for idx in id2score:
+                if len(id2score[idx]) == 1:
+                    id2mean[idx] = torch.tensor(0.0, device=scores.device)
+                    id2std[idx] = torch.tensor(1.0, device=scores.device)
+                elif len(id2score[idx]) > 1:
+                    scores_tensor = torch.stack(id2score[idx])
+                    id2mean[idx] = torch.mean(scores_tensor)
+                    id2std[idx] = torch.std(scores_tensor)
+                else:
+                    raise ValueError(f"no score in prompt index: {idx}")
+
+            for i in range(bsz):
+                if norm_adv_by_std_in_grpo:
+                    scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+                else:
+                    scores[i] = scores[i] - id2mean[index[i]]
+
+            scores = scores.unsqueeze(-1) * response_mask
+
+            return scores, scores
 
 
 @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")

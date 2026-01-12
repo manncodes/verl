@@ -239,6 +239,35 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.GDPO:
+        # GDPO: Group reward-Decoupled normalization Policy Optimization
+        # Key difference from GRPO: normalize each reward independently, then aggregate
+        # See: https://arxiv.org/abs/2601.05242
+
+        # Check for multi-reward tensors (stored with 'reward_' prefix in batch)
+        multi_reward_tensors = {}
+        for key in data.batch.keys():
+            if key.startswith("reward_") and key != "reward_baselines":
+                # e.g., "reward_correctness", "reward_format", etc.
+                reward_name = key[7:]  # Remove 'reward_' prefix
+                multi_reward_tensors[reward_name] = data.batch[key]
+
+        # Get reward weights from config if available
+        reward_weights = None
+        if config is not None:
+            reward_weights = config.get("gdpo_reward_weights", None)
+
+        advantages, returns = core_algos.compute_gdpo_outcome_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            index=data.non_tensor_batch["uid"],
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+            reward_weights=reward_weights,
+            multi_reward_tensors=multi_reward_tensors if multi_reward_tensors else None,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)

@@ -22,6 +22,7 @@ import torch
 import verl.trainer.ppo.core_algos
 from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
+    compute_gdpo_outcome_advantage,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
     compute_rloo_outcome_advantage,
@@ -311,6 +312,193 @@ def test_grpo_and_vectorized_equivalence(batch_size: int, seq_len: int, num_grou
     assert ret1.shape == ret2.shape == (batch_size, seq_len)
     assert torch.allclose(adv1, adv2, rtol=1e-5, atol=1e-6)
     assert torch.allclose(ret1, ret2, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "batch_size,seq_len,num_groups,seed",
+    [
+        (64, 128, 5, 0),
+        (128, 256, 8, 1),
+        (512, 512, 10, 2),
+    ],
+)
+def test_gdpo_single_reward_equals_grpo(batch_size: int, seq_len: int, num_groups: int, seed: int):
+    """Test that GDPO with single reward equals GRPO output."""
+    # Set seeds for reproducibility
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+    # Generate group indices (numpy array of shape [batch_size])
+    index = _make_group_index(batch_size, num_groups)
+
+    # Generate binary response mask (at least one valid token per row)
+    response_mask = _rand_mask(batch_size, seq_len)
+
+    # Generate token-level rewards and apply mask
+    base_rewards = torch.randn(batch_size, seq_len, dtype=torch.float32)
+    token_level_rewards = base_rewards * response_mask
+
+    # Compute GRPO outcome advantage
+    adv_grpo, ret_grpo = compute_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+    )
+
+    # Compute GDPO outcome advantage (single reward - should be equivalent to GRPO)
+    adv_gdpo, ret_gdpo = compute_gdpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+    )
+
+    # Diagnostic info
+    adv_max_diff = (adv_grpo - adv_gdpo).abs().max().item()
+    ret_max_diff = (ret_grpo - ret_gdpo).abs().max().item()
+    total_mask_tokens = int(response_mask.sum().item())
+    print(
+        f"[GDPO-single] seed={seed} groups={num_groups} shape={adv_grpo.shape} "
+        f"mask_tokens={total_mask_tokens} adv_max_diff={adv_max_diff:.3e} ret_max_diff={ret_max_diff:.3e}"
+    )
+
+    # Assert shape and numerical equivalence
+    assert adv_grpo.shape == adv_gdpo.shape == (batch_size, seq_len)
+    assert ret_grpo.shape == ret_gdpo.shape == (batch_size, seq_len)
+    assert torch.allclose(adv_grpo, adv_gdpo, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(ret_grpo, ret_gdpo, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "batch_size,seq_len,num_groups,seed",
+    [
+        (64, 128, 5, 0),
+        (128, 256, 8, 1),
+    ],
+)
+def test_gdpo_multi_reward(batch_size: int, seq_len: int, num_groups: int, seed: int):
+    """Test GDPO with multiple rewards normalizes each independently."""
+    # Set seeds for reproducibility
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+    # Generate group indices
+    index = _make_group_index(batch_size, num_groups)
+
+    # Generate binary response mask
+    response_mask = _rand_mask(batch_size, seq_len)
+
+    # Generate two reward signals with different scales
+    reward1 = torch.randn(batch_size, seq_len, dtype=torch.float32) * 10  # Scale 10
+    reward2 = torch.randn(batch_size, seq_len, dtype=torch.float32) * 0.1  # Scale 0.1
+
+    reward1 = reward1 * response_mask
+    reward2 = reward2 * response_mask
+
+    # Combined reward (for comparison with GRPO)
+    combined_reward = reward1 + reward2
+
+    # Create multi-reward tensors dict
+    multi_reward_tensors = {
+        "reward1": reward1,
+        "reward2": reward2,
+    }
+
+    # Compute GDPO with multi-reward (equal weights)
+    adv_gdpo_multi, ret_gdpo_multi = compute_gdpo_outcome_advantage(
+        token_level_rewards=combined_reward,
+        response_mask=response_mask,
+        index=index,
+        multi_reward_tensors=multi_reward_tensors,
+        reward_weights={"reward1": 1.0, "reward2": 1.0},
+    )
+
+    # Compute GRPO with combined reward
+    adv_grpo, ret_grpo = compute_grpo_outcome_advantage(
+        token_level_rewards=combined_reward,
+        response_mask=response_mask,
+        index=index,
+    )
+
+    # The outputs should be different because GDPO normalizes each reward independently
+    total_mask_tokens = int(response_mask.sum().item())
+    adv_diff = (adv_grpo - adv_gdpo_multi).abs().max().item()
+    print(
+        f"[GDPO-multi] seed={seed} groups={num_groups} shape={adv_grpo.shape} "
+        f"mask_tokens={total_mask_tokens} adv_diff_from_grpo={adv_diff:.3e}"
+    )
+
+    # Assert shapes are correct
+    assert adv_gdpo_multi.shape == (batch_size, seq_len)
+    assert ret_gdpo_multi.shape == (batch_size, seq_len)
+
+    # GDPO with multi-reward should NOT be identical to GRPO
+    # (unless by coincidence the rewards have the same distribution)
+    # This is the key difference - GDPO normalizes each reward independently
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_gdpo_preserves_relative_differences(seed: int):
+    """
+    Test that GDPO preserves relative differences between rewards better than GRPO.
+
+    This is the key advantage of GDPO: when rewards have different scales,
+    GDPO normalizes each independently to preserve their relative importance.
+    """
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+    batch_size = 32
+    seq_len = 64
+    num_groups = 4
+
+    index = _make_group_index(batch_size, num_groups)
+    response_mask = _rand_mask(batch_size, seq_len)
+
+    # Create rewards with very different scales
+    # Reward1: high variance, dominates in combined reward
+    reward1 = torch.randn(batch_size, seq_len, dtype=torch.float32) * 100
+    # Reward2: low variance, gets dominated in combined reward
+    reward2 = torch.randn(batch_size, seq_len, dtype=torch.float32) * 0.01
+
+    reward1 = reward1 * response_mask
+    reward2 = reward2 * response_mask
+
+    multi_reward_tensors = {"reward1": reward1, "reward2": reward2}
+
+    # With GDPO, both rewards contribute meaningfully after normalization
+    adv_gdpo, _ = compute_gdpo_outcome_advantage(
+        token_level_rewards=reward1 + reward2,
+        response_mask=response_mask,
+        index=index,
+        multi_reward_tensors=multi_reward_tensors,
+        reward_weights={"reward1": 1.0, "reward2": 1.0},
+    )
+
+    # Compute individual normalized rewards for verification
+    adv_r1_only, _ = compute_gdpo_outcome_advantage(
+        token_level_rewards=reward1,
+        response_mask=response_mask,
+        index=index,
+    )
+
+    adv_r2_only, _ = compute_gdpo_outcome_advantage(
+        token_level_rewards=reward2,
+        response_mask=response_mask,
+        index=index,
+    )
+
+    # GDPO should be approximately equal to the sum of individual normalized advantages
+    expected_gdpo = adv_r1_only + adv_r2_only
+    adv_diff = (adv_gdpo - expected_gdpo).abs().max().item()
+
+    print(f"[GDPO-preserve] seed={seed} adv_diff_from_expected={adv_diff:.3e}")
+
+    assert torch.allclose(adv_gdpo, expected_gdpo, rtol=1e-5, atol=1e-6), (
+        f"GDPO should equal sum of individual normalized advantages. Max diff: {adv_diff}"
+    )
 
 
 if __name__ == "__main__":

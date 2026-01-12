@@ -424,8 +424,8 @@ class AlgoConfig(BaseConfig):
     Args:
         gamma (float): Discount factor for future rewards.
         lam (float): Trade-off between bias and variance in the GAE estimator.
-        adv_estimator (str): Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
-        norm_adv_by_std_in_grpo (bool): Whether to normalize advantages by std (specific to GRPO).
+        adv_estimator (str): Advantage estimator type: "gae", "grpo", "gdpo", "reinforce_plus_plus", etc.
+        norm_adv_by_std_in_grpo (bool): Whether to normalize advantages by std (specific to GRPO/GDPO).
         use_kl_in_reward (bool): Whether to enable in-reward KL penalty.
         kl_penalty (str): How to estimate KL divergence: "kl", "abs", "mse", "low_var_kl", or "full".
         kl_ctrl (KLControlConfig): KL control configuration.
@@ -446,6 +446,15 @@ class AlgoConfig(BaseConfig):
 
             For backward compatibility, you can still pass a dict, which will be converted to
             RolloutCorrectionConfig automatically.
+        gdpo_reward_weights (Optional[dict[str, float]]): Weights for multi-reward GDPO.
+            Maps reward names to their weights. Used when adv_estimator="gdpo".
+            Example: {"correctness": 1.0, "format": 0.5, "length": 0.3}
+
+            GDPO (Group reward-Decoupled normalization Policy Optimization) normalizes each
+            reward independently before combining them, which preserves relative differences
+            between rewards better than GRPO when using multiple reward signals.
+
+            See: https://arxiv.org/abs/2601.05242
     """
 
     gamma: float = 1.0
@@ -461,3 +470,6 @@ class AlgoConfig(BaseConfig):
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
+    # GDPO reward weights: maps reward names to weights for multi-reward normalization
+    # Used when adv_estimator="gdpo". See: https://arxiv.org/abs/2601.05242
+    gdpo_reward_weights: Optional[dict[str, float]] = None
