@@ -341,16 +341,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self.rank == 0:
             print(f"Model config after override: {actor_model_config}")
 
+        # Check if model uses remote/custom code for from_pretrained
+        # This needs to be done before setting up init_context
+        has_remote_code = hasattr(actor_model_config, "auto_map") and any(
+            actor_model_config.architectures[0] in val for val in actor_model_config.auto_map.values()
+        )
+
         # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
+        # Also disable meta tensors for custom models with remote code as they often have
+        # complex weight loading logic that doesn't work well with init_empty_weights
+        use_meta_tensor = not actor_model_config.tie_word_embeddings and not has_remote_code
         init_context = get_init_weight_context_manager(
-            use_meta_tensor=not actor_model_config.tie_word_embeddings, mesh=self.device_mesh
+            use_meta_tensor=use_meta_tensor, mesh=self.device_mesh
         )
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            has_remote_code = hasattr(actor_model_config, "auto_map") and any(
-                actor_model_config.architectures[0] in val for val in actor_model_config.auto_map.values()
-            )
             if has_remote_code:
                 auto_class = next(
                     k for k, v in actor_model_config.auto_map.items() if actor_model_config.architectures[0] in v
