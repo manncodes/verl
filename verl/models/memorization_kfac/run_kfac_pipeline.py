@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-End-to-end K-FAC pipeline for verl's parallel llama models.
+End-to-end K-FAC pipeline for verl's parallel llama models and CustomSplitLLamaModel.
 
 This script provides a complete pipeline for:
 1. Collecting K-FAC factors from a model
@@ -21,31 +21,46 @@ This script provides a complete pipeline for:
 3. Applying K-FAC treatment to reduce memorization
 4. Evaluating the treatment effects
 
+Supports:
+- Standard HuggingFace llama models
+- CustomSplitLLamaModel with layers_first (8B), adapter, and layers_last (70B)
+- verl's parallel llama models
+
 Usage:
-    # Collect K-FAC factors
-    python run_kfac_pipeline.py collect --model meta-llama/Llama-2-7b-hf \
+    # For standard models
+    python run_kfac_pipeline.py collect --model meta-llama/Llama-2-7b-hf \\
         --layers 20 24 28 31 --output_dir ./kfac_output
 
+    # For CustomSplitLLamaModel
+    python run_kfac_pipeline.py collect --model ./custom_split_model \\
+        --layer_group 8b --layers 0 1 2 3 --output_dir ./kfac_output
+
+    python run_kfac_pipeline.py collect --model ./custom_split_model \\
+        --layer_group 70b --layers 0 1 2 3 --output_dir ./kfac_output
+
+    python run_kfac_pipeline.py collect --model ./custom_split_model \\
+        --layer_group adapter --output_dir ./kfac_output
+
     # Analyze collected factors
-    python run_kfac_pipeline.py analyze --factors_path ./kfac_output/kfac_factors.pt \
+    python run_kfac_pipeline.py analyze --factors_path ./kfac_output/kfac_factors.pt \\
         --output_dir ./kfac_analysis
 
     # Apply treatment and evaluate
-    python run_kfac_pipeline.py treat --model meta-llama/Llama-2-7b-hf \
+    python run_kfac_pipeline.py treat --model ./custom_split_model \\
         --factors_path ./kfac_output/kfac_factors.pt --variance_ratio 0.9
 
     # Run full pipeline
-    python run_kfac_pipeline.py full --model meta-llama/Llama-2-7b-hf \
-        --layers 20 24 28 31 --output_dir ./kfac_pipeline
+    python run_kfac_pipeline.py full --model ./custom_split_model \\
+        --layer_group 70b --layers 0 1 2 3 --output_dir ./kfac_pipeline
 """
 
 import argparse
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -98,6 +113,10 @@ class KFACConfig:
     layers_per_pass: int = 2
     sample_labels: bool = False
 
+    # Custom split model settings
+    layer_group: str = "auto"  # "auto", "8b", "70b", "adapter", or "all"
+    include_adapter: bool = True
+
     # Treatment settings
     variance_ratio: float = 0.9
     treatment_method: str = "product"  # "product" or "separate"
@@ -110,9 +129,133 @@ class KFACConfig:
 
     def __post_init__(self):
         if self.target_layers is None:
-            self.target_layers = [20, 24, 28, 31]
+            self.target_layers = [0, 1, 2, 3]  # Default to first 4 layers
         if self.projections is None:
             self.projections = ["gate", "up", "down"]
+
+
+# ============================================================================
+# Model Structure Detection
+# ============================================================================
+
+
+def is_custom_split_model(model: nn.Module) -> bool:
+    """Check if model is a CustomSplitLLamaModel."""
+    model_inner = model.model if hasattr(model, "model") else model
+    return hasattr(model_inner, "layers_first") and hasattr(model_inner, "layers_last")
+
+
+def get_model_structure(model: nn.Module) -> Dict[str, Any]:
+    """
+    Detect model structure and return information about layers.
+
+    Returns:
+        Dict with keys:
+        - 'type': 'custom_split', 'standard', or 'parallel'
+        - 'layers_first': ModuleList or None (8B layers for split model)
+        - 'layers_last': ModuleList or None (70B layers for split model)
+        - 'layers': ModuleList or None (standard layers)
+        - 'adapter': nn.Module or None
+        - 'has_mlp_adapter': bool
+    """
+    model_inner = model.model if hasattr(model, "model") else model
+
+    structure = {
+        "type": "standard",
+        "layers_first": None,
+        "layers_last": None,
+        "layers": None,
+        "adapter": None,
+        "adapter_linear_1": None,
+        "adapter_linear_2": None,
+        "has_mlp_adapter": False,
+    }
+
+    # Check for CustomSplitLLamaModel
+    if hasattr(model_inner, "layers_first") and hasattr(model_inner, "layers_last"):
+        structure["type"] = "custom_split"
+        structure["layers_first"] = model_inner.layers_first
+        structure["layers_last"] = model_inner.layers_last
+
+        # Check for adapter(s)
+        if hasattr(model_inner, "adapter"):
+            structure["adapter"] = model_inner.adapter
+        if hasattr(model_inner, "adapter_linear_1"):
+            structure["adapter_linear_1"] = model_inner.adapter_linear_1
+            structure["has_mlp_adapter"] = True
+        if hasattr(model_inner, "adapter_linear_2"):
+            structure["adapter_linear_2"] = model_inner.adapter_linear_2
+
+        print(f"Detected CustomSplitLLamaModel:")
+        print(f"  layers_first (8B): {len(structure['layers_first'])} layers")
+        print(f"  layers_last (70B): {len(structure['layers_last'])} layers")
+        print(f"  adapter: {'MLP' if structure['has_mlp_adapter'] else 'Linear' if structure['adapter'] else 'None'}")
+
+    # Check for standard model
+    elif hasattr(model_inner, "layers"):
+        structure["type"] = "standard"
+        structure["layers"] = model_inner.layers
+        print(f"Detected standard model with {len(structure['layers'])} layers")
+
+    # Check for GPT-style model
+    elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+        structure["type"] = "standard"
+        structure["layers"] = model.transformer.h
+        print(f"Detected GPT-style model with {len(structure['layers'])} layers")
+
+    else:
+        raise ValueError("Could not detect model structure")
+
+    return structure
+
+
+def get_layers_for_group(
+    structure: Dict[str, Any],
+    layer_group: str,
+    target_layers: List[int],
+) -> List[Tuple[str, nn.Module, int]]:
+    """
+    Get the layers to process based on layer group selection.
+
+    Args:
+        structure: Model structure from get_model_structure()
+        layer_group: "8b", "70b", "adapter", "all", or "auto"
+        target_layers: List of layer indices within the group
+
+    Returns:
+        List of (layer_name, layer_module, layer_idx) tuples
+    """
+    layers_to_process = []
+
+    if structure["type"] == "custom_split":
+        if layer_group in ["8b", "all", "auto"]:
+            layers_first = structure["layers_first"]
+            for idx in target_layers:
+                if idx < len(layers_first):
+                    layers_to_process.append((f"8b_blk{idx}", layers_first[idx], idx))
+
+        if layer_group in ["70b", "all", "auto"]:
+            layers_last = structure["layers_last"]
+            for idx in target_layers:
+                if idx < len(layers_last):
+                    layers_to_process.append((f"70b_blk{idx}", layers_last[idx], idx))
+
+        if layer_group in ["adapter", "all"]:
+            if structure["has_mlp_adapter"]:
+                if structure["adapter_linear_1"] is not None:
+                    layers_to_process.append(("adapter.linear_1", structure["adapter_linear_1"], -1))
+                if structure["adapter_linear_2"] is not None:
+                    layers_to_process.append(("adapter.linear_2", structure["adapter_linear_2"], -1))
+            elif structure["adapter"] is not None:
+                layers_to_process.append(("adapter", structure["adapter"], -1))
+
+    else:  # standard model
+        layers = structure["layers"]
+        for idx in target_layers:
+            if idx < len(layers):
+                layers_to_process.append((f"blk{idx}", layers[idx], idx))
+
+    return layers_to_process
 
 
 # ============================================================================
@@ -207,9 +350,7 @@ def create_dataloader(config: KFACConfig, tokenizer) -> DataLoader:
 
 class SimpleKFACCollector:
     """
-    Simplified K-FAC collector that works with standard HuggingFace models.
-
-    This collector is designed to work with both standard and parallel models.
+    Simplified K-FAC collector that works with any nn.Linear layer.
     """
 
     def __init__(self, layer: nn.Module, layer_name: str, device: str = "cuda"):
@@ -288,28 +429,25 @@ class SimpleKFACCollector:
         self._input_buffer = None
 
 
-def collect_kfac_factors(
+def collect_kfac_factors_split_model(
     model: nn.Module,
     dataloader: DataLoader,
-    target_layers: List[int],
     config: KFACConfig,
 ) -> Dict[str, Dict[str, torch.Tensor]]:
     """
-    Collect K-FAC factors from a model.
+    Collect K-FAC factors from CustomSplitLLamaModel or standard model.
 
-    Args:
-        model: The language model.
-        dataloader: DataLoader providing training data.
-        target_layers: List of layer indices to collect factors from.
-        config: KFACConfig with settings.
-
-    Returns:
-        Dictionary mapping layer names to their K-FAC factors.
+    Handles both layer types (8B, 70B) and adapter layers.
     """
     print(f"\n{'='*60}")
     print("K-FAC Factor Collection")
     print(f"{'='*60}")
-    print(f"Target layers: {target_layers}")
+
+    # Detect model structure
+    structure = get_model_structure(model)
+
+    print(f"Target layers: {config.target_layers}")
+    print(f"Layer group: {config.layer_group}")
     print(f"Batch size: {config.batch_size}")
     print(f"Sequence length: {config.seq_length}")
     print(f"Sample labels: {config.sample_labels}")
@@ -318,24 +456,35 @@ def collect_kfac_factors(
 
     # Enable gradient checkpointing if available
     if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
+        try:
+            model.gradient_checkpointing_enable()
+        except Exception as e:
+            print(f"Warning: Could not enable gradient checkpointing: {e}")
 
     all_factors = {}
 
-    # Get model layers
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        layers = model.model.layers
-    elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
-        layers = model.transformer.h
-    else:
-        raise ValueError("Could not find model layers")
+    # Get layers to process
+    layers_to_process = get_layers_for_group(
+        structure, config.layer_group, config.target_layers
+    )
+
+    if not layers_to_process:
+        print("Warning: No layers found to process!")
+        return all_factors
+
+    print(f"\nWill process {len(layers_to_process)} layer(s):")
+    for name, _, _ in layers_to_process:
+        print(f"  - {name}")
 
     # Process layers in groups
-    for start in range(0, len(target_layers), config.layers_per_pass):
-        end = min(start + config.layers_per_pass, len(target_layers))
-        current_layers = target_layers[start:end]
+    layer_names = [name for name, _, _ in layers_to_process]
 
-        print(f"\nProcessing layers: {current_layers}")
+    for start in range(0, len(layers_to_process), config.layers_per_pass):
+        end = min(start + config.layers_per_pass, len(layers_to_process))
+        current_layers = layers_to_process[start:end]
+        current_names = [name for name, _, _ in current_layers]
+
+        print(f"\nProcessing: {current_names}")
 
         # Disable all gradients
         for p in model.parameters():
@@ -343,51 +492,57 @@ def collect_kfac_factors(
 
         # Setup collectors
         collectors = {}
-        for idx in current_layers:
-            if idx >= len(layers):
-                print(f"Warning: Layer {idx} out of range, skipping")
-                continue
 
-            layer = layers[idx]
-            mlp = layer.mlp if hasattr(layer, "mlp") else layer
-
-            # Find MLP projections
-            proj_names = []
-            if hasattr(mlp, "gate_proj"):
-                proj_names.append(("gate_proj", "gate"))
-            if hasattr(mlp, "up_proj"):
-                proj_names.append(("up_proj", "up"))
-            if hasattr(mlp, "down_proj"):
-                proj_names.append(("down_proj", "down"))
-            if hasattr(mlp, "gate_up_proj"):
-                proj_names.append(("gate_up_proj", "gate_up"))
-
-            # Fallback for GPT-style models
-            if hasattr(mlp, "c_fc"):
-                proj_names.append(("c_fc", "up"))
-            if hasattr(mlp, "c_proj"):
-                proj_names.append(("c_proj", "down"))
-
-            for attr_name, proj_type in proj_names:
-                proj_layer = getattr(mlp, attr_name)
-                proj_layer.weight.requires_grad_(True)
-
-                key = f"blk{idx}.{proj_type}"
-                collectors[key] = SimpleKFACCollector(
-                    layer=proj_layer,
-                    layer_name=key,
+        for layer_name, layer_module, layer_idx in current_layers:
+            # Check if this is an adapter layer (nn.Linear directly)
+            if isinstance(layer_module, nn.Linear):
+                layer_module.weight.requires_grad_(True)
+                collectors[layer_name] = SimpleKFACCollector(
+                    layer=layer_module,
+                    layer_name=layer_name,
                     device=config.device,
                 )
+            else:
+                # This is a decoder layer, get MLP projections
+                mlp = layer_module.mlp if hasattr(layer_module, "mlp") else layer_module
+
+                # Find MLP projections
+                proj_names = []
+                if hasattr(mlp, "gate_proj"):
+                    proj_names.append(("gate_proj", "gate"))
+                if hasattr(mlp, "up_proj"):
+                    proj_names.append(("up_proj", "up"))
+                if hasattr(mlp, "down_proj"):
+                    proj_names.append(("down_proj", "down"))
+                if hasattr(mlp, "gate_up_proj"):
+                    proj_names.append(("gate_up_proj", "gate_up"))
+
+                # Fallback for GPT-style models
+                if hasattr(mlp, "c_fc"):
+                    proj_names.append(("c_fc", "up"))
+                if hasattr(mlp, "c_proj"):
+                    proj_names.append(("c_proj", "down"))
+
+                for attr_name, proj_type in proj_names:
+                    proj_layer = getattr(mlp, attr_name)
+                    proj_layer.weight.requires_grad_(True)
+
+                    key = f"{layer_name}.{proj_type}"
+                    collectors[key] = SimpleKFACCollector(
+                        layer=proj_layer,
+                        layer_name=key,
+                        device=config.device,
+                    )
 
         if not collectors:
-            print(f"Warning: No collectors created for layers {current_layers}")
+            print(f"Warning: No collectors created for {current_names}")
             continue
 
         # Run forward/backward passes
         ce_loss = nn.CrossEntropyLoss(ignore_index=-100)
         total_tokens = 0
 
-        for batch in tqdm(dataloader, desc=f"Collecting K-FAC (layers {current_layers})"):
+        for batch in tqdm(dataloader, desc=f"Collecting K-FAC"):
             input_ids = batch["input_ids"].to(config.device)
             attention_mask = batch.get("attention_mask")
             if attention_mask is not None:
@@ -444,6 +599,18 @@ def collect_kfac_factors(
     return all_factors
 
 
+# Alias for backward compatibility
+def collect_kfac_factors(
+    model: nn.Module,
+    dataloader: DataLoader,
+    target_layers: List[int],
+    config: KFACConfig,
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    """Collect K-FAC factors (wrapper for backward compatibility)."""
+    config.target_layers = target_layers
+    return collect_kfac_factors_split_model(model, dataloader, config)
+
+
 # ============================================================================
 # K-FAC Analysis
 # ============================================================================
@@ -455,13 +622,6 @@ def analyze_kfac_factors(
 ) -> Dict[str, Any]:
     """
     Analyze K-FAC factors and generate statistics and visualizations.
-
-    Args:
-        factors: Dictionary of K-FAC factors.
-        output_dir: Optional directory to save analysis results.
-
-    Returns:
-        Dictionary with analysis results.
     """
     print(f"\n{'='*60}")
     print("K-FAC Factor Analysis")
@@ -528,7 +688,7 @@ def analyze_kfac_factors(
         # Effective rank (using entropy)
         def effective_rank(eigenvalues):
             p = eigenvalues / eigenvalues.sum()
-            p = p[p > 1e-10]  # Filter near-zero
+            p = p[p > 1e-10]
             entropy = -(p * p.log()).sum()
             return entropy.exp().item()
 
@@ -545,7 +705,7 @@ def analyze_kfac_factors(
         print(f"     eigenvalues: max={eva_G[0]:.2e}, min={eva_G[-1]:.2e}")
         print(f"     90% variance at rank: {variance_ranks['G']['90%']}/{len(eva_G)}")
 
-        # Store eigenvalues for later use
+        # Store eigenvalues for plotting
         layer_analysis["_eva_A"] = eva_A.numpy() if HAS_MATPLOTLIB else None
         layer_analysis["_eva_G"] = eva_G.numpy() if HAS_MATPLOTLIB else None
 
@@ -567,9 +727,7 @@ def analyze_kfac_factors(
         _plot_effective_ranks(analysis, output_dir)
 
         # Save analysis JSON
-        analysis_json = {
-            k: v for k, v in analysis.items() if not k.startswith("_")
-        }
+        analysis_json = {k: v for k, v in analysis.items() if not k.startswith("_")}
         for layer_name in analysis_json.get("layers", {}):
             layer_data = analysis_json["layers"][layer_name]
             layer_data.pop("_eva_A", None)
@@ -599,13 +757,13 @@ def _plot_eigenvalue_distributions(analysis: Dict, output_dir: str):
     axes[0].set_title("Activation Covariance (A) Eigenvalues")
     axes[0].set_xlabel("Index")
     axes[0].set_ylabel("Eigenvalue (log scale)")
-    axes[0].legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+    axes[0].legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
     axes[0].grid(True, alpha=0.3)
 
     axes[1].set_title("Gradient Covariance (G) Eigenvalues")
     axes[1].set_xlabel("Index")
     axes[1].set_ylabel("Eigenvalue (log scale)")
-    axes[1].legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+    axes[1].legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
     axes[1].grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -636,13 +794,13 @@ def _plot_variance_explained(analysis: Dict, output_dir: str):
     axes[0].set_title("Cumulative Variance Explained (A)")
     axes[0].set_xlabel("Fraction of Components")
     axes[0].set_ylabel("Variance Explained")
-    axes[0].legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+    axes[0].legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
     axes[0].grid(True, alpha=0.3)
 
     axes[1].set_title("Cumulative Variance Explained (G)")
     axes[1].set_xlabel("Fraction of Components")
     axes[1].set_ylabel("Variance Explained")
-    axes[1].legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+    axes[1].legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
     axes[1].grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -656,18 +814,18 @@ def _plot_effective_ranks(analysis: Dict, output_dir: str):
     eff_ranks_A = [analysis["layers"][l]["A_effective_rank"] for l in layers]
     eff_ranks_G = [analysis["layers"][l]["G_effective_rank"] for l in layers]
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=(max(12, len(layers) * 0.8), 6))
 
     x = np.arange(len(layers))
     width = 0.35
 
-    bars1 = ax.bar(x - width / 2, eff_ranks_A, width, label="A (Activation)", alpha=0.8)
-    bars2 = ax.bar(x + width / 2, eff_ranks_G, width, label="G (Gradient)", alpha=0.8)
+    ax.bar(x - width / 2, eff_ranks_A, width, label="A (Activation)", alpha=0.8)
+    ax.bar(x + width / 2, eff_ranks_G, width, label="G (Gradient)", alpha=0.8)
 
     ax.set_ylabel("Effective Rank")
     ax.set_title("Effective Rank by Layer")
     ax.set_xticks(x)
-    ax.set_xticklabels(layers, rotation=45, ha="right")
+    ax.set_xticklabels(layers, rotation=45, ha="right", fontsize=8)
     ax.legend()
     ax.grid(True, alpha=0.3, axis="y")
 
@@ -681,21 +839,13 @@ def _plot_effective_ranks(analysis: Dict, output_dir: str):
 # ============================================================================
 
 
-def apply_kfac_treatment(
+def apply_kfac_treatment_split_model(
     model: nn.Module,
     factors: Dict[str, Dict[str, torch.Tensor]],
     config: KFACConfig,
 ) -> Dict[str, Any]:
     """
-    Apply K-FAC treatment to reduce memorization.
-
-    Args:
-        model: The language model.
-        factors: K-FAC factors dictionary.
-        config: KFACConfig with settings.
-
-    Returns:
-        Treatment statistics.
+    Apply K-FAC treatment to CustomSplitLLamaModel or standard model.
     """
     print(f"\n{'='*60}")
     print("K-FAC Treatment Application")
@@ -703,47 +853,72 @@ def apply_kfac_treatment(
     print(f"Variance ratio: {config.variance_ratio}")
     print(f"Method: {config.treatment_method}")
 
-    # Get model layers
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        layers = model.model.layers
-    elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
-        layers = model.transformer.h
-    else:
-        raise ValueError("Could not find model layers")
-
+    structure = get_model_structure(model)
     treatment_stats = {}
 
     for layer_name, layer_factors in factors.items():
-        # Parse layer name to get index and projection type
-        # Format: blk{idx}.{proj_type}
-        parts = layer_name.split(".")
-        if len(parts) < 2:
-            continue
+        # Parse layer name to get the actual layer
+        # Formats: "8b_blk{idx}.{proj}", "70b_blk{idx}.{proj}", "blk{idx}.{proj}", "adapter.linear_1", etc.
 
-        try:
-            idx = int(parts[0].replace("blk", ""))
-            proj_type = parts[1]
-        except (ValueError, IndexError):
-            print(f"Warning: Could not parse layer name {layer_name}")
-            continue
+        proj_layer = None
+        layer_key = layer_name
 
-        if idx >= len(layers):
-            continue
+        # Handle adapter layers
+        if layer_name.startswith("adapter"):
+            if "linear_1" in layer_name and structure["adapter_linear_1"] is not None:
+                proj_layer = structure["adapter_linear_1"]
+            elif "linear_2" in layer_name and structure["adapter_linear_2"] is not None:
+                proj_layer = structure["adapter_linear_2"]
+            elif structure["adapter"] is not None:
+                proj_layer = structure["adapter"]
 
-        layer = layers[idx]
-        mlp = layer.mlp if hasattr(layer, "mlp") else layer
+        # Handle 8B layers
+        elif layer_name.startswith("8b_blk"):
+            parts = layer_name.split(".")
+            blk_part = parts[0]  # "8b_blk{idx}"
+            proj_type = parts[1] if len(parts) > 1 else None
 
-        # Find the projection layer
-        if proj_type == "gate" and hasattr(mlp, "gate_proj"):
-            proj_layer = mlp.gate_proj
-        elif proj_type == "up" and hasattr(mlp, "up_proj"):
-            proj_layer = mlp.up_proj
-        elif proj_type == "down" and hasattr(mlp, "down_proj"):
-            proj_layer = mlp.down_proj
-        elif proj_type == "gate_up" and hasattr(mlp, "gate_up_proj"):
-            proj_layer = mlp.gate_up_proj
-        else:
-            print(f"Warning: Could not find projection {proj_type} for layer {idx}")
+            try:
+                idx = int(blk_part.replace("8b_blk", ""))
+                if structure["layers_first"] is not None and idx < len(structure["layers_first"]):
+                    layer = structure["layers_first"][idx]
+                    mlp = layer.mlp if hasattr(layer, "mlp") else layer
+                    proj_layer = _get_proj_layer(mlp, proj_type)
+            except (ValueError, IndexError):
+                pass
+
+        # Handle 70B layers
+        elif layer_name.startswith("70b_blk"):
+            parts = layer_name.split(".")
+            blk_part = parts[0]
+            proj_type = parts[1] if len(parts) > 1 else None
+
+            try:
+                idx = int(blk_part.replace("70b_blk", ""))
+                if structure["layers_last"] is not None and idx < len(structure["layers_last"]):
+                    layer = structure["layers_last"][idx]
+                    mlp = layer.mlp if hasattr(layer, "mlp") else layer
+                    proj_layer = _get_proj_layer(mlp, proj_type)
+            except (ValueError, IndexError):
+                pass
+
+        # Handle standard model layers
+        elif layer_name.startswith("blk"):
+            parts = layer_name.split(".")
+            blk_part = parts[0]
+            proj_type = parts[1] if len(parts) > 1 else None
+
+            try:
+                idx = int(blk_part.replace("blk", ""))
+                if structure["layers"] is not None and idx < len(structure["layers"]):
+                    layer = structure["layers"][idx]
+                    mlp = layer.mlp if hasattr(layer, "mlp") else layer
+                    proj_layer = _get_proj_layer(mlp, proj_type)
+            except (ValueError, IndexError):
+                pass
+
+        if proj_layer is None:
+            print(f"Warning: Could not find layer for {layer_name}, skipping")
             continue
 
         # Apply treatment
@@ -801,6 +976,32 @@ def apply_kfac_treatment(
     return treatment_stats
 
 
+def _get_proj_layer(mlp: nn.Module, proj_type: str) -> Optional[nn.Module]:
+    """Get projection layer from MLP module."""
+    if proj_type == "gate" and hasattr(mlp, "gate_proj"):
+        return mlp.gate_proj
+    elif proj_type == "up" and hasattr(mlp, "up_proj"):
+        return mlp.up_proj
+    elif proj_type == "down" and hasattr(mlp, "down_proj"):
+        return mlp.down_proj
+    elif proj_type == "gate_up" and hasattr(mlp, "gate_up_proj"):
+        return mlp.gate_up_proj
+    elif proj_type == "c_fc" and hasattr(mlp, "c_fc"):
+        return mlp.c_fc
+    elif proj_type == "c_proj" and hasattr(mlp, "c_proj"):
+        return mlp.c_proj
+    return None
+
+
+# Alias for backward compatibility
+def apply_kfac_treatment(
+    model: nn.Module,
+    factors: Dict[str, Dict[str, torch.Tensor]],
+    config: KFACConfig,
+) -> Dict[str, Any]:
+    return apply_kfac_treatment_split_model(model, factors, config)
+
+
 # ============================================================================
 # Evaluation
 # ============================================================================
@@ -812,18 +1013,7 @@ def evaluate_model(
     config: KFACConfig,
     description: str = "Evaluation",
 ) -> Dict[str, float]:
-    """
-    Evaluate model perplexity.
-
-    Args:
-        model: The language model.
-        dataloader: DataLoader for evaluation.
-        config: KFACConfig.
-        description: Description for progress bar.
-
-    Returns:
-        Dictionary with evaluation metrics.
-    """
+    """Evaluate model perplexity."""
     model.eval()
 
     total_loss = 0.0
@@ -871,30 +1061,31 @@ def evaluate_model(
 # ============================================================================
 
 
-def run_collection(config: KFACConfig):
+def run_collection(config: KFACConfig, model: nn.Module = None, tokenizer=None):
     """Run K-FAC factor collection."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    if model is None:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    print("Loading model and tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.model_name_or_path,
-        trust_remote_code=config.trust_remote_code,
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        print("Loading model and tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.model_name_or_path,
+            trust_remote_code=config.trust_remote_code,
+        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_name_or_path,
-        torch_dtype=getattr(torch, config.dtype),
-        device_map=config.device,
-        trust_remote_code=config.trust_remote_code,
-    )
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_name_or_path,
+            torch_dtype=getattr(torch, config.dtype),
+            device_map=config.device,
+            trust_remote_code=config.trust_remote_code,
+        )
 
     print("Creating dataloader...")
     dataloader = create_dataloader(config, tokenizer)
 
     # Collect factors
-    factors = collect_kfac_factors(model, dataloader, config.target_layers, config)
+    factors = collect_kfac_factors_split_model(model, dataloader, config)
 
     # Save factors
     if config.save_factors:
@@ -915,24 +1106,25 @@ def run_analysis(factors_path: str, output_dir: str):
     return analysis
 
 
-def run_treatment(config: KFACConfig, factors_path: str):
+def run_treatment(config: KFACConfig, factors_path: str, model: nn.Module = None, tokenizer=None):
     """Run K-FAC treatment and evaluation."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    if model is None:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    print("Loading model and tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.model_name_or_path,
-        trust_remote_code=config.trust_remote_code,
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        print("Loading model and tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.model_name_or_path,
+            trust_remote_code=config.trust_remote_code,
+        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_name_or_path,
-        torch_dtype=getattr(torch, config.dtype),
-        device_map=config.device,
-        trust_remote_code=config.trust_remote_code,
-    )
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_name_or_path,
+            torch_dtype=getattr(torch, config.dtype),
+            device_map=config.device,
+            trust_remote_code=config.trust_remote_code,
+        )
 
     print("Loading factors...")
     factors = torch.load(factors_path, map_location="cpu")
@@ -946,11 +1138,11 @@ def run_treatment(config: KFACConfig, factors_path: str):
     print(f"  Perplexity: {metrics_before['perplexity']:.2f}")
 
     # Apply treatment
-    treatment_stats = apply_kfac_treatment(model, factors, config)
+    treatment_stats = apply_kfac_treatment_split_model(model, factors, config)
 
     # Evaluate after treatment
     print("\nEvaluating model AFTER treatment...")
-    dataloader = create_dataloader(config, tokenizer)  # Reset dataloader
+    dataloader = create_dataloader(config, tokenizer)
     metrics_after = evaluate_model(model, dataloader, config, "After Treatment")
     print(f"  Perplexity: {metrics_after['perplexity']:.2f}")
 
@@ -970,15 +1162,33 @@ def run_treatment(config: KFACConfig, factors_path: str):
     }
 
 
-def run_full_pipeline(config: KFACConfig):
+def run_full_pipeline(config: KFACConfig, model: nn.Module = None, tokenizer=None):
     """Run the complete K-FAC pipeline."""
     print(f"\n{'='*60}")
     print("FULL K-FAC PIPELINE")
     print(f"{'='*60}")
 
+    if model is None:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        print("Loading model and tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.model_name_or_path,
+            trust_remote_code=config.trust_remote_code,
+        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_name_or_path,
+            torch_dtype=getattr(torch, config.dtype),
+            device_map=config.device,
+            trust_remote_code=config.trust_remote_code,
+        )
+
     # Step 1: Collect factors
     print("\n[Step 1/4] Collecting K-FAC factors...")
-    factors = run_collection(config)
+    factors = run_collection(config, model, tokenizer)
 
     # Step 2: Analyze factors
     print("\n[Step 2/4] Analyzing K-FAC factors...")
@@ -988,7 +1198,7 @@ def run_full_pipeline(config: KFACConfig):
     # Step 3: Apply treatment and evaluate
     print("\n[Step 3/4] Applying K-FAC treatment...")
     factors_path = os.path.join(config.output_dir, "kfac_factors.pt")
-    results = run_treatment(config, factors_path)
+    results = run_treatment(config, factors_path, model, tokenizer)
 
     # Step 4: Save results
     print("\n[Step 4/4] Saving results...")
@@ -996,7 +1206,7 @@ def run_full_pipeline(config: KFACConfig):
     with open(results_path, "w") as f:
         json.dump(
             {
-                "config": vars(config),
+                "config": {k: v for k, v in vars(config).items() if not k.startswith("_")},
                 "treatment_stats": results["treatment_stats"],
                 "metrics_before": results["metrics_before"],
                 "metrics_after": results["metrics_after"],
@@ -1031,7 +1241,10 @@ def parse_args():
     # Collect command
     collect_parser = subparsers.add_parser("collect", help="Collect K-FAC factors")
     collect_parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-hf")
-    collect_parser.add_argument("--layers", type=int, nargs="+", default=[20, 24, 28, 31])
+    collect_parser.add_argument("--layers", type=int, nargs="+", default=[0, 1, 2, 3])
+    collect_parser.add_argument("--layer_group", type=str, default="auto",
+                                choices=["auto", "8b", "70b", "adapter", "all"],
+                                help="Layer group for CustomSplitLLamaModel")
     collect_parser.add_argument("--output_dir", type=str, default="./kfac_output")
     collect_parser.add_argument("--batch_size", type=int, default=4)
     collect_parser.add_argument("--seq_length", type=int, default=512)
@@ -1059,7 +1272,9 @@ def parse_args():
     # Full pipeline command
     full_parser = subparsers.add_parser("full", help="Run full pipeline")
     full_parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-hf")
-    full_parser.add_argument("--layers", type=int, nargs="+", default=[20, 24, 28, 31])
+    full_parser.add_argument("--layers", type=int, nargs="+", default=[0, 1, 2, 3])
+    full_parser.add_argument("--layer_group", type=str, default="auto",
+                             choices=["auto", "8b", "70b", "adapter", "all"])
     full_parser.add_argument("--output_dir", type=str, default="./kfac_pipeline")
     full_parser.add_argument("--batch_size", type=int, default=4)
     full_parser.add_argument("--seq_length", type=int, default=512)
@@ -1079,6 +1294,7 @@ def main():
         config = KFACConfig(
             model_name_or_path=args.model,
             target_layers=args.layers,
+            layer_group=args.layer_group,
             output_dir=args.output_dir,
             batch_size=args.batch_size,
             seq_length=args.seq_length,
@@ -1108,6 +1324,7 @@ def main():
         config = KFACConfig(
             model_name_or_path=args.model,
             target_layers=args.layers,
+            layer_group=args.layer_group,
             output_dir=args.output_dir,
             batch_size=args.batch_size,
             seq_length=args.seq_length,
