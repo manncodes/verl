@@ -1,0 +1,68 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# Data configuration
+data:
+  train_files: ~/data/natural_plan/train.parquet
+  val_files: ~/data/natural_plan/test.parquet
+  train_batch_size: 128
+  val_batch_size: 128
+  gen_batch_size: ${data.train_batch_size}
+  max_prompt_length: 2048
+  max_response_length: 1024
+  reward_fn_key: data_source
+
+# Custom reward function
+custom_reward_function:
+  path: recipe/natural_plan/reward_fn.py
+  name: compute_score
+
+# Reward model configuration
+reward_model:
+  reward_manager: naive
+  enable: True
+
+# GRPO-style algorithm (no critic)
+algorithm:
+  adv_estimator: grpo
+  kl_ctrl:
+    kl_coef: 0.0  # No KL penalty in GRPO
+  gamma: 1.0
+  lam: 1.0
+
+# Actor settings for GRPO
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen2.5-7B-Instruct
+  actor:
+    optim:
+      lr: 5e-7
+      weight_decay: 0.01
+    ppo_mini_batch_size: 32
+    ppo_epochs: 1
+    clip_ratio: 0.2
+  rollout:
+    n: 8  # Generate 8 responses per prompt for GRPO
+    temperature: 0.8
+    top_p: 0.95
+  ref:
+    log_prob_micro_batch_size: 32
+
+# No critic for GRPO
+critic:
+  enable: False
+
+# Trainer settings
+trainer:
+  project_name: verl-natural-plan-grpo
+  experiment_name: natural_plan_grpo
+  total_epochs: 10
+  save_freq: 1
+  test_freq: 1
+  logger:
+    - wandb

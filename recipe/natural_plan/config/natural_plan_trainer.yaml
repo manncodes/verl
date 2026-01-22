@@ -1,0 +1,75 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# Data configuration
+data:
+  train_files: ~/data/natural_plan/train.parquet
+  val_files: ~/data/natural_plan/test.parquet
+  train_batch_size: 256
+  val_batch_size: 256
+  gen_batch_size: ${data.train_batch_size}
+  max_prompt_length: 2048
+  max_response_length: 1024
+  reward_fn_key: data_source  # Route reward by task type
+
+# Custom reward function
+custom_reward_function:
+  path: recipe/natural_plan/reward_fn.py
+  name: compute_score
+
+# Reward model configuration
+reward_model:
+  reward_manager: naive
+  enable: True
+
+# Algorithm settings
+algorithm:
+  kl_ctrl:
+    kl_coef: 0.02
+  adv_estimator: gae
+  gamma: 1.0
+  lam: 0.95
+
+# Actor (policy) settings
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen2.5-7B-Instruct
+  actor:
+    optim:
+      lr: 1e-6
+      weight_decay: 0.01
+    ppo_mini_batch_size: 64
+    ppo_epochs: 1
+    clip_ratio: 0.2
+  rollout:
+    temperature: 0.7
+    top_p: 0.9
+    top_k: 50
+  ref:
+    log_prob_micro_batch_size: 64
+
+# Critic settings
+critic:
+  model:
+    path: Qwen/Qwen2.5-7B-Instruct
+  optim:
+    lr: 1e-5
+    weight_decay: 0.01
+  ppo_mini_batch_size: 64
+  ppo_epochs: 1
+  cliprange_value: 0.2
+
+# Trainer settings
+trainer:
+  project_name: verl-natural-plan
+  experiment_name: natural_plan_rlvr
+  total_epochs: 10
+  save_freq: 1
+  test_freq: 1
+  logger:
+    - wandb
