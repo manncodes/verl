@@ -19,9 +19,12 @@ three Natural Plan tasks: Calendar Scheduling, Meeting Planning, and Trip Planni
 
 The reward function is deterministic and verifiable - it extracts structured
 answers from model responses and compares them against ground truth.
+
+Supports both batch interface (for BatchRewardManager) and single-item interface
+(for NaiveRewardManager and DAPORewardManager).
 """
 
-from typing import Optional
+from typing import Optional, Union
 
 from recipe.natural_plan.tasks.calendar_scheduling import (
     compute_score as calendar_compute_score,
@@ -47,42 +50,119 @@ from recipe.natural_plan.tasks.trip_planning import (
 )
 
 
-def compute_score(
+def _compute_single_score(
     data_source: str,
     solution_str: str,
     ground_truth: dict,
     extra_info: Optional[dict] = None,
-    **kwargs
 ) -> float:
+    """
+    Compute reward score for a single Natural Plan instance.
+
+    Args:
+        data_source: Task identifier
+        solution_str: Model's response string
+        ground_truth: Dict containing task-specific ground truth
+        extra_info: Optional dict with full instance info
+
+    Returns:
+        Float score, typically 0.0 or 1.0
+    """
+    if ground_truth is None:
+        return 0.0
+
+    try:
+        if "calendar" in data_source.lower():
+            return calendar_compute_score(solution_str, ground_truth, extra_info)
+        elif "meeting" in data_source.lower():
+            return meeting_compute_score(solution_str, ground_truth, extra_info)
+        elif "trip" in data_source.lower():
+            return trip_compute_score(solution_str, ground_truth, extra_info)
+        else:
+            # Default: try all parsers
+            score = calendar_compute_score(solution_str, ground_truth, extra_info)
+            if score > 0:
+                return score
+            score = meeting_compute_score(solution_str, ground_truth, extra_info)
+            if score > 0:
+                return score
+            return trip_compute_score(solution_str, ground_truth, extra_info)
+    except Exception as e:
+        print(f"Error computing score for {data_source}: {e}")
+        return 0.0
+
+
+def compute_score(
+    # Batch interface (used by BatchRewardManager)
+    data_sources: Optional[list] = None,
+    solution_strs: Optional[list] = None,
+    ground_truths: Optional[list] = None,
+    extra_infos: Optional[list] = None,
+    # Single-item interface (used by NaiveRewardManager, DAPORewardManager)
+    data_source: Optional[str] = None,
+    solution_str: Optional[str] = None,
+    ground_truth: Optional[dict] = None,
+    extra_info: Optional[dict] = None,
+    **kwargs
+) -> Union[float, list[float]]:
     """
     Compute reward score for Natural Plan tasks.
 
-    This is the main entry point for the reward function, compatible with
-    verl's reward manager interface.
+    Supports both batch and single-item interfaces for compatibility with
+    different verl reward managers.
 
-    Args:
-        data_source: Task identifier, one of:
-            - "natural_plan/calendar_scheduling"
-            - "natural_plan/meeting_planning"
-            - "natural_plan/trip_planning"
+    Batch interface (BatchRewardManager):
+        data_sources: List of task identifiers
+        solution_strs: List of model responses
+        ground_truths: List of ground truth dicts
+        extra_infos: List of extra info dicts
+
+    Single-item interface (NaiveRewardManager, DAPORewardManager):
+        data_source: Task identifier
         solution_str: Model's response string
-        ground_truth: Dict containing task-specific ground truth:
-            - Calendar: {"day": str, "start": float, "end": float}
-            - Meeting: {"solution_score": int}
-            - Trip: {"solution_cities": list, "solution_durations": list}
-        extra_info: Optional dict with full instance info for detailed validation
+        ground_truth: Ground truth dict
+        extra_info: Extra info dict
 
     Returns:
-        Float score, typically 0.0 or 1.0 for exact match tasks
+        For batch: List of float scores
+        For single: Float score
     """
-    if "calendar" in data_source.lower():
-        return calendar_compute_score(solution_str, ground_truth, extra_info)
-    elif "meeting" in data_source.lower():
-        return meeting_compute_score(solution_str, ground_truth, extra_info)
-    elif "trip" in data_source.lower():
-        return trip_compute_score(solution_str, ground_truth, extra_info)
+    # Detect which interface is being used
+    if data_sources is not None:
+        # Batch interface
+        n = len(data_sources)
+        if solution_strs is None:
+            solution_strs = [""] * n
+        if ground_truths is None:
+            ground_truths = [None] * n
+        if extra_infos is None:
+            extra_infos = [None] * n
+
+        scores = []
+        for i in range(n):
+            score = _compute_single_score(
+                data_source=data_sources[i],
+                solution_str=solution_strs[i],
+                ground_truth=ground_truths[i],
+                extra_info=extra_infos[i],
+            )
+            scores.append(score)
+        return scores
+
+    elif data_source is not None:
+        # Single-item interface
+        return _compute_single_score(
+            data_source=data_source,
+            solution_str=solution_str or "",
+            ground_truth=ground_truth or {},
+            extra_info=extra_info,
+        )
+
     else:
-        raise ValueError(f"Unknown data source: {data_source}")
+        raise ValueError(
+            "Must provide either batch arguments (data_sources, solution_strs, ...) "
+            "or single-item arguments (data_source, solution_str, ...)"
+        )
 
 
 def compute_score_with_details(
