@@ -383,8 +383,8 @@ python3 -m recipe.fully_async_policy.fully_async_main \
     async_training.use_rollout_log_probs="$USE_ROLLOUT_LOG_PROBS" \
     \
     `# === Ray Runtime Environment (propagate env vars to workers) ===` \
-    +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_USE_V1=1 \
-    +ray_kwargs.ray_init.runtime_env.env_vars.HYDRA_FULL_ERROR=1 \
+    '+ray_kwargs.ray_init.runtime_env.env_vars.VLLM_USE_V1="1"' \
+    '+ray_kwargs.ray_init.runtime_env.env_vars.HYDRA_FULL_ERROR="1"' \
     \
     `# === Additional Hydra Overrides ===` \
     "${@:2}"
