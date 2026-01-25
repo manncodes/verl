@@ -32,6 +32,36 @@ export LANG=C
 set -euo pipefail
 
 # =============================================================================
+# IMPORTANT: CHANGE TO VERL ROOT DIRECTORY
+# =============================================================================
+# The fully_async_policy recipe uses relative hydra config paths that require
+# running from the verl root directory. Auto-detect and change to it.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Find verl root directory (contains verl/ and recipe/ directories)
+find_verl_root() {
+    local dir="$1"
+    while [[ "$dir" != "/" ]]; do
+        if [[ -d "$dir/verl" && -d "$dir/recipe" && -f "$dir/pyproject.toml" ]]; then
+            echo "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
+VERL_ROOT="${VERL_ROOT:-$(find_verl_root "$SCRIPT_DIR")}"
+if [[ -z "$VERL_ROOT" || ! -d "$VERL_ROOT/recipe/fully_async_policy" ]]; then
+    echo "[ERROR] Cannot find verl root directory. Set VERL_ROOT environment variable."
+    exit 1
+fi
+
+echo "[INFO] Changing to verl root directory: $VERL_ROOT"
+cd "$VERL_ROOT"
+
+# =============================================================================
 # WANDB SETUP
 # =============================================================================
 
@@ -281,6 +311,7 @@ python3 -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.grad_clip="$GRAD_CLIP" \
     actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.use_torch_compile="$USE_TORCH_COMPILE" \
+    critic.strategy=fsdp2 \
     \
     `# === Actor FSDP Configuration ===` \
     actor_rollout_ref.actor.fsdp_config.dtype="$FSDP_DTYPE" \
