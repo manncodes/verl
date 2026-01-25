@@ -98,6 +98,13 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
         Returns:
             list[AgentLoopOutput]: List of agent loop outputs, one per sample in the batch.
         """
+        # Guard against empty batches which would cause torch.cat() to fail in _postprocess
+        if len(batch) == 0:
+            raise ValueError(
+                "Empty batch received in generate_sequences_no_post. "
+                "This may indicate a data loading issue or incorrect batch configuration."
+            )
+
         config = self.config.actor_rollout_ref.rollout
         sampling_params = dict(
             temperature=config.temperature,
@@ -325,3 +332,42 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
     async def clear_kv_cache(self):
         await asyncio.gather(*[replica.clear_kv_cache() for replica in self.rollout_replicas])
+
+    def generate_sequences(self, prompts: DataProto) -> DataProto:
+        """Override base class to properly handle async wake_up/sleep methods.
+
+        The base class AgentLoopManager.generate_sequences() calls self.wake_up() and
+        self.sleep() synchronously, but FullyAsyncAgentLoopManager overrides these as
+        async methods. This override ensures they are properly awaited.
+        """
+
+        async def _async_wake_up():
+            await self.wake_up()
+            if self.reward_model_manager:
+                self.reward_model_manager.wake_up()
+
+        async def _async_sleep():
+            await self.sleep()
+            if self.reward_model_manager:
+                self.reward_model_manager.sleep()
+
+        # Wake up replicas before generation
+        asyncio.get_event_loop().run_until_complete(_async_wake_up())
+
+        # Dispatch work to agent loop workers (same as base class)
+        chunkes = prompts.chunk(len(self.agent_loop_workers))
+        outputs = ray.get([
+            worker.generate_sequences.remote(chunk)
+            for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+        ])
+        output = DataProto.concat(outputs)
+
+        # Sleep replicas after generation
+        asyncio.get_event_loop().run_until_complete(_async_sleep())
+
+        # Calculate performance metrics (same as base class)
+        metrics = [o.meta_info.pop("metrics") for o in outputs]
+        timing = self._performance_metrics(metrics, output)
+        output.meta_info = {"timing": timing, **outputs[0].meta_info}
+
+        return output
