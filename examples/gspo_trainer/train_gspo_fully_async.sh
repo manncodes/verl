@@ -235,7 +235,7 @@ LOG_VAL_GENERATIONS=100
 
 SANDBOX_FUSION_URL="http://sandbox-fusion-code-rl-service.llm-pretraining.svc.cluster.local:8080/run_code"
 REWARD_FUNCTION_PATH="/fsxp2/qpn744/rl/verl/verl/utils/reward_score/dolci_think_rl_v2.py"
-REWARD_FUNCTION_NAME="compute_score_batch"
+REWARD_FUNCTION_NAME="compute_score"
 
 # =============================================================================
 # ENVIRONMENT SETUP
@@ -354,7 +354,7 @@ python3 -m recipe.fully_async_policy.fully_async_main \
     \
     `# === Reward Model Configuration ===` \
     reward_model.sandbox_fusion.url="$SANDBOX_FUSION_URL" \
-    reward_model.reward_manager=batch \
+    reward_model.reward_manager=naive \
     custom_reward_function.path="$REWARD_FUNCTION_PATH" \
     custom_reward_function.name="$REWARD_FUNCTION_NAME" \
     \
