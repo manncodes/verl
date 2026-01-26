@@ -443,7 +443,12 @@ def compute_score(solution_str: str, ground_truth: dict, extra_info: dict = None
     """
     Compute reward score for calendar scheduling task.
 
-    This is the main entry point for the reward function.
+    Validates that:
+    1. The proposed slot has the correct duration
+    2. The proposed slot doesn't conflict with any participant's busy slots
+
+    This allows multiple valid solutions - any time slot where all participants
+    are available receives full credit.
 
     Args:
         solution_str: Model's response
@@ -458,25 +463,33 @@ def compute_score(solution_str: str, ground_truth: dict, extra_info: dict = None
     if parsed is None:
         return 0.0
 
-    # Extract expected solution
+    # Extract expected duration
+    expected_duration = ground_truth["end"] - ground_truth["start"]
+    actual_duration = parsed.end_hour - parsed.start_hour
+
+    # Check 1: Duration must match
+    if abs(actual_duration - expected_duration) > 0.01:
+        return 0.0
+
+    # Check 2: Verify slot is valid (doesn't conflict with busy slots)
+    if extra_info and "participants" in extra_info:
+        for p in extra_info["participants"]:
+            for busy in p.get("busy_slots", []):
+                busy_slot = TimeSlot(busy["day"], busy["start"], busy["end"])
+                if parsed.overlaps(busy_slot):
+                    return 0.0  # Conflicts with a busy slot
+        # All participants available - valid solution!
+        return 1.0
+
+    # No extra_info available - fall back to exact match
     expected_day = ground_truth["day"]
     expected_start = ground_truth["start"]
     expected_end = ground_truth["end"]
 
-    # Check exact match
     if (parsed.day == expected_day and
         abs(parsed.start_hour - expected_start) < 0.01 and
         abs(parsed.end_hour - expected_end) < 0.01):
         return 1.0
-
-    # If we have extra_info with full instance, check if response is valid (alternative solution)
-    if extra_info and "participants" in extra_info:
-        # Reconstruct participants to check validity
-        duration = ground_truth["end"] - ground_truth["start"]
-        if abs((parsed.end_hour - parsed.start_hour) - duration) < 0.01:
-            # Duration matches, could be alternative valid solution
-            # For strict verification, still return 0 if not exact match
-            pass
 
     return 0.0
 

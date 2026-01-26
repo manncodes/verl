@@ -581,6 +581,13 @@ def compute_score(solution_str: str, ground_truth: dict, extra_info: dict = None
     """
     Compute reward score for trip planning task.
 
+    Validates that:
+    1. All required cities are visited with correct durations
+    2. All constraints are satisfied (ordering, consecutiveness, etc.)
+
+    This allows multiple valid solutions - any ordering that satisfies
+    all constraints receives full credit.
+
     Args:
         solution_str: Model's response
         ground_truth: Dict containing solution_cities and solution_durations
@@ -604,11 +611,31 @@ def compute_score(solution_str: str, ground_truth: dict, extra_info: dict = None
     expected_durations = ground_truth["solution_durations"]
     actual_cities = [normalize(c) for c in parsed_cities]
 
-    # Exact match required
-    if actual_cities == expected_cities and parsed_durations == expected_durations:
-        return 1.0
+    # Check 1: All cities present (order doesn't matter)
+    if sorted(actual_cities) != sorted(expected_cities):
+        return 0.0
 
-    return 0.0
+    # Check 2: Each city has correct duration
+    expected_duration_map = dict(zip(expected_cities, expected_durations))
+    actual_duration_map = dict(zip(actual_cities, parsed_durations))
+
+    for city, expected_dur in expected_duration_map.items():
+        if actual_duration_map.get(city) != expected_dur:
+            return 0.0
+
+    # Check 3: All constraints satisfied (if provided)
+    if extra_info and "constraints" in extra_info:
+        for constraint_dict in extra_info["constraints"]:
+            constraint = TripConstraint(
+                constraint_type=constraint_dict["type"],
+                city1=constraint_dict["city1"],
+                city2=constraint_dict.get("city2"),
+                value=constraint_dict.get("value")
+            )
+            if not constraint.is_satisfied(parsed_cities, parsed_durations):
+                return 0.0
+
+    return 1.0
 
 
 if __name__ == "__main__":
