@@ -420,6 +420,35 @@ class TripPlanningTask:
         return [self.generate(num_cities, region) for _ in range(n)]
 
 
+def _consolidate_consecutive_cities(cities: list[str], durations: list[int]) -> tuple[list[str], list[int]]:
+    """Consolidate consecutive entries for the same city."""
+    if not cities:
+        return cities, durations
+
+    consolidated_cities = []
+    consolidated_durations = []
+
+    current_city = cities[0]
+    current_duration = durations[0]
+
+    for i in range(1, len(cities)):
+        if cities[i].lower() == current_city.lower():
+            # Same city, add duration
+            current_duration += durations[i]
+        else:
+            # Different city, save current and start new
+            consolidated_cities.append(current_city)
+            consolidated_durations.append(current_duration)
+            current_city = cities[i]
+            current_duration = durations[i]
+
+    # Don't forget the last city
+    consolidated_cities.append(current_city)
+    consolidated_durations.append(current_duration)
+
+    return consolidated_cities, consolidated_durations
+
+
 def parse_trip_response(response: str) -> Optional[tuple[list[str], list[int]]]:
     """
     Parse a trip planning response to extract the itinerary.
@@ -447,7 +476,8 @@ def parse_trip_response(response: str) -> Optional[tuple[list[str], list[int]]]:
         durations.append(duration)
 
     if cities:
-        return cities, durations
+        # Consolidate consecutive same-city entries (e.g., Day 1: Paris, Day 2: Paris -> Paris: 2 days)
+        return _consolidate_consecutive_cities(cities, durations)
 
     # Pattern 2: "City (N days)" or "City: N days"
     pattern2 = r"([A-Za-z][A-Za-z\s]+?)\s*[\(:]?\s*(\d+)\s*days?\s*[\)]?"
