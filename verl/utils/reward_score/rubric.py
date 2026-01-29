@@ -499,19 +499,24 @@ def compute_score_batch(
         results = judge.compute_rewards(prompts, solution_strs, references)
         # Build return dicts with only numeric values that can be averaged
         # VERL's metric_utils.py tries np.mean() on all extra_info fields
+        # IMPORTANT: All dicts must have the same keys to avoid length mismatch errors
         reward_dicts = []
         for r in results:
             d = {
                 "score": r.reward,
                 "elapsed_ms": r.elapsed_ms,
                 "retries": r.retries,
-                "success": 1 if r.success else 0,  # Convert bool to int for averaging
+                "success": 1 if r.success else 0,
+                # Always include these fields with defaults to ensure consistent dict keys
+                "overall_score": 0.0,
+                "usefulness_score": 0,
+                "efficiency_score": 0,
+                "presentation_score": 0,
             }
-            # Add criterion scores as separate numeric fields for tracking
+            # Override with actual values if evaluation succeeded
             if r.evaluation is not None:
                 d["overall_score"] = r.evaluation.overall_score
                 for cs in r.evaluation.criterion_scores:
-                    # e.g. "usefulness_score", "efficiency_score", "presentation_score"
                     key = cs.criterion.lower().replace(" ", "_") + "_score"
                     d[key] = cs.score
             reward_dicts.append(d)
