@@ -443,14 +443,15 @@ def _get_judge() -> RubricJudge:
 
 
 def _extract_prompts(
-    extra_infos: Optional[List[dict]],
-    data_sources: Optional[List[str]],
+    extra_infos,  # Can be list, numpy array, or None
+    data_sources,  # Can be list, numpy array, or None
     num_samples: int,
 ) -> List[str]:
-    """Extract prompts from extra_infos (list of dicts) with fallback."""
+    """Extract prompts from extra_infos (list/array of dicts) with fallback."""
     PROMPT_KEYS = ["prompt", "original_prompt", "question", "instruction", "input"]
 
-    if extra_infos and len(extra_infos) > 0:
+    # Handle numpy arrays and lists - check length directly to avoid numpy truth ambiguity
+    if extra_infos is not None and len(extra_infos) > 0:
         first_info = extra_infos[0] if isinstance(extra_infos[0], dict) else {}
         for key in PROMPT_KEYS:
             if key in first_info:
@@ -465,8 +466,8 @@ def _extract_prompts(
                     prompts.append(str(prompt) if prompt else "")
                 return prompts
 
-    if data_sources and len(data_sources) == num_samples:
-        return list(data_sources)
+    if data_sources is not None and len(data_sources) == num_samples:
+        return [str(s) for s in data_sources]
 
     print("[WARNING] No prompts found in extra_infos. Using empty prompts.")
     return [""] * num_samples
@@ -489,8 +490,9 @@ def compute_score_batch(
 
     # Use ground_truths as references if they are all non-empty strings
     references = None
-    if ground_truths and all(isinstance(gt, str) and gt for gt in ground_truths):
-        references = ground_truths
+    if ground_truths is not None and len(ground_truths) > 0:
+        if all(isinstance(gt, str) and gt for gt in ground_truths):
+            references = list(ground_truths)
 
     try:
         judge = _get_judge()
