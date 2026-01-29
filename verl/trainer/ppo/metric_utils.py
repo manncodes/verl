@@ -266,6 +266,83 @@ def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> di
     }
 
 
+def compute_domain_metrics(batch: DataProto) -> dict[str, Any]:
+    """
+    Computes per-domain metrics for multi-domain training.
+
+    This function groups samples by their data_source (domain) and computes
+    statistics for each domain separately. Useful for tracking domain-specific
+    performance in multi-domain RL training.
+
+    Args:
+        batch: A DataProto object containing batch data with domain information
+               in non_tensor_batch["data_source"].
+
+    Returns:
+        A dictionary of per-domain metrics including:
+            - domain/{domain_name}/score/mean: Mean score for each domain
+            - domain/{domain_name}/reward/mean: Mean reward for each domain
+            - domain/{domain_name}/advantage/mean: Mean advantage for each domain
+            - domain/{domain_name}/sample_count: Number of samples per domain
+            - domain/{domain_name}/response_length/mean: Mean response length per domain
+    """
+    if "data_source" not in batch.non_tensor_batch:
+        return {}
+
+    data_sources = batch.non_tensor_batch["data_source"]
+    sequence_score = batch.batch["token_level_scores"].sum(-1)
+    sequence_reward = batch.batch["token_level_rewards"].sum(-1)
+
+    response_info = _compute_response_info(batch)
+    response_length = response_info["response_length"]
+
+    # Get advantages if available
+    advantages = batch.batch.get("advantages", None)
+    response_mask = batch.batch.get("response_mask", None)
+
+    # Group by domain
+    domain_metrics = {}
+    unique_domains = set(data_sources)
+
+    for domain in unique_domains:
+        # Create mask for this domain
+        domain_mask = np.array([d == domain for d in data_sources])
+        domain_indices = np.where(domain_mask)[0]
+
+        if len(domain_indices) == 0:
+            continue
+
+        # Compute domain-specific metrics
+        domain_scores = sequence_score[domain_indices]
+        domain_rewards = sequence_reward[domain_indices]
+        domain_response_lengths = response_length[domain_indices]
+
+        domain_name = str(domain).replace("/", "_")  # Sanitize for metric names
+
+        domain_metrics[f"domain/{domain_name}/score/mean"] = torch.mean(domain_scores).detach().item()
+        domain_metrics[f"domain/{domain_name}/score/max"] = torch.max(domain_scores).detach().item()
+        domain_metrics[f"domain/{domain_name}/score/min"] = torch.min(domain_scores).detach().item()
+
+        domain_metrics[f"domain/{domain_name}/reward/mean"] = torch.mean(domain_rewards).detach().item()
+        domain_metrics[f"domain/{domain_name}/reward/max"] = torch.max(domain_rewards).detach().item()
+        domain_metrics[f"domain/{domain_name}/reward/min"] = torch.min(domain_rewards).detach().item()
+
+        domain_metrics[f"domain/{domain_name}/sample_count"] = len(domain_indices)
+        domain_metrics[f"domain/{domain_name}/response_length/mean"] = torch.mean(domain_response_lengths).detach().item()
+
+        # Compute domain-specific advantage statistics if available
+        if advantages is not None and response_mask is not None:
+            domain_advantages = advantages[domain_indices]
+            domain_response_mask = response_mask[domain_indices].bool()
+
+            valid_adv = torch.masked_select(domain_advantages, domain_response_mask)
+            if valid_adv.numel() > 0:
+                domain_metrics[f"domain/{domain_name}/advantage/mean"] = torch.mean(valid_adv).detach().item()
+                domain_metrics[f"domain/{domain_name}/advantage/std"] = torch.std(valid_adv).detach().item()
+
+    return domain_metrics
+
+
 def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n_gpus: int) -> dict[str, Any]:
     """
     Computes throughput metrics for PPO training.

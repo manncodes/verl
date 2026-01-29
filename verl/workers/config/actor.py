@@ -159,6 +159,10 @@ class ActorConfig(BaseConfig):
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
 
+    # Gradient analysis configuration for multi-domain training
+    enable_gradient_analysis: bool = False  # Enable interference matrix and domain gradient logging
+    gradient_analysis_layer_pattern: Optional[str] = None  # Filter layers to analyze (e.g., "layers.")
+
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
     # batch_num_tokens: number of valid tokens in global batch

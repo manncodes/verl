@@ -19,6 +19,7 @@ Single Process Actor
 
 import logging
 import os
+from typing import Optional
 
 import torch
 from torch import nn
@@ -31,6 +32,7 @@ from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
+from verl.utils.gradient_analysis import GradientAnalyzer, GradientAnalysisResult
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
@@ -423,6 +425,11 @@ class DataParallelPPOActor(BasePPOActor):
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
+        # Include data_source for gradient analysis if available
+        has_data_source = "data_source" in data.non_tensor_batch.keys()
+        if has_data_source:
+            non_tensor_select_keys.append("data_source")
+
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
         # Split to make minibatch iterator for updating the actor
@@ -430,6 +437,17 @@ class DataParallelPPOActor(BasePPOActor):
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
+
+        # Initialize gradient analyzer for multi-domain gradient analysis
+        enable_gradient_analysis = self.config.get("enable_gradient_analysis", False) and has_data_source
+        gradient_analyzer: Optional[GradientAnalyzer] = None
+        if enable_gradient_analysis:
+            gradient_analyzer = GradientAnalyzer(
+                model=self.actor_module,
+                enabled=True,
+                layer_pattern=self.config.get("gradient_analysis_layer_pattern", None),
+                reduce_across_ranks=True,
+            )
 
         metrics = {}
         for _ in range(self.config.ppo_epochs):
@@ -543,11 +561,33 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss.backward()
 
+                    # Accumulate gradients per domain for interference analysis
+                    if gradient_analyzer is not None:
+                        # Get domains for this micro-batch
+                        micro_batch_domains = model_inputs.get("data_source", None)
+                        if micro_batch_domains is not None:
+                            # Convert to list if numpy array
+                            if hasattr(micro_batch_domains, "tolist"):
+                                micro_batch_domains = micro_batch_domains.tolist()
+                            gradient_analyzer.accumulate_domain_gradients(
+                                domains=micro_batch_domains,
+                                scale_factor=loss_scale_factor,
+                            )
+
                     micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+
+                # Compute and log gradient interference metrics for this mini-batch
+                if gradient_analyzer is not None:
+                    gradient_analysis_result = gradient_analyzer.compute_interference_matrix()
+                    gradient_metrics = gradient_analysis_result.to_metrics_dict()
+                    mini_batch_metrics.update(gradient_metrics)
+                    # Reset for next mini-batch
+                    gradient_analyzer.reset()
+
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics
