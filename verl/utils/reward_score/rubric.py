@@ -497,7 +497,27 @@ def compute_score_batch(
     try:
         judge = _get_judge()
         results = judge.compute_rewards(prompts, solution_strs, references)
-        return [{"score": r.reward, **asdict(r)} for r in results]
+        # Build return dicts with only serializable values (no Pydantic models)
+        reward_dicts = []
+        for r in results:
+            d = {
+                "score": r.reward,
+                "index": r.index,
+                "elapsed_ms": r.elapsed_ms,
+                "retries": r.retries,
+                "error": r.error,
+                "success": r.success,
+            }
+            # Add evaluation details if present (convert Pydantic to dict)
+            if r.evaluation is not None:
+                d["overall_feedback"] = r.evaluation.overall_feedback
+                d["overall_score"] = r.evaluation.overall_score
+                d["criterion_scores"] = [
+                    {"criterion": cs.criterion, "score": cs.score, "feedback": cs.feedback}
+                    for cs in r.evaluation.criterion_scores
+                ]
+            reward_dicts.append(d)
+        return reward_dicts
     except Exception as e:
         print(f"[ERROR] compute_score_batch failed: {e}")
         return [{"score": 0.0}] * num_samples
