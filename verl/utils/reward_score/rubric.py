@@ -497,28 +497,50 @@ def compute_score_batch(
     try:
         judge = _get_judge()
         results = judge.compute_rewards(prompts, solution_strs, references)
-        # Build return dicts with only numeric values that can be averaged
-        # VERL's metric_utils.py tries np.mean() on all extra_info fields
+
+        # Compute averages from successful evaluations to use as fallback for failed ones
+        successful = [r for r in results if r.evaluation is not None]
+        if successful:
+            avg_score = sum(r.reward for r in successful) / len(successful)
+            avg_overall = sum(r.evaluation.overall_score for r in successful) / len(successful)
+            # Compute per-criterion averages
+            criterion_sums = {}
+            for r in successful:
+                for cs in r.evaluation.criterion_scores:
+                    key = cs.criterion.lower().replace(" ", "_") + "_score"
+                    criterion_sums[key] = criterion_sums.get(key, 0) + cs.score
+            avg_criteria = {k: v / len(successful) for k, v in criterion_sums.items()}
+        else:
+            # All failed - use neutral defaults
+            avg_score = 0.5
+            avg_overall = 0.5
+            avg_criteria = {"usefulness_score": 2.5, "efficiency_score": 2.5, "presentation_score": 2.5}
+
+        # Build return dicts - use averages for failed evaluations
         # IMPORTANT: All dicts must have the same keys to avoid length mismatch errors
         reward_dicts = []
         for r in results:
-            d = {
-                "score": r.reward,
-                "elapsed_ms": r.elapsed_ms,
-                "retries": r.retries,
-                "success": 1 if r.success else 0,
-                # Always include these fields with defaults to ensure consistent dict keys
-                "overall_score": 0.0,
-                "usefulness_score": 0,
-                "efficiency_score": 0,
-                "presentation_score": 0,
-            }
-            # Override with actual values if evaluation succeeded
             if r.evaluation is not None:
-                d["overall_score"] = r.evaluation.overall_score
+                d = {
+                    "score": r.reward,
+                    "elapsed_ms": r.elapsed_ms,
+                    "retries": r.retries,
+                    "success": 1,
+                    "overall_score": r.evaluation.overall_score,
+                }
                 for cs in r.evaluation.criterion_scores:
                     key = cs.criterion.lower().replace(" ", "_") + "_score"
                     d[key] = cs.score
+            else:
+                # Failed evaluation - use batch averages as fallback
+                d = {
+                    "score": avg_score,
+                    "elapsed_ms": r.elapsed_ms,
+                    "retries": r.retries,
+                    "success": 0,
+                    "overall_score": avg_overall,
+                    **avg_criteria,
+                }
             reward_dicts.append(d)
         return reward_dicts
     except Exception as e:
