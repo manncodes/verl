@@ -497,25 +497,23 @@ def compute_score_batch(
     try:
         judge = _get_judge()
         results = judge.compute_rewards(prompts, solution_strs, references)
-        # Build return dicts with only serializable values (no Pydantic models)
+        # Build return dicts with only numeric values that can be averaged
+        # VERL's metric_utils.py tries np.mean() on all extra_info fields
         reward_dicts = []
         for r in results:
             d = {
                 "score": r.reward,
-                "index": r.index,
                 "elapsed_ms": r.elapsed_ms,
                 "retries": r.retries,
-                "error": r.error,
-                "success": r.success,
+                "success": 1 if r.success else 0,  # Convert bool to int for averaging
             }
-            # Add evaluation details if present (convert Pydantic to dict)
+            # Add criterion scores as separate numeric fields for tracking
             if r.evaluation is not None:
-                d["overall_feedback"] = r.evaluation.overall_feedback
                 d["overall_score"] = r.evaluation.overall_score
-                d["criterion_scores"] = [
-                    {"criterion": cs.criterion, "score": cs.score, "feedback": cs.feedback}
-                    for cs in r.evaluation.criterion_scores
-                ]
+                for cs in r.evaluation.criterion_scores:
+                    # e.g. "usefulness_score", "efficiency_score", "presentation_score"
+                    key = cs.criterion.lower().replace(" ", "_") + "_score"
+                    d[key] = cs.score
             reward_dicts.append(d)
         return reward_dicts
     except Exception as e:
