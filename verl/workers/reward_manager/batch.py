@@ -60,15 +60,6 @@ class BatchRewardManager(AbstractRewardManager):
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
             responses_str.append(response_str)
 
-        # Decode prompts and inject into extra_infos for reward functions that need them
-        prompts_str = []
-        for i in range(len(data)):
-            # Skip padding tokens when decoding prompts
-            prompt_attention = attention_mask[i, :prompt_len]
-            valid_prompt_ids = prompt_ids[i][prompt_attention.bool()]
-            prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
-            prompts_str.append(prompt_str)
-
         ground_truths = [item.non_tensor_batch["reward_model"].get("ground_truth", None) for item in data]
         data_sources = data.non_tensor_batch[self.reward_fn_key]
         rollout_reward_scores = data.non_tensor_batch.get("reward_scores", [{} for _ in range(len(data))])
@@ -76,10 +67,8 @@ class BatchRewardManager(AbstractRewardManager):
 
         for i in range(len(data)):
             extras[i]["rollout_reward_scores"] = rollout_reward_scores[i]
-            # Inject decoded prompt into extra_info if not already present
-            # This makes prompts available to custom reward functions
-            if "prompt" not in extras[i]:
-                extras[i]["prompt"] = prompts_str[i]
+            extras[i]["prompt"] = self.tokenizer.decode(data.batch["prompts"][i], skip_special_tokens=True)
+            extras[i]["validate"] = data.meta_info.get("validate", False)
 
         scores = self.compute_score(
             data_sources=data_sources,
