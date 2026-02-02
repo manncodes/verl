@@ -50,12 +50,18 @@ def default_compute_score(
 
         res = math_reward.compute_score(solution_str, ground_truth)
         # [Optional] Math-Verify Integration
-        # For enhanced accuracy, consider utilizing Math-Verify (https://github.com/huggingface/Math-Verify).
-        # Note: Math-Verify needs to be manually installed via pip: `pip install math-verify`.
-        # To use it, override the `compute_score` function with the following implementation:
+        # The built-in math_verify module provides enhanced accuracy with:
+        # - Multiple extraction strategies (boxed, patterns, heuristics)
+        # - Multiple comparison strategies (string, numeric, symbolic)
+        # - Detailed diagnostics for debugging reward signals
+        # To use it, override the `compute_score` function with:
 
-        # from . import math_verify
-        # res = math_verify.compute_score(solution_str, ground_truth)
+        # from .math_verify import compute_score as math_verify_compute_score
+        # res = math_verify_compute_score(solution_str, ground_truth)
+
+        # Or for the external HuggingFace Math-Verify package (pip install math-verify):
+        # from . import math_verify_external
+        # res = math_verify_external.compute_score(solution_str, ground_truth)
     elif data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
         from . import math_dapo
 
