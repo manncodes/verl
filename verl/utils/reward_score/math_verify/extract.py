@@ -174,26 +174,31 @@ def extract_last_number(text: str) -> ExtractionResult:
     Returns:
         ExtractionResult with the last number found or None
     """
-    # Pattern for various number formats
+    # Pattern for various number formats - order matters for overlapping matches
+    # More specific patterns should come later so they can override simpler ones
     number_patterns = [
         # LaTeX fractions: \frac{a}{b}
         r"\\frac\s*\{([^}]+)\}\s*\{([^}]+)\}",
         # Decimal/integer with optional negative: -123.456
         r"-?\d+\.?\d*",
-        # Scientific notation: 1.23e-4
-        r"-?\d+\.?\d*[eE][+-]?\d+",
-        # Simple fractions: 1/2
+        # Simple fractions: 1/2 (must come after simple integers)
         r"-?\d+/\d+",
+        # Scientific notation: 1.23e-4 (must come last - most specific)
+        r"-?\d+\.?\d*[eE][+-]?\d+",
     ]
 
     last_match = None
     last_pos = -1
+    last_len = 0
 
     for pattern in number_patterns:
         for match in re.finditer(pattern, text):
-            if match.end() > last_pos:
+            match_str = match.group(0)
+            # Prefer rightmost match, and for ties prefer longer match
+            if match.end() > last_pos or (match.end() == last_pos and len(match_str) > last_len):
                 last_pos = match.end()
-                last_match = match.group(0)
+                last_match = match_str
+                last_len = len(match_str)
 
     if last_match:
         return ExtractionResult(

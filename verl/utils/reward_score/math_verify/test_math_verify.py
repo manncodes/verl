@@ -422,7 +422,8 @@ class TestNumericComparison:
         assert result["match"]
 
     def test_no_tolerance_exceeded(self):
-        result = compare_numeric("0.333333", "0.333334", tolerance=1e-9)
+        # Must specify both tolerances to test strict absolute tolerance
+        result = compare_numeric("0.333333", "0.333334", tolerance=1e-9, relative_tolerance=1e-9)
         assert not result["match"]
 
     def test_fraction_to_decimal(self):
