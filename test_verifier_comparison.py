@@ -140,6 +140,17 @@ TEST_CASES = [
 
     # No boxed - should use pattern/fallback extraction
     ("The answer is: 42", "42", True),
+
+    # === NEW: Features from prime_math ===
+
+    # Thousands separator handling
+    (r"\boxed{1,000,000}", "1000000", True),
+
+    # Tuples/lists
+    (r"\boxed{(1, 2, 3)}", "(1, 2, 3)", True),
+
+    # Leading decimal normalization
+    (r"\boxed{.5}", "0.5", True),
 ]
 
 def test_our_verifier(solution, gt):

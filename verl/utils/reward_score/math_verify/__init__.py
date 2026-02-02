@@ -34,10 +34,16 @@ from verl.utils.reward_score.math_verify.compare import (
     compare_strings,
     compare_numeric,
     compare_symbolic,
+    compare_tuple_or_list,
+    compare_answers,
+    format_interval,
 )
 from verl.utils.reward_score.math_verify.normalize import (
     normalize_latex,
     NormalizationConfig,
+    normalize_for_numeric_comparison,
+    try_numeric_with_pi_variants,
+    normalize_answer_string,
 )
 
 __all__ = [
@@ -54,8 +60,14 @@ __all__ = [
     "compare_strings",
     "compare_numeric",
     "compare_symbolic",
+    "compare_tuple_or_list",
+    "compare_answers",
+    "format_interval",
     "normalize_latex",
     "NormalizationConfig",
+    "normalize_for_numeric_comparison",
+    "try_numeric_with_pi_variants",
+    "normalize_answer_string",
     "compute_score",
 ]
 

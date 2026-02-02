@@ -1,21 +1,81 @@
 # Copyright 2024
 # Licensed under the Apache License, Version 2.0
+# Incorporates normalization logic from prime_math (PRIME team, OpenAI prm800k, Hendrycks MATH)
 
 """
 LaTeX and mathematical expression normalization.
 
 This module provides configurable normalization for mathematical
 expressions to enable fair string comparison.
+
+Features incorporated from prime_math:
+- Unicode symbol conversion (√, π, ∞, etc.)
+- Unit stripping (degree, cm, meter, etc.)
+- Large number words (million, billion, trillion)
+- Mixed number handling (7 3/4 -> 7+3/4)
+- Pi normalization
 """
 
 from __future__ import annotations
 
+import math
 import re
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 
 logger = logging.getLogger(__name__)
+
+# Unicode to ASCII/LaTeX mappings (from prime_math)
+UNICODE_MAPPINGS = {
+    "√": "sqrt",
+    "π": "pi",
+    "∞": "inf",
+    "∪": "U",
+    "·": "*",
+    "×": "*",
+    "÷": "/",
+    "−": "-",  # Unicode minus
+    "–": "-",  # En dash
+    "—": "-",  # Em dash
+    "'": "'",
+    "'": "'",
+    """: '"',
+    """: '"',
+}
+
+# Units that can be stripped (from prime_math)
+UNITS_TO_STRIP = [
+    "degree", "degrees",
+    "cm", "centimeter", "centimeters",
+    "mm", "millimeter", "millimeters",
+    "m", "meter", "meters",
+    "km", "kilometer", "kilometers",
+    "mile", "miles",
+    "second", "seconds",
+    "minute", "minutes",
+    "hour", "hours",
+    "day", "days",
+    "week", "weeks",
+    "month", "months",
+    "year", "years",
+    "foot", "feet",
+    "inch", "inches",
+    "yard", "yards",
+    "liter", "liters",
+    "gallon", "gallons",
+    "pound", "pounds",
+    "ounce", "ounces",
+    "gram", "grams",
+    "kilogram", "kilograms",
+]
+
+# Large number words (from prime_math)
+LARGE_NUMBER_WORDS = {
+    "million": "*10^6",
+    "billion": "*10^9",
+    "trillion": "*10^12",
+}
 
 
 @dataclass
@@ -37,7 +97,7 @@ class NormalizationConfig:
     remove_text_wrappers: bool = True  # \text{foo} -> foo
     remove_mathrm: bool = True  # \mathrm{foo} -> foo
 
-    # Unit handling (be careful with this)
+    # Unit handling
     remove_units: bool = False
     unit_patterns: list[str] = field(default_factory=lambda: [
         r"\\text\{[a-zA-Z]+\}$",  # Trailing \text{units}
@@ -46,7 +106,18 @@ class NormalizationConfig:
 
     # Number normalization
     remove_thousands_separator: bool = True  # 1,000 -> 1000
-    normalize_decimals: bool = False  # Don't change 0.5 to .5 by default
+    normalize_decimals: bool = True  # .5 -> 0.5
+
+    # Advanced features (from prime_math)
+    convert_unicode: bool = True  # √ -> sqrt, π -> pi, etc.
+    handle_large_numbers: bool = True  # million -> *10^6
+    handle_mixed_numbers: bool = True  # 7 3/4 -> 7+3/4
+    remove_degree_symbol: bool = True  # Remove ^\circ
+    remove_percentage: bool = True  # Remove \% and %
+    remove_dollar_sign: bool = True  # Remove $ from currency
+    extract_from_equals: bool = True  # k = 5 -> 5 (short var prefix)
+    normalize_inverse_space: bool = True  # Remove \!
+    normalize_double_backslash: bool = True  # \\\\ -> \\
 
 
 def normalize_latex(
@@ -85,6 +156,42 @@ def normalize_latex(
     if config.strip_whitespace:
         result = result.strip()
 
+    # Convert Unicode symbols to ASCII equivalents (from prime_math)
+    if config.convert_unicode:
+        for unicode_char, replacement in UNICODE_MAPPINGS.items():
+            result = result.replace(unicode_char, replacement)
+
+    # Normalize double backslashes (from prime_math)
+    if config.normalize_double_backslash:
+        result = result.replace("\\\\", "\\")
+
+    # Remove inverse spaces \! (from prime_math)
+    if config.normalize_inverse_space:
+        result = result.replace("\\!", "")
+
+    # Remove dollar signs (currency, not math delimiters)
+    if config.remove_dollar_sign:
+        result = result.replace("\\$", "")
+        # Only remove standalone $ not used as math delimiters
+        if not (result.startswith("$") and result.endswith("$")):
+            result = result.replace("$", "")
+
+    # Remove percentage symbols
+    if config.remove_percentage:
+        result = result.replace("\\%", "")
+        result = result.replace("%", "")
+
+    # Handle large number words (from prime_math)
+    if config.handle_large_numbers:
+        for word, replacement in LARGE_NUMBER_WORDS.items():
+            result = result.replace(word, replacement)
+
+    # Remove degree symbol (from prime_math)
+    if config.remove_degree_symbol:
+        result = result.replace("^{\\circ}", "")
+        result = result.replace("^\\circ", "")
+        result = re.sub(r"\^ *\\circ", "", result)
+
     # Remove display/text style commands
     if config.remove_display_style:
         result = re.sub(r"\\displaystyle\s*", "", result)
@@ -97,11 +204,6 @@ def normalize_latex(
         result = result.replace("\\cfrac", "\\frac")
 
     # Expand fraction shorthand: \frac12 -> \frac{1}{2}
-    # This is tricky - we need to handle:
-    #   \frac12 -> \frac{1}{2}
-    #   \frac1{23} -> \frac{1}{23}
-    #   \frac{12}3 -> \frac{12}{3}
-    #   \frac{12}{34} -> unchanged
     if config.expand_frac_shorthand:
         result = _expand_frac_shorthand(result)
 
@@ -114,8 +216,12 @@ def normalize_latex(
         for cmd in ["\\left", "\\right", "\\big", "\\Big", "\\bigg", "\\Bigg"]:
             result = result.replace(cmd, "")
 
-    # Remove text wrappers
+    # Remove enclosing \text{} wrapper (from prime_math)
     if config.remove_text_wrappers:
+        m = re.search(r"^\\text\{(?P<text>.+?)\}$", result)
+        if m is not None:
+            result = m.group("text")
+        # Also handle inline text wrappers
         result = re.sub(r"\\text\{([^}]*)\}", r"\1", result)
         result = re.sub(r"\\textbf\{([^}]*)\}", r"\1", result)
         result = re.sub(r"\\textit\{([^}]*)\}", r"\1", result)
@@ -126,18 +232,41 @@ def normalize_latex(
         result = re.sub(r"\\mathbf\{([^}]*)\}", r"\1", result)
         result = re.sub(r"\\mathit\{([^}]*)\}", r"\1", result)
 
+    # Strip enclosing braces {} if present
+    if len(result) > 1 and result[0] == "{" and result[-1] == "}":
+        result = result[1:-1]
+
     # Remove units if configured
     if config.remove_units:
         for pattern in config.unit_patterns:
             result = re.sub(pattern, "", result, flags=re.IGNORECASE)
+        # Also strip common units (from prime_math)
+        for unit in UNITS_TO_STRIP:
+            result = re.sub(rf"{unit}(es)?(s)? *(\^[0-9]+)?", "", result, flags=re.IGNORECASE)
+
+    # Handle "or" and "and" in answers (from prime_math)
+    result = result.replace(" or ", " , ")
+    result = result.replace(" and ", " , ")
 
     # Normalize thousands separators
     if config.remove_thousands_separator:
-        # Match numbers with commas as thousand separators
-        result = re.sub(r"(\d),(\d{3})", r"\1\2", result)
-        # Repeat for numbers with multiple separators
-        while re.search(r"(\d),(\d{3})", result):
-            result = re.sub(r"(\d),(\d{3})", r"\1\2", result)
+        result = _strip_thousands_separators(result)
+
+    # Normalize decimals: .5 -> 0.5 (from prime_math)
+    if config.normalize_decimals:
+        result = result.replace(" .", " 0.")
+        result = result.replace("{.", "{0.")
+        if result.startswith("."):
+            result = "0" + result
+
+    # Extract value from short variable assignments: k = 5 -> 5 (from prime_math)
+    if config.extract_from_equals:
+        if len(result.split("=")) == 2 and len(result.split("=")[0].strip()) <= 2:
+            result = result.split("=")[1].strip()
+
+    # Handle mixed numbers: 7 3/4 -> 7+3/4 (from prime_math)
+    if config.handle_mixed_numbers:
+        result = _inject_implicit_mixed_number(result)
 
     # Collapse whitespace
     if config.collapse_whitespace:
@@ -150,6 +279,37 @@ def normalize_latex(
         result = result.strip()
 
     return result
+
+
+def _strip_thousands_separators(expr: str) -> str:
+    """
+    Strip properly formatted thousand separators from numbers.
+
+    Handles commas that are thousand separators (1,000,000) while
+    preserving commas in tuples and other contexts.
+
+    From prime_math.
+    """
+    # Pattern matches: digit, comma, exactly 3 digits, then end or non-digit
+    p1 = re.compile(r"(\d)(,)(\d\d\d)($|\D)")
+    while True:
+        next_expr = p1.sub(r"\1\3\4", expr)
+        if next_expr == expr:
+            break
+        expr = next_expr
+    return expr
+
+
+def _inject_implicit_mixed_number(expr: str) -> str:
+    """
+    Convert mixed numbers to addition form.
+
+    E.g., "7 3/4" -> "7+3/4"
+
+    From prime_math.
+    """
+    p1 = re.compile(r"([0-9]) +([0-9])")
+    return p1.sub(r"\1+\2", expr)
 
 
 def _expand_frac_shorthand(expr: str) -> str:
@@ -239,7 +399,10 @@ def _expand_sqrt_shorthand(expr: str) -> str:
     return result
 
 
-def normalize_for_numeric_comparison(expr: str) -> Optional[float]:
+def normalize_for_numeric_comparison(
+    expr: str,
+    pi_value: float = math.pi,
+) -> Optional[float]:
     """
     Attempt to convert an expression to a float for numeric comparison.
 
@@ -248,9 +411,12 @@ def normalize_for_numeric_comparison(expr: str) -> Optional[float]:
     - Fractions: 1/2, \\frac{1}{2}
     - Scientific notation: 1.5e-3
     - Percentages: 50% -> 0.5
+    - Pi expressions: 2\\pi -> 2*pi
+    - Thousands separators: 1,000 -> 1000
 
     Args:
         expr: The expression to convert
+        pi_value: Value to use for pi (default: math.pi, can use 3.14 for approx)
 
     Returns:
         Float value or None if conversion fails
@@ -258,18 +424,27 @@ def normalize_for_numeric_comparison(expr: str) -> Optional[float]:
     if not expr:
         return None
 
-    expr = expr.strip()
+    expr = str(expr).strip()
 
     # Remove LaTeX math delimiters
     expr = re.sub(r"^\$+|\$+$", "", expr)
     expr = re.sub(r"^\\+\(|\\+\)$", "", expr)
 
-    # Handle percentage
+    # Remove LaTeX percentage
+    expr = expr.replace("\\%", "")
+
+    # Handle percentage (do this before removing %)
     if expr.endswith("%"):
         try:
-            return float(expr[:-1]) / 100
+            return float(expr[:-1].replace(",", "")) / 100
         except ValueError:
             pass
+
+    # Strip thousands separators
+    expr = _strip_thousands_separators(expr)
+
+    # Handle pi expressions (from prime_math)
+    expr = _handle_pi_for_numeric(expr, pi_value)
 
     # Try direct float conversion
     try:
@@ -292,9 +467,12 @@ def normalize_for_numeric_comparison(expr: str) -> Optional[float]:
     latex_frac = re.match(r"^\\frac\{([^}]+)\}\{([^}]+)\}$", expr)
     if latex_frac:
         try:
-            num = float(latex_frac.group(1))
-            denom = float(latex_frac.group(2))
-            if denom != 0:
+            num_str = latex_frac.group(1)
+            denom_str = latex_frac.group(2)
+            # Recursively handle pi in numerator/denominator
+            num = normalize_for_numeric_comparison(num_str, pi_value)
+            denom = normalize_for_numeric_comparison(denom_str, pi_value)
+            if num is not None and denom is not None and denom != 0:
                 return num / denom
         except ValueError:
             pass
@@ -307,4 +485,116 @@ def normalize_for_numeric_comparison(expr: str) -> Optional[float]:
         except ValueError:
             pass
 
+    # Handle base notation: 123_8 means 123 in base 8, but we just take the number
+    if "_" in expr:
+        try:
+            base_part = expr.split("_")[0]
+            return float(base_part)
+        except ValueError:
+            pass
+
     return None
+
+
+def _handle_pi_for_numeric(expr: str, pi_value: float = math.pi) -> str:
+    """
+    Replace \\pi with numeric value for evaluation.
+
+    Handles cases like:
+    - "2\\pi" -> "2*3.14159..."
+    - "\\pi" -> "3.14159..."
+    - "\\pi/2" -> "3.14159.../2"
+
+    From prime_math.
+    """
+    if "\\pi" not in expr and "pi" not in expr.lower():
+        return expr
+
+    result = expr
+
+    # Replace \pi with pi_value
+    idx = result.find("\\pi")
+    while idx != -1:
+        if idx > 0 and (result[idx - 1].isdigit() or result[idx - 1] == ")"):
+            # Previous char is digit or ), insert multiplication
+            result = result[:idx] + f"*{pi_value}" + result[idx + 3:]
+        else:
+            # Just replace \pi
+            result = result[:idx] + f"{pi_value}" + result[idx + 3:]
+        idx = result.find("\\pi", idx + 1)
+
+    # Also handle plain "pi" (case insensitive)
+    result = re.sub(r"\bpi\b", str(pi_value), result, flags=re.IGNORECASE)
+
+    # Try to evaluate the expression
+    try:
+        # Safe evaluation of simple math expressions
+        result = str(eval(result, {"__builtins__": {}}, {"pi": pi_value}))
+    except Exception:
+        pass
+
+    return result
+
+
+def try_numeric_with_pi_variants(
+    pred: str,
+    gt: str,
+    tolerance: float = 1e-6,
+) -> Optional[bool]:
+    """
+    Try numeric comparison with different pi values.
+
+    Some problems expect exact pi, others expect 3.14 approximation.
+    Try both to be lenient.
+
+    From prime_math.
+
+    Args:
+        pred: Predicted value
+        gt: Ground truth value
+        tolerance: Numeric tolerance
+
+    Returns:
+        True if match found, False if no match, None if can't compare
+    """
+    pi_values = [math.pi, 3.14, 3.14159]
+
+    for pi_val in pi_values:
+        pred_num = normalize_for_numeric_comparison(pred, pi_val)
+        gt_num = normalize_for_numeric_comparison(gt, pi_val)
+
+        if pred_num is not None and gt_num is not None:
+            if abs(pred_num - gt_num) <= tolerance:
+                return True
+            # Also try relative tolerance
+            if gt_num != 0 and abs(pred_num - gt_num) / abs(gt_num) <= tolerance:
+                return True
+
+    return None
+
+
+def normalize_answer_string(answer: str) -> str:
+    """
+    Normalize an answer string for string comparison.
+
+    This applies all normalizations and is suitable for final
+    string-based comparison.
+
+    Args:
+        answer: The answer string to normalize
+
+    Returns:
+        Normalized answer string
+    """
+    config = NormalizationConfig(
+        remove_units=True,
+        normalize_decimals=True,
+    )
+    result = normalize_latex(answer, config)
+
+    # Additional normalization: lowercase for text answers
+    # Only if it contains letters and isn't LaTeX
+    if not "\\" in result and any(c.isalpha() for c in result):
+        result = result.lower()
+
+    return result
