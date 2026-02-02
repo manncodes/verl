@@ -31,6 +31,12 @@ from verl.utils.reward_score.math_verify.normalize import (
     normalize_for_numeric_comparison,
     try_numeric_with_pi_variants,
     _strip_thousands_separators,
+    normalize_set,
+    normalize_ratio,
+    simplify_ratio,
+    roman_to_int,
+    is_text_answer,
+    TEXT_ANSWER_ALIASES,
 )
 
 logger = logging.getLogger(__name__)
@@ -446,6 +452,235 @@ def format_interval(prediction: str) -> str:
     return prediction
 
 
+def compare_sets(pred: str, gt: str) -> dict:
+    """
+    Compare set expressions (order-independent).
+
+    Handles formats like:
+    - {1, 2, 3} vs {3, 2, 1}
+    - {2,3,5} vs {5,3,2}
+    - \\{a, b\\} vs \\{b, a\\}
+
+    Args:
+        pred: Predicted answer
+        gt: Ground truth answer
+
+    Returns:
+        Dict with 'match' bool and 'method'
+    """
+    pred_set = normalize_set(pred)
+    gt_set = normalize_set(gt)
+
+    if pred_set is None or gt_set is None:
+        return {"match": False, "method": ComparisonMethod.FAILED}
+
+    # Direct set comparison (order-independent)
+    if pred_set == gt_set:
+        return {
+            "match": True,
+            "method": ComparisonMethod.STRING_NORMALIZED,
+            "metadata": {"set_comparison": True},
+        }
+
+    # Try numeric comparison of elements
+    if len(pred_set) == len(gt_set):
+        pred_numeric = set()
+        gt_numeric = set()
+
+        for elem in pred_set:
+            val = normalize_for_numeric_comparison(elem)
+            pred_numeric.add(val if val is not None else elem)
+
+        for elem in gt_set:
+            val = normalize_for_numeric_comparison(elem)
+            gt_numeric.add(val if val is not None else elem)
+
+        if pred_numeric == gt_numeric:
+            return {
+                "match": True,
+                "method": ComparisonMethod.NUMERIC,
+                "metadata": {"set_comparison": True, "numeric_elements": True},
+            }
+
+    return {"match": False, "method": ComparisonMethod.FAILED}
+
+
+def compare_ratios(pred: str, gt: str, tolerance: float = 1e-6) -> dict:
+    """
+    Compare ratio expressions.
+
+    Handles formats like:
+    - 1:3 vs 1:3
+    - 2:6 vs 1:3 (equivalent ratios)
+    - 1:2:3 vs 2:4:6
+
+    Args:
+        pred: Predicted answer
+        gt: Ground truth answer
+        tolerance: Numeric tolerance for comparison
+
+    Returns:
+        Dict with 'match' bool and 'method'
+    """
+    pred_ratio = normalize_ratio(pred)
+    gt_ratio = normalize_ratio(gt)
+
+    if pred_ratio is None or gt_ratio is None:
+        return {"match": False, "method": ComparisonMethod.FAILED}
+
+    # Must have same number of parts
+    if len(pred_ratio) != len(gt_ratio):
+        return {"match": False, "method": ComparisonMethod.FAILED}
+
+    # Direct comparison
+    if pred_ratio == gt_ratio:
+        return {
+            "match": True,
+            "method": ComparisonMethod.NUMERIC,
+            "metadata": {"ratio_comparison": True},
+        }
+
+    # Try simplified comparison
+    pred_simplified = simplify_ratio(pred_ratio)
+    gt_simplified = simplify_ratio(gt_ratio)
+
+    if pred_simplified == gt_simplified:
+        return {
+            "match": True,
+            "method": ComparisonMethod.NUMERIC,
+            "metadata": {"ratio_comparison": True, "simplified": True},
+        }
+
+    # Try proportional comparison (all ratios between parts should be equal)
+    if all(isinstance(p, (int, float)) for p in pred_ratio) and \
+       all(isinstance(g, (int, float)) for g in gt_ratio):
+        try:
+            # Check if pred/gt ratios are all equal
+            ratios = [p / g if g != 0 else None for p, g in zip(pred_ratio, gt_ratio)]
+            if all(r is not None for r in ratios):
+                first_ratio = ratios[0]
+                if all(abs(r - first_ratio) < tolerance for r in ratios):
+                    return {
+                        "match": True,
+                        "method": ComparisonMethod.NUMERIC,
+                        "metadata": {"ratio_comparison": True, "proportional": True},
+                    }
+        except Exception:
+            pass
+
+    return {"match": False, "method": ComparisonMethod.FAILED}
+
+
+def compare_roman_numerals(pred: str, gt: str) -> dict:
+    """
+    Compare Roman numeral expressions.
+
+    Handles formats like:
+    - XIV vs 14
+    - IV vs IV
+    - 4 vs IV
+
+    Args:
+        pred: Predicted answer
+        gt: Ground truth answer
+
+    Returns:
+        Dict with 'match' bool and 'method'
+    """
+    pred = str(pred).strip()
+    gt = str(gt).strip()
+
+    # Try to convert both to integers
+    pred_int = roman_to_int(pred)
+    gt_int = roman_to_int(gt)
+
+    # If pred is Roman numeral
+    if pred_int is not None:
+        # Compare with gt as Roman
+        if gt_int is not None and pred_int == gt_int:
+            return {
+                "match": True,
+                "method": ComparisonMethod.STRING_NORMALIZED,
+                "metadata": {"roman_numeral": True},
+            }
+        # Compare with gt as integer
+        try:
+            gt_as_int = int(gt)
+            if pred_int == gt_as_int:
+                return {
+                    "match": True,
+                    "method": ComparisonMethod.NUMERIC,
+                    "metadata": {"roman_numeral": True, "roman_to_int": True},
+                }
+        except ValueError:
+            pass
+
+    # If gt is Roman numeral and pred is integer
+    if gt_int is not None and pred_int is None:
+        try:
+            pred_as_int = int(pred)
+            if pred_as_int == gt_int:
+                return {
+                    "match": True,
+                    "method": ComparisonMethod.NUMERIC,
+                    "metadata": {"roman_numeral": True, "int_to_roman": True},
+                }
+        except ValueError:
+            pass
+
+    return {"match": False, "method": ComparisonMethod.FAILED}
+
+
+def compare_text_answers(pred: str, gt: str) -> dict:
+    """
+    Compare text-based answers with fuzzy matching.
+
+    Handles:
+    - Case insensitivity: "Median" vs "median"
+    - Common aliases: "average" vs "mean"
+    - Whitespace normalization
+
+    Args:
+        pred: Predicted answer
+        gt: Ground truth answer
+
+    Returns:
+        Dict with 'match' bool and 'method'
+    """
+    pred = str(pred).strip().lower()
+    gt = str(gt).strip().lower()
+
+    # Direct match
+    if pred == gt:
+        return {
+            "match": True,
+            "method": ComparisonMethod.STRING_NORMALIZED,
+        }
+
+    # Check alias groups
+    for canonical, aliases in TEXT_ANSWER_ALIASES.items():
+        aliases_lower = [a.lower() for a in aliases]
+        if pred in aliases_lower and gt in aliases_lower:
+            return {
+                "match": True,
+                "method": ComparisonMethod.STRING_NORMALIZED,
+                "metadata": {"text_alias": canonical},
+            }
+
+    # Try without spaces and punctuation
+    pred_clean = re.sub(r'[^a-z0-9]', '', pred)
+    gt_clean = re.sub(r'[^a-z0-9]', '', gt)
+
+    if pred_clean == gt_clean and pred_clean:
+        return {
+            "match": True,
+            "method": ComparisonMethod.STRING_NORMALIZED,
+            "metadata": {"cleaned_match": True},
+        }
+
+    return {"match": False, "method": ComparisonMethod.FAILED}
+
+
 def compare_answers(
     pred: str,
     gt: str,
@@ -454,6 +689,10 @@ def compare_answers(
     enable_symbolic: bool = True,
     enable_numeric: bool = True,
     enable_tuple: bool = True,
+    enable_set: bool = True,
+    enable_ratio: bool = True,
+    enable_roman: bool = True,
+    enable_text: bool = True,
     numeric_tolerance: float = 1e-6,
     numeric_relative_tolerance: float = 1e-4,
 ) -> dict:
@@ -463,14 +702,22 @@ def compare_answers(
     Order of comparison:
     1. String comparison (exact, then normalized)
     2. Numeric comparison (if both can be parsed as numbers)
-    3. Tuple/list comparison (if both look like tuples)
-    4. Symbolic comparison (if sympy available)
+    3. Set comparison (if both look like sets)
+    4. Ratio comparison (if both contain colons)
+    5. Roman numeral comparison
+    6. Text answer comparison (for word answers)
+    7. Tuple/list comparison (if both look like tuples)
+    8. Symbolic comparison (if sympy available)
 
-    Features from prime_math:
+    Features:
     - Pi-aware numeric comparison
     - Tuple/list element-wise comparison
     - Interval format handling
     - Percentage tolerance
+    - Set comparison (order-independent)
+    - Ratio comparison (with simplification)
+    - Roman numeral handling
+    - Text answer aliases
 
     Args:
         pred: Predicted answer
@@ -480,6 +727,10 @@ def compare_answers(
         enable_symbolic: Whether to try symbolic comparison
         enable_numeric: Whether to try numeric comparison
         enable_tuple: Whether to try tuple comparison
+        enable_set: Whether to try set comparison
+        enable_ratio: Whether to try ratio comparison
+        enable_roman: Whether to try Roman numeral comparison
+        enable_text: Whether to try text answer comparison
         numeric_tolerance: Absolute tolerance for numeric comparison
         numeric_relative_tolerance: Relative tolerance for numeric comparison
 
@@ -517,13 +768,37 @@ def compare_answers(
         if result["match"]:
             return result
 
-    # Strategy 3: Tuple/list comparison
+    # Strategy 3: Set comparison
+    if enable_set and ("{" in pred or "{" in gt or "\\{" in pred or "\\{" in gt):
+        result = compare_sets(pred, gt)
+        if result["match"]:
+            return result
+
+    # Strategy 4: Ratio comparison
+    if enable_ratio and (":" in pred or ":" in gt):
+        result = compare_ratios(pred, gt, tolerance=numeric_tolerance)
+        if result["match"]:
+            return result
+
+    # Strategy 5: Roman numeral comparison
+    if enable_roman:
+        result = compare_roman_numerals(pred, gt)
+        if result["match"]:
+            return result
+
+    # Strategy 6: Text answer comparison
+    if enable_text and (is_text_answer(pred) or is_text_answer(gt)):
+        result = compare_text_answers(pred, gt)
+        if result["match"]:
+            return result
+
+    # Strategy 7: Tuple/list comparison
     if enable_tuple and ("," in pred or "," in gt or pred.startswith("(") or pred.startswith("[")):
         result = compare_tuple_or_list(pred, gt, tolerance=numeric_tolerance)
         if result["match"]:
             return result
 
-    # Strategy 4: Symbolic comparison
+    # Strategy 8: Symbolic comparison
     if enable_symbolic:
         result = compare_symbolic(pred, gt)
         if result["match"]:
@@ -537,6 +812,10 @@ def compare_answers(
             "strategies_tried": [
                 "string",
                 "numeric" if enable_numeric else None,
+                "set" if enable_set else None,
+                "ratio" if enable_ratio else None,
+                "roman" if enable_roman else None,
+                "text" if enable_text else None,
                 "tuple" if enable_tuple else None,
                 "symbolic" if enable_symbolic else None,
             ],

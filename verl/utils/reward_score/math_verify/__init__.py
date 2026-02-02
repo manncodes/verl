@@ -35,6 +35,10 @@ from verl.utils.reward_score.math_verify.compare import (
     compare_numeric,
     compare_symbolic,
     compare_tuple_or_list,
+    compare_sets,
+    compare_ratios,
+    compare_roman_numerals,
+    compare_text_answers,
     compare_answers,
     format_interval,
 )
@@ -44,6 +48,13 @@ from verl.utils.reward_score.math_verify.normalize import (
     normalize_for_numeric_comparison,
     try_numeric_with_pi_variants,
     normalize_answer_string,
+    normalize_set,
+    normalize_ratio,
+    simplify_ratio,
+    roman_to_int,
+    int_to_roman,
+    is_text_answer,
+    TEXT_ANSWER_ALIASES,
 )
 
 __all__ = [
@@ -61,6 +72,10 @@ __all__ = [
     "compare_numeric",
     "compare_symbolic",
     "compare_tuple_or_list",
+    "compare_sets",
+    "compare_ratios",
+    "compare_roman_numerals",
+    "compare_text_answers",
     "compare_answers",
     "format_interval",
     "normalize_latex",
@@ -68,6 +83,13 @@ __all__ = [
     "normalize_for_numeric_comparison",
     "try_numeric_with_pi_variants",
     "normalize_answer_string",
+    "normalize_set",
+    "normalize_ratio",
+    "simplify_ratio",
+    "roman_to_int",
+    "int_to_roman",
+    "is_text_answer",
+    "TEXT_ANSWER_ALIASES",
     "compute_score",
 ]
 

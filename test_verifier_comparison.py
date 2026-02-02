@@ -64,7 +64,14 @@ extract_boxed = extract_mod.extract_boxed
 extract_answer = extract_mod.extract_answer
 compare_numeric = compare_mod.compare_numeric
 compare_strings = compare_mod.compare_strings
+compare_sets = compare_mod.compare_sets
+compare_ratios = compare_mod.compare_ratios
+compare_roman_numerals = compare_mod.compare_roman_numerals
+compare_text_answers = compare_mod.compare_text_answers
 normalize_latex = normalize_mod.normalize_latex
+roman_to_int = normalize_mod.roman_to_int
+normalize_set = normalize_mod.normalize_set
+normalize_ratio = normalize_mod.normalize_ratio
 
 # Load other verifiers for comparison
 def load_verifier(name, path):
@@ -141,7 +148,7 @@ TEST_CASES = [
     # No boxed - should use pattern/fallback extraction
     ("The answer is: 42", "42", True),
 
-    # === NEW: Features from prime_math ===
+    # === Features from prime_math ===
 
     # Thousands separator handling
     (r"\boxed{1,000,000}", "1000000", True),
@@ -151,6 +158,71 @@ TEST_CASES = [
 
     # Leading decimal normalization
     (r"\boxed{.5}", "0.5", True),
+
+    # === LaTeX sqrt comparisons ===
+    (r"\boxed{\sqrt{2}}", r"\sqrt{2}", True),
+    (r"\boxed{\sqrt2}", r"\sqrt{2}", True),  # shorthand expansion
+    (r"\boxed{\sqrt{3}}", "1.732", True),  # numeric sqrt comparison
+
+    # === Text word answers ===
+    (r"\boxed{Median}", "median", True),  # case insensitive
+    (r"\boxed{MEDIAN}", "Median", True),
+    (r"The answer is \boxed{Mean}", "average", True),  # aliases
+    (r"\boxed{undefined}", "does not exist", True),
+
+    # === Algebraic expressions ===
+    (r"\boxed{20(q-1)}", "20(q-1)", True),  # exact string match
+    (r"\boxed{2^{n-1}}", "2^{n-1}", True),
+
+    # === Fractions with spaces ===
+    (r"\boxed{46 / 3}", "46/3", True),
+    (r"\boxed{46/3}", "46 / 3", True),
+
+    # === Sets (order-independent) ===
+    (r"\boxed{\{2,3,5\}}", "{2,3,5}", True),
+    (r"\boxed{\{5,3,2\}}", "{2,3,5}", True),  # different order
+    (r"\boxed{{2, 3, 5}}", "{5, 2, 3}", True),
+
+    # === Ratios ===
+    (r"\boxed{1:3}", "1:3", True),
+    (r"\boxed{2:6}", "1:3", True),  # equivalent ratio
+    (r"\boxed{1 : 3}", "1:3", True),  # with spaces
+
+    # === Inequalities/conditions ===
+    (r"\boxed{\neq 0}", r"\neq0", True),
+    (r"\boxed{c \neq 0}", r"c \neq 0", True),
+
+    # === Roman numerals ===
+    (r"\boxed{XIV}", "14", True),
+    (r"\boxed{IV}", "4", True),
+    (r"\boxed{4}", "IV", True),  # reverse direction
+    (r"\boxed{MCMLXXXIV}", "1984", True),
+
+    # === Degree/angle expressions ===
+    (r"\boxed{60^\circ}", "60", True),  # degree symbol removed
+    (r"\boxed{90^{\circ}}", "90", True),
+
+    # === Equations/assignments ===
+    (r"\boxed{n = 2018}", "2018", True),  # extract value from assignment
+    (r"\boxed{k = 5}", "5", True),
+
+    # === Dolci dataset funky ground truths ===
+    (r"The statistical measure is the \boxed{median}", "Median", True),  # word answer
+    (r"\boxed{2^{n-1}}", "2^{n-1}", True),  # expression with variable
+    (r"\boxed{68991}", "68991", True),  # plain number
+
+    # === Additional edge cases ===
+    # Pi expressions
+    (r"\boxed{2\pi}", r"2\pi", True),
+    (r"\boxed{\pi/2}", r"\frac{\pi}{2}", True),
+
+    # Percentages
+    (r"\boxed{50\%}", "0.5", True),
+    (r"\boxed{25%}", "0.25", True),
+
+    # Unicode
+    (r"\boxed{√2}", r"\sqrt{2}", True),
+    (r"\boxed{π}", r"\pi", True),
 ]
 
 def test_our_verifier(solution, gt):
@@ -313,6 +385,56 @@ def run_comparison():
     ]
     for pred, gt, expected in test_numerics:
         result = compare_numeric(pred, gt)
+        status = "PASS" if result['match'] == expected else "FAIL"
+        print(f"  [{status}] '{pred}' == '{gt}' -> {result['match']} (expected: {expected})")
+
+    print("\n4. Set Comparison:")
+    test_sets = [
+        ("{1,2,3}", "{3,2,1}", True),  # order independent
+        ("{2,3,5}", "{5,3,2}", True),
+        ("{1,2}", "{1,2,3}", False),   # different elements
+        (r"\{a,b,c\}", "{c,b,a}", True),  # with LaTeX braces
+    ]
+    for pred, gt, expected in test_sets:
+        result = compare_sets(pred, gt)
+        status = "PASS" if result['match'] == expected else "FAIL"
+        print(f"  [{status}] '{pred}' == '{gt}' -> {result['match']} (expected: {expected})")
+
+    print("\n5. Ratio Comparison:")
+    test_ratios = [
+        ("1:3", "1:3", True),
+        ("2:6", "1:3", True),  # equivalent ratio
+        ("1:2:3", "2:4:6", True),  # multi-part equivalent
+        ("1:3", "1:4", False),
+    ]
+    for pred, gt, expected in test_ratios:
+        result = compare_ratios(pred, gt)
+        status = "PASS" if result['match'] == expected else "FAIL"
+        print(f"  [{status}] '{pred}' == '{gt}' -> {result['match']} (expected: {expected})")
+
+    print("\n6. Roman Numeral Comparison:")
+    test_romans = [
+        ("XIV", "14", True),
+        ("IV", "4", True),
+        ("4", "IV", True),
+        ("MCMLXXXIV", "1984", True),
+        ("X", "11", False),
+    ]
+    for pred, gt, expected in test_romans:
+        result = compare_roman_numerals(pred, gt)
+        status = "PASS" if result['match'] == expected else "FAIL"
+        print(f"  [{status}] '{pred}' == '{gt}' -> {result['match']} (expected: {expected})")
+
+    print("\n7. Text Answer Comparison:")
+    test_texts = [
+        ("Median", "median", True),
+        ("MEAN", "average", True),  # alias
+        ("undefined", "does not exist", True),  # alias
+        ("true", "yes", True),
+        ("hello", "world", False),
+    ]
+    for pred, gt, expected in test_texts:
+        result = compare_text_answers(pred, gt)
         status = "PASS" if result['match'] == expected else "FAIL"
         print(f"  [{status}] '{pred}' == '{gt}' -> {result['match']} (expected: {expected})")
 

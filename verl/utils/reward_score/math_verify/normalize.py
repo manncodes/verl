@@ -28,13 +28,13 @@ logger = logging.getLogger(__name__)
 
 # Unicode to ASCII/LaTeX mappings (from prime_math)
 UNICODE_MAPPINGS = {
-    "√": "sqrt",
-    "π": "pi",
-    "∞": "inf",
-    "∪": "U",
-    "·": "*",
-    "×": "*",
-    "÷": "/",
+    "√": "\\sqrt",  # Map to LaTeX command
+    "π": "\\pi",    # Map to LaTeX command
+    "∞": "\\infty",
+    "∪": "\\cup",
+    "·": "\\cdot",
+    "×": "\\times",
+    "÷": "\\div",
     "−": "-",  # Unicode minus
     "–": "-",  # En dash
     "—": "-",  # Em dash
@@ -42,6 +42,12 @@ UNICODE_MAPPINGS = {
     "'": "'",
     """: '"',
     """: '"',
+    "≠": "\\neq",
+    "≤": "\\leq",
+    "≥": "\\geq",
+    "±": "\\pm",
+    "∓": "\\mp",
+    "°": "^\\circ",
 }
 
 # Units that can be stripped (from prime_math)
@@ -76,6 +82,68 @@ LARGE_NUMBER_WORDS = {
     "billion": "*10^9",
     "trillion": "*10^12",
 }
+
+# Roman numeral mappings
+ROMAN_NUMERALS = {
+    'M': 1000, 'CM': 900, 'D': 500, 'CD': 400,
+    'C': 100, 'XC': 90, 'L': 50, 'XL': 40,
+    'X': 10, 'IX': 9, 'V': 5, 'IV': 4, 'I': 1
+}
+
+def roman_to_int(s: str) -> Optional[int]:
+    """
+    Convert Roman numeral string to integer.
+
+    Args:
+        s: Roman numeral string (e.g., "XIV")
+
+    Returns:
+        Integer value or None if invalid
+    """
+    if not s:
+        return None
+    s = s.upper().strip()
+
+    # Quick validation: only valid Roman numeral chars
+    if not all(c in 'MDCLXVI' for c in s):
+        return None
+
+    result = 0
+    i = 0
+    while i < len(s):
+        # Check for two-character numerals first
+        if i + 1 < len(s) and s[i:i+2] in ROMAN_NUMERALS:
+            result += ROMAN_NUMERALS[s[i:i+2]]
+            i += 2
+        elif s[i] in ROMAN_NUMERALS:
+            result += ROMAN_NUMERALS[s[i]]
+            i += 1
+        else:
+            return None
+    return result
+
+
+def int_to_roman(num: int) -> Optional[str]:
+    """
+    Convert integer to Roman numeral string.
+
+    Args:
+        num: Integer (1-3999)
+
+    Returns:
+        Roman numeral string or None if out of range
+    """
+    if num <= 0 or num >= 4000:
+        return None
+
+    result = ""
+    for numeral, value in [('M', 1000), ('CM', 900), ('D', 500), ('CD', 400),
+                           ('C', 100), ('XC', 90), ('L', 50), ('XL', 40),
+                           ('X', 10), ('IX', 9), ('V', 5), ('IV', 4), ('I', 1)]:
+        while num >= value:
+            result += numeral
+            num -= value
+    return result
 
 
 @dataclass
@@ -477,6 +545,30 @@ def normalize_for_numeric_comparison(
         except ValueError:
             pass
 
+    # Handle LaTeX sqrt: \sqrt{a} or \sqrt[n]{a}
+    latex_sqrt = re.match(r"^\\sqrt\{([^}]+)\}$", expr)
+    if latex_sqrt:
+        try:
+            inner = latex_sqrt.group(1)
+            inner_val = normalize_for_numeric_comparison(inner, pi_value)
+            if inner_val is not None and inner_val >= 0:
+                return math.sqrt(inner_val)
+        except ValueError:
+            pass
+
+    # Handle nth root: \sqrt[n]{a}
+    latex_nthroot = re.match(r"^\\sqrt\[([^]]+)\]\{([^}]+)\}$", expr)
+    if latex_nthroot:
+        try:
+            n_str = latex_nthroot.group(1)
+            inner = latex_nthroot.group(2)
+            n_val = normalize_for_numeric_comparison(n_str, pi_value)
+            inner_val = normalize_for_numeric_comparison(inner, pi_value)
+            if n_val is not None and inner_val is not None and n_val != 0:
+                return inner_val ** (1 / n_val)
+        except ValueError:
+            pass
+
     # Handle negative with parentheses: -(3)
     neg_match = re.match(r"^-\((\d+(?:\.\d+)?)\)$", expr)
     if neg_match:
@@ -598,3 +690,151 @@ def normalize_answer_string(answer: str) -> str:
         result = result.lower()
 
     return result
+
+
+def normalize_set(expr: str) -> Optional[set]:
+    """
+    Parse a set expression into a Python set.
+
+    Handles formats like:
+    - {1, 2, 3}
+    - {2,3,5}
+    - \\{2, 3, 5\\}
+
+    Args:
+        expr: The expression to parse
+
+    Returns:
+        Set of elements or None if not a set
+    """
+    expr = str(expr).strip()
+
+    # Remove LaTeX braces
+    expr = expr.replace("\\{", "{").replace("\\}", "}")
+
+    # Check if it looks like a set
+    if not (expr.startswith("{") and expr.endswith("}")):
+        return None
+
+    # Extract elements
+    inner = expr[1:-1].strip()
+    if not inner:
+        return set()
+
+    elements = [e.strip() for e in inner.split(",")]
+    return set(elements)
+
+
+def normalize_ratio(expr: str) -> Optional[tuple]:
+    """
+    Parse a ratio expression into a tuple.
+
+    Handles formats like:
+    - 1:3
+    - 1 : 3
+    - 1:2:3 (multi-part ratios)
+
+    Args:
+        expr: The expression to parse
+
+    Returns:
+        Tuple of ratio parts or None if not a ratio
+    """
+    expr = str(expr).strip()
+
+    # Check if it contains colon
+    if ":" not in expr:
+        return None
+
+    parts = [p.strip() for p in expr.split(":")]
+
+    # Try to convert to numbers for comparison
+    try:
+        numeric_parts = []
+        for p in parts:
+            val = normalize_for_numeric_comparison(p)
+            if val is not None:
+                numeric_parts.append(val)
+            else:
+                numeric_parts.append(p)
+        return tuple(numeric_parts)
+    except Exception:
+        return tuple(parts)
+
+
+def simplify_ratio(ratio: tuple) -> tuple:
+    """
+    Simplify a ratio to its lowest terms.
+
+    Args:
+        ratio: Tuple of numeric ratio parts
+
+    Returns:
+        Simplified ratio tuple
+    """
+    import math
+
+    # Check all parts are numeric
+    if not all(isinstance(p, (int, float)) for p in ratio):
+        return ratio
+
+    # Convert to integers if possible
+    int_parts = []
+    for p in ratio:
+        if float(p).is_integer():
+            int_parts.append(int(p))
+        else:
+            # If any part is not integer, return original
+            return ratio
+
+    if not int_parts:
+        return ratio
+
+    # Find GCD of all parts
+    gcd = int_parts[0]
+    for p in int_parts[1:]:
+        gcd = math.gcd(gcd, p)
+
+    if gcd > 0:
+        return tuple(p // gcd for p in int_parts)
+    return tuple(int_parts)
+
+
+def is_text_answer(answer: str) -> bool:
+    """
+    Check if an answer is primarily text (not numeric or LaTeX).
+
+    Args:
+        answer: The answer string
+
+    Returns:
+        True if the answer appears to be text
+    """
+    answer = str(answer).strip()
+
+    # Empty string
+    if not answer:
+        return False
+
+    # Contains LaTeX commands
+    if "\\" in answer:
+        return False
+
+    # Mostly letters
+    letters = sum(1 for c in answer if c.isalpha())
+    digits = sum(1 for c in answer if c.isdigit())
+
+    return letters > digits
+
+
+# Common text answer variations (for fuzzy matching)
+TEXT_ANSWER_ALIASES = {
+    "median": ["median", "the median", "middle value"],
+    "mean": ["mean", "average", "the mean", "the average"],
+    "mode": ["mode", "the mode", "most frequent"],
+    "infinite": ["infinite", "infinity", "inf", "∞", "\\infty"],
+    "undefined": ["undefined", "undef", "no solution", "does not exist", "dne"],
+    "none": ["none", "no solution", "empty", "∅", "\\emptyset", "{}"],
+    "true": ["true", "yes", "correct"],
+    "false": ["false", "no", "incorrect"],
+}
