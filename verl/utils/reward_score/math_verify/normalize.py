@@ -569,6 +569,20 @@ def normalize_for_numeric_comparison(
         except ValueError:
             pass
 
+    # Handle exponentiation: a^b, a^{b}, \pi^2, etc.
+    # Pattern: base^exponent or base^{exponent}
+    exp_match = re.match(r"^(.+?)\^(?:\{([^}]+)\}|(\d+))$", expr)
+    if exp_match:
+        try:
+            base_str = exp_match.group(1)
+            exp_str = exp_match.group(2) or exp_match.group(3)
+            base_val = normalize_for_numeric_comparison(base_str, pi_value)
+            exp_val = normalize_for_numeric_comparison(exp_str, pi_value)
+            if base_val is not None and exp_val is not None:
+                return base_val ** exp_val
+        except (ValueError, OverflowError):
+            pass
+
     # Handle negative with parentheses: -(3)
     neg_match = re.match(r"^-\((\d+(?:\.\d+)?)\)$", expr)
     if neg_match:
@@ -632,6 +646,7 @@ def try_numeric_with_pi_variants(
     pred: str,
     gt: str,
     tolerance: float = 1e-6,
+    relative_tolerance: float = 1e-4,
 ) -> Optional[bool]:
     """
     Try numeric comparison with different pi values.
@@ -644,22 +659,21 @@ def try_numeric_with_pi_variants(
     Args:
         pred: Predicted value
         gt: Ground truth value
-        tolerance: Numeric tolerance
+        tolerance: Absolute numeric tolerance (default 1e-6)
+        relative_tolerance: Relative numeric tolerance (default 1e-4)
 
     Returns:
         True if match found, False if no match, None if can't compare
     """
-    pi_values = [math.pi, 3.14, 3.14159]
+    pi_values = [math.pi, 3.14, 3.14159, 3.1416]
 
     for pi_val in pi_values:
         pred_num = normalize_for_numeric_comparison(pred, pi_val)
         gt_num = normalize_for_numeric_comparison(gt, pi_val)
 
         if pred_num is not None and gt_num is not None:
-            if abs(pred_num - gt_num) <= tolerance:
-                return True
-            # Also try relative tolerance
-            if gt_num != 0 and abs(pred_num - gt_num) / abs(gt_num) <= tolerance:
+            # Use math.isclose for consistent comparison
+            if math.isclose(pred_num, gt_num, rel_tol=relative_tolerance, abs_tol=tolerance):
                 return True
 
     return None

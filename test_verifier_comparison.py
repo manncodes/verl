@@ -212,9 +212,12 @@ TEST_CASES = [
     (r"\boxed{68991}", "68991", True),  # plain number
 
     # === Additional edge cases ===
-    # Pi expressions
+    # Pi expressions with numeric ground truths
     (r"\boxed{2\pi}", r"2\pi", True),
     (r"\boxed{\pi/2}", r"\frac{\pi}{2}", True),
+    (r"\boxed{2\pi}", "6.28", True),  # pi symbol vs numeric
+    (r"\boxed{\pi}", "3.14", True),   # pi vs numeric
+    (r"\boxed{\pi^2}", "9.87", True), # pi squared vs numeric
 
     # Percentages
     (r"\boxed{50\%}", "0.5", True),

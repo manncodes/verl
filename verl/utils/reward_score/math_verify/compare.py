@@ -188,7 +188,7 @@ def compare_numeric(
 
     # If pi expressions detected, try multiple pi values
     if try_pi_variants and ("\\pi" in str(pred) or "\\pi" in str(gt) or "pi" in str(pred).lower() or "pi" in str(gt).lower()):
-        pi_result = try_numeric_with_pi_variants(pred, gt, tolerance)
+        pi_result = try_numeric_with_pi_variants(pred, gt, tolerance, relative_tolerance)
         if pi_result is True:
             return {
                 "match": True,
