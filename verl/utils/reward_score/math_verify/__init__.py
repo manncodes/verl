@@ -26,6 +26,7 @@ from verl.utils.reward_score.math_verify.core import (
 )
 from verl.utils.reward_score.math_verify.extract import (
     extract_boxed,
+    extract_all_boxed,
     extract_by_pattern,
     extract_last_number,
     extract_answer,
@@ -42,6 +43,7 @@ from verl.utils.reward_score.math_verify.compare import (
     compare_answers,
     format_interval,
     fuzzy_string_match,
+    is_mathematically_equivalent,
     DEFAULT_FUZZY_THRESHOLD,
 )
 from verl.utils.reward_score.math_verify.normalize import (
@@ -67,6 +69,7 @@ __all__ = [
     "ExtractionMethod",
     "ComparisonMethod",
     "extract_boxed",
+    "extract_all_boxed",
     "extract_by_pattern",
     "extract_last_number",
     "extract_answer",
@@ -81,6 +84,7 @@ __all__ = [
     "compare_answers",
     "format_interval",
     "fuzzy_string_match",
+    "is_mathematically_equivalent",
     "DEFAULT_FUZZY_THRESHOLD",
     "normalize_latex",
     "NormalizationConfig",
