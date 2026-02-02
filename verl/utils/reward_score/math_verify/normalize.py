@@ -476,11 +476,15 @@ def normalize_for_numeric_comparison(
 
     Handles:
     - Plain numbers: 42, 3.14, -17
-    - Fractions: 1/2, \\frac{1}{2}
-    - Scientific notation: 1.5e-3
+    - Fractions: 1/2, \\frac{1}{2}, -\\frac{1}{2}
+    - Scientific notation: 1.5e-3, 3 \\times 10^8
     - Percentages: 50% -> 0.5
     - Pi expressions: 2\\pi -> 2*pi
+    - Euler's number: e, e^2
     - Thousands separators: 1,000 -> 1000
+    - Factorial: 5! -> 120
+    - Absolute value: |-5| -> 5
+    - Binomial: \\binom{5}{2} -> 10
 
     Args:
         expr: The expression to convert
@@ -511,6 +515,83 @@ def normalize_for_numeric_comparison(
     # Strip thousands separators
     expr = _strip_thousands_separators(expr)
 
+    # Handle absolute value: |-5| or |5|
+    abs_match = re.match(r"^\|(.+)\|$", expr)
+    if abs_match:
+        inner = abs_match.group(1)
+        inner_val = normalize_for_numeric_comparison(inner, pi_value)
+        if inner_val is not None:
+            return abs(inner_val)
+
+    # Handle factorial: 5! or n!
+    factorial_match = re.match(r"^(\d+)!$", expr)
+    if factorial_match:
+        try:
+            n = int(factorial_match.group(1))
+            if n <= 170:  # Avoid overflow
+                result = 1
+                for i in range(2, n + 1):
+                    result *= i
+                return float(result)
+        except ValueError:
+            pass
+
+    # Handle binomial coefficient: \binom{n}{k}
+    binom_match = re.match(r"^\\binom\{(\d+)\}\{(\d+)\}$", expr)
+    if binom_match:
+        try:
+            n = int(binom_match.group(1))
+            k = int(binom_match.group(2))
+            if k <= n:
+                # Calculate C(n,k) = n! / (k! * (n-k)!)
+                result = 1
+                for i in range(min(k, n - k)):
+                    result = result * (n - i) // (i + 1)
+                return float(result)
+        except ValueError:
+            pass
+
+    # Handle C(n,k) notation
+    c_notation_match = re.match(r"^C\((\d+),\s*(\d+)\)$", expr)
+    if c_notation_match:
+        try:
+            n = int(c_notation_match.group(1))
+            k = int(c_notation_match.group(2))
+            if k <= n:
+                result = 1
+                for i in range(min(k, n - k)):
+                    result = result * (n - i) // (i + 1)
+                return float(result)
+        except ValueError:
+            pass
+
+    # Handle LaTeX scientific notation: 3 \times 10^8 or 3 \cdot 10^8
+    sci_latex_match = re.match(r"^([\d.]+)\s*(?:\\times|\\cdot|\*)\s*10\^(?:\{(-?\d+)\}|(-?\d+))$", expr)
+    if sci_latex_match:
+        try:
+            base = float(sci_latex_match.group(1))
+            exp = int(sci_latex_match.group(2) or sci_latex_match.group(3))
+            return base * (10 ** exp)
+        except ValueError:
+            pass
+
+    # Handle Euler's number e
+    e_value = math.e
+    if expr == "e" or expr == "\\e":
+        return e_value
+
+    # Handle e expressions: e^2, 2e, etc.
+    if "e" in expr.lower() and "\\e" not in expr:
+        # Replace standalone 'e' with Euler's number (careful not to replace in scientific notation)
+        expr_for_e = re.sub(r"(?<![0-9.])e(?![0-9+-])", str(e_value), expr, flags=re.IGNORECASE)
+        if expr_for_e != expr:
+            # Try to evaluate
+            try:
+                result = eval(expr_for_e, {"__builtins__": {}}, {"e": e_value, "pi": pi_value})
+                return float(result)
+            except Exception:
+                pass
+
     # Handle pi expressions (from prime_math)
     expr = _handle_pi_for_numeric(expr, pi_value)
 
@@ -519,6 +600,19 @@ def normalize_for_numeric_comparison(
         return float(expr)
     except ValueError:
         pass
+
+    # Handle negative fractions: -\frac{a}{b}
+    neg_frac_match = re.match(r"^-\\frac\{([^}]+)\}\{([^}]+)\}$", expr)
+    if neg_frac_match:
+        try:
+            num_str = neg_frac_match.group(1)
+            denom_str = neg_frac_match.group(2)
+            num = normalize_for_numeric_comparison(num_str, pi_value)
+            denom = normalize_for_numeric_comparison(denom_str, pi_value)
+            if num is not None and denom is not None and denom != 0:
+                return -num / denom
+        except ValueError:
+            pass
 
     # Handle simple fractions: a/b
     frac_match = re.match(r"^(-?\d+(?:\.\d+)?)\s*/\s*(-?\d+(?:\.\d+)?)$", expr)
