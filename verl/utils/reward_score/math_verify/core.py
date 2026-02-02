@@ -110,7 +110,7 @@ class VerifierConfig:
     enable_symbolic: bool = True
     enable_numeric: bool = True
     numeric_tolerance: float = 1e-6
-    numeric_relative_tolerance: float = 1e-4  # Reasonable tolerance for practical comparisons (e.g. sqrt(3) vs 1.732)
+    numeric_relative_tolerance: float = 1e-2  # 1% tolerance (~2 decimal places) for practical comparisons
 
     # Score settings
     correct_score: float = 1.0

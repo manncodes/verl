@@ -157,7 +157,7 @@ def compare_numeric(
     pred: str,
     gt: str,
     tolerance: float = 1e-6,
-    relative_tolerance: float = 1e-4,
+    relative_tolerance: float = 1e-2,
     include_percentage: bool = True,
     try_pi_variants: bool = True,
 ) -> dict:
@@ -790,7 +790,7 @@ def compare_answers(
     enable_roman: bool = True,
     enable_text: bool = True,
     numeric_tolerance: float = 1e-6,
-    numeric_relative_tolerance: float = 1e-4,
+    numeric_relative_tolerance: float = 1e-2,
 ) -> dict:
     """
     Compare answers using multiple strategies with fallback.

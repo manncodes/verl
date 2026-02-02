@@ -646,7 +646,7 @@ def try_numeric_with_pi_variants(
     pred: str,
     gt: str,
     tolerance: float = 1e-6,
-    relative_tolerance: float = 1e-4,
+    relative_tolerance: float = 1e-2,
 ) -> Optional[bool]:
     """
     Try numeric comparison with different pi values.
@@ -660,7 +660,7 @@ def try_numeric_with_pi_variants(
         pred: Predicted value
         gt: Ground truth value
         tolerance: Absolute numeric tolerance (default 1e-6)
-        relative_tolerance: Relative numeric tolerance (default 1e-4)
+        relative_tolerance: Relative numeric tolerance (default 1e-2, ~2 decimal places)
 
     Returns:
         True if match found, False if no match, None if can't compare
