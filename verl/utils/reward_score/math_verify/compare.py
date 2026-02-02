@@ -25,6 +25,7 @@ import re
 import logging
 from typing import Optional, List
 import math
+from difflib import SequenceMatcher
 
 from verl.utils.reward_score.math_verify.core import ComparisonMethod
 from verl.utils.reward_score.math_verify.normalize import (
@@ -43,6 +44,72 @@ logger = logging.getLogger(__name__)
 
 # Characters that indicate tuple/interval expressions
 TUPLE_CHARS = "()[]"
+
+# Default fuzzy matching threshold (85% similarity)
+DEFAULT_FUZZY_THRESHOLD = 0.85
+
+
+def fuzzy_string_match(
+    s1: str,
+    s2: str,
+    threshold: float = DEFAULT_FUZZY_THRESHOLD,
+    ignore_case: bool = True,
+    ignore_whitespace: bool = True,
+    ignore_punctuation: bool = True,
+) -> dict:
+    """
+    Perform fuzzy string matching between two strings.
+
+    Uses SequenceMatcher to compute similarity ratio.
+
+    Args:
+        s1: First string
+        s2: Second string
+        threshold: Minimum similarity ratio to consider a match (0.0-1.0)
+        ignore_case: Whether to ignore case differences
+        ignore_whitespace: Whether to normalize whitespace
+        ignore_punctuation: Whether to ignore punctuation
+
+    Returns:
+        Dict with 'match' bool, 'similarity' ratio, and processing details
+    """
+    if not s1 or not s2:
+        return {"match": False, "similarity": 0.0}
+
+    # Preprocessing
+    a, b = str(s1), str(s2)
+
+    if ignore_case:
+        a, b = a.lower(), b.lower()
+
+    if ignore_whitespace:
+        a = " ".join(a.split())
+        b = " ".join(b.split())
+
+    if ignore_punctuation:
+        a = re.sub(r'[^\w\s]', '', a)
+        b = re.sub(r'[^\w\s]', '', b)
+
+    # Exact match after preprocessing
+    if a == b:
+        return {
+            "match": True,
+            "similarity": 1.0,
+            "exact_after_preprocessing": True,
+        }
+
+    # Compute similarity
+    ratio = SequenceMatcher(None, a, b).ratio()
+
+    return {
+        "match": ratio >= threshold,
+        "similarity": ratio,
+        "threshold": threshold,
+        "preprocessed": {
+            "s1": a,
+            "s2": b,
+        },
+    }
 
 
 def compare_strings(
@@ -631,7 +698,12 @@ def compare_roman_numerals(pred: str, gt: str) -> dict:
     return {"match": False, "method": ComparisonMethod.FAILED}
 
 
-def compare_text_answers(pred: str, gt: str) -> dict:
+def compare_text_answers(
+    pred: str,
+    gt: str,
+    fuzzy_threshold: float = 0.85,
+    enable_fuzzy: bool = True,
+) -> dict:
     """
     Compare text-based answers with fuzzy matching.
 
@@ -639,10 +711,13 @@ def compare_text_answers(pred: str, gt: str) -> dict:
     - Case insensitivity: "Median" vs "median"
     - Common aliases: "average" vs "mean"
     - Whitespace normalization
+    - Fuzzy matching for typos/variations (configurable threshold)
 
     Args:
         pred: Predicted answer
         gt: Ground truth answer
+        fuzzy_threshold: Minimum similarity ratio for fuzzy match (0.0-1.0)
+        enable_fuzzy: Whether to try fuzzy matching
 
     Returns:
         Dict with 'match' bool and 'method'
@@ -677,6 +752,27 @@ def compare_text_answers(pred: str, gt: str) -> dict:
             "method": ComparisonMethod.STRING_NORMALIZED,
             "metadata": {"cleaned_match": True},
         }
+
+    # Fuzzy string matching using SequenceMatcher
+    if enable_fuzzy and len(pred) >= 3 and len(gt) >= 3:
+        # Compare original strings
+        ratio = SequenceMatcher(None, pred, gt).ratio()
+        if ratio >= fuzzy_threshold:
+            return {
+                "match": True,
+                "method": ComparisonMethod.STRING_NORMALIZED,
+                "metadata": {"fuzzy_match": True, "similarity": ratio},
+            }
+
+        # Also try cleaned versions
+        if pred_clean and gt_clean:
+            ratio_clean = SequenceMatcher(None, pred_clean, gt_clean).ratio()
+            if ratio_clean >= fuzzy_threshold:
+                return {
+                    "match": True,
+                    "method": ComparisonMethod.STRING_NORMALIZED,
+                    "metadata": {"fuzzy_match": True, "similarity": ratio_clean, "cleaned": True},
+                }
 
     return {"match": False, "method": ComparisonMethod.FAILED}
 

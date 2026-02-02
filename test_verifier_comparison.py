@@ -223,6 +223,11 @@ TEST_CASES = [
     # Unicode
     (r"\boxed{√2}", r"\sqrt{2}", True),
     (r"\boxed{π}", r"\pi", True),
+
+    # === Fuzzy string matching ===
+    (r"\boxed{triangle}", "triangel", True),  # typo in gt
+    (r"\boxed{isoceles}", "isosceles", True),  # missing letter
+    (r"\boxed{parallelogram}", "paralellogram", True),  # common misspelling
 ]
 
 def test_our_verifier(solution, gt):
@@ -437,6 +442,24 @@ def run_comparison():
         result = compare_text_answers(pred, gt)
         status = "PASS" if result['match'] == expected else "FAIL"
         print(f"  [{status}] '{pred}' == '{gt}' -> {result['match']} (expected: {expected})")
+
+    print("\n8. Fuzzy String Matching:")
+    test_fuzzy = [
+        ("triangle", "triangel", True),  # typo
+        ("rectangle", "rectangel", True),  # typo
+        ("perpendicular", "perpendiuclar", True),  # typo
+        ("parallelogram", "paralellogram", True),  # common misspelling
+        ("isoceles", "isosceles", True),  # missing letter
+        ("quadrilateral", "quadralateral", True),  # vowel swap
+        ("hello", "world", False),  # completely different
+        ("cat", "dog", False),  # short and different
+        ("yes", "no", False),  # short opposites
+    ]
+    for pred, gt, expected in test_fuzzy:
+        result = compare_text_answers(pred, gt, fuzzy_threshold=0.80)
+        status = "PASS" if result['match'] == expected else "FAIL"
+        sim = result.get('metadata', {}).get('similarity', 'N/A')
+        print(f"  [{status}] '{pred}' ~= '{gt}' -> {result['match']} (sim={sim}, expected: {expected})")
 
     print("\n" + "=" * 90)
     print("TEST COMPLETE")

@@ -41,6 +41,8 @@ from verl.utils.reward_score.math_verify.compare import (
     compare_text_answers,
     compare_answers,
     format_interval,
+    fuzzy_string_match,
+    DEFAULT_FUZZY_THRESHOLD,
 )
 from verl.utils.reward_score.math_verify.normalize import (
     normalize_latex,
@@ -78,6 +80,8 @@ __all__ = [
     "compare_text_answers",
     "compare_answers",
     "format_interval",
+    "fuzzy_string_match",
+    "DEFAULT_FUZZY_THRESHOLD",
     "normalize_latex",
     "NormalizationConfig",
     "normalize_for_numeric_comparison",
