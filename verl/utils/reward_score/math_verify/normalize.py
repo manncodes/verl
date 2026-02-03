@@ -498,6 +498,16 @@ def normalize_for_numeric_comparison(
 
     expr = str(expr).strip()
 
+    # Convert Unicode math symbols to LaTeX equivalents for consistent handling
+    # This ensures π, √, etc. are processed correctly
+    for unicode_char, replacement in UNICODE_MAPPINGS.items():
+        expr = expr.replace(unicode_char, replacement)
+
+    # Normalize fraction types: \dfrac, \tfrac, \cfrac -> \frac
+    expr = expr.replace("\\dfrac", "\\frac")
+    expr = expr.replace("\\tfrac", "\\frac")
+    expr = expr.replace("\\cfrac", "\\frac")
+
     # Remove LaTeX math delimiters
     expr = re.sub(r"^\$+|\$+$", "", expr)
     expr = re.sub(r"^\\+\(|\\+\)$", "", expr)

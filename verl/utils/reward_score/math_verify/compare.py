@@ -837,10 +837,26 @@ def compare_answers(
     pred = format_interval(str(pred))
     gt = format_interval(str(gt))
 
+    # Normalize Unicode symbols in both pred and gt for consistent comparison
+    # This handles cases like \pm vs ±, π vs \pi, etc.
+    from verl.utils.reward_score.math_verify.normalize import UNICODE_MAPPINGS
+    pred_unicode_normalized = pred
+    gt_unicode_normalized = gt
+    for unicode_char, replacement in UNICODE_MAPPINGS.items():
+        pred_unicode_normalized = pred_unicode_normalized.replace(unicode_char, replacement)
+        gt_unicode_normalized = gt_unicode_normalized.replace(unicode_char, replacement)
+
     # Strategy 1: String comparison
     result = compare_strings(pred, gt, pred_normalized, gt_normalized)
     if result["match"]:
         return result
+
+    # Try with Unicode-normalized versions
+    if pred_unicode_normalized == gt_unicode_normalized:
+        return {
+            "match": True,
+            "method": ComparisonMethod.STRING_NORMALIZED,
+        }
 
     # Also try case-insensitive and space-normalized
     if pred.strip().lower() == gt.strip().lower():
@@ -848,7 +864,14 @@ def compare_answers(
             "match": True,
             "method": ComparisonMethod.STRING_NORMALIZED,
         }
+    # Try with spaces removed (handles \pm 4 vs \pm4)
     if pred.replace(" ", "") == gt.replace(" ", ""):
+        return {
+            "match": True,
+            "method": ComparisonMethod.STRING_NORMALIZED,
+        }
+    # Also try Unicode-normalized with spaces removed
+    if pred_unicode_normalized.replace(" ", "") == gt_unicode_normalized.replace(" ", ""):
         return {
             "match": True,
             "method": ComparisonMethod.STRING_NORMALIZED,
