@@ -344,6 +344,142 @@ class TestComputeThinkingPenalty:
         assert _compute_thinking_penalty(text) == -1.0
 
 
+# ===================================================================
+# Tests for empty / whitespace-only <think> blocks
+# ===================================================================
+
+
+class TestEmptyThinkBlock:
+    """Edge cases where <think> contains no real reasoning text.
+
+    Tests two axes:
+      - Content inside <think>: empty vs whitespace-only vs draft_answer-only
+      - Surrounding structure: with vs without <evaluation> tags
+
+    Key finding: Pattern 1 (.+?) and Pattern 2 (.*?) have INCONSISTENT
+    handling of truly empty <think> blocks. Whitespace is treated as
+    content by Pattern 1 but stripped away by _compute_thinking_penalty.
+    """
+
+    # ── format_reward with evaluation tags (Pattern 2: .*?) ──────────
+
+    def test_empty_think_with_eval_gets_format_1(self):
+        """EDGE CASE: Pattern 2 uses .*? in _think_block, so completely
+        empty <think></think> PASSES format_reward when evaluation tags
+        are present. This is arguably too lenient."""
+        text = "<think></think><evaluation>CORRECT</evaluation><answer>ans</answer>"
+        assert format_reward(text) == 1.0
+
+    def test_whitespace_think_with_eval_gets_format_1(self):
+        """Whitespace-only <think> also passes Pattern 2 (.*? matches whitespace)."""
+        text = "<think>   \n\n  \t  </think><evaluation>CORRECT</evaluation><answer>ans</answer>"
+        assert format_reward(text) == 1.0
+
+    def test_draft_only_think_with_eval_gets_format_1(self):
+        """<think> containing only <draft_answer> passes Pattern 2."""
+        text = (
+            "<think>\n<draft_answer>draft content</draft_answer>\n</think>"
+            "<evaluation>CORRECT</evaluation><answer>ans</answer>"
+        )
+        assert format_reward(text) == 1.0
+
+    # ── format_reward without evaluation tags (Pattern 1: .+?) ───────
+
+    def test_empty_think_no_eval_gets_format_0(self):
+        """Pattern 1 uses .+? inside <think>, so empty <think></think>
+        FAILS format_reward when no evaluation tags are present."""
+        text = "<think></think><answer>ans</answer>"
+        assert format_reward(text) == 0.0
+
+    def test_whitespace_think_no_eval_gets_format_1(self):
+        """INCONSISTENCY: Whitespace-only <think> PASSES Pattern 1 because
+        .+? matches whitespace characters. So a single space is 'reasoning'
+        for format_reward but not for _compute_thinking_penalty."""
+        text = "<think>   </think><answer>ans</answer>"
+        assert format_reward(text) == 1.0
+
+    def test_single_space_think_no_eval_gets_format_1(self):
+        """Even a single space passes Pattern 1's .+? requirement."""
+        text = "<think> </think><answer>ans</answer>"
+        assert format_reward(text) == 1.0
+
+    def test_newline_think_no_eval_gets_format_1(self):
+        """A single newline passes Pattern 1 with re.DOTALL (. matches \\n)."""
+        text = "<think>\n</think><answer>ans</answer>"
+        assert format_reward(text) == 1.0
+
+    # ── Pattern 1 vs Pattern 2 inconsistency ─────────────────────────
+
+    def test_pattern1_vs_pattern2_empty_think_inconsistency(self):
+        """BUG: Empty <think></think> is rejected by Pattern 1 (.+?)
+        but accepted by Pattern 2 (.*?). The only difference is whether
+        evaluation tags are present, which shouldn't affect whether the
+        think block itself is considered valid."""
+        no_eval = "<think></think><answer>ans</answer>"
+        with_eval = "<think></think><evaluation>CORRECT</evaluation><answer>ans</answer>"
+        assert format_reward(no_eval) == 0.0   # Pattern 1 rejects
+        assert format_reward(with_eval) == 1.0  # Pattern 2 accepts
+
+    # ── _compute_thinking_penalty (consistent across all empty cases) ─
+
+    def test_empty_think_penalty(self):
+        """Empty <think> always gets -1.0 thinking penalty."""
+        assert _compute_thinking_penalty("<think></think>") == -1.0
+
+    def test_whitespace_think_penalty(self):
+        """Whitespace-only <think> gets -1.0 (stripped to empty)."""
+        assert _compute_thinking_penalty("<think>   \n\n  \t  </think>") == -1.0
+
+    def test_draft_only_think_penalty(self):
+        """<draft_answer>-only <think> gets -1.0 (draft stripped, nothing remains)."""
+        text = "<think>\n<draft_answer>lots of content here</draft_answer>\n</think>"
+        assert _compute_thinking_penalty(text) == -1.0
+
+    def test_whitespace_stripped_before_length_check(self):
+        """Whitespace is .strip()'d before the >= 100 char check, so
+        99 spaces + 1 real char = 1 char after strip (penalty applies)."""
+        text = "<think>" + " " * 99 + "x" + "</think>"
+        assert _compute_thinking_penalty(text) == -1.0
+
+    # ── Combined scores for empty think variants ─────────────────────
+
+    def test_empty_think_with_eval_score_composition(self):
+        """Empty <think> + eval: fmt=1.0, think=-1.0.
+        These cancel out, so only V_i and S_i contribute."""
+        text = "<think></think><evaluation>CORRECT</evaluation><answer>ans</answer>"
+        fmt = format_reward(text)
+        think = _compute_thinking_penalty(text)
+        assert fmt == 1.0
+        assert think == -1.0
+        # At V_i=2.0, S_i>alpha: F_i = (2.5 + 1 - 1) / 4.5 = 2.5/4.5
+        F_i = max(0.0, 2.5 + fmt + think) / MAX_REWARD
+        assert abs(F_i - 2.5 / 4.5) < 1e-9
+
+    def test_empty_think_no_eval_score_composition(self):
+        """Empty <think> + no eval: fmt=0.0, think=-1.0.
+        Both penalize, making the response essentially worthless."""
+        text = "<think></think><answer>ans</answer>"
+        fmt = format_reward(text)
+        think = _compute_thinking_penalty(text)
+        assert fmt == 0.0
+        assert think == -1.0
+        # At V_i=2.0, S_i>alpha: F_i = max(0, 2.5 + 0 - 1) / 4.5 = 1.5/4.5
+        F_i = max(0.0, 2.5 + fmt + think) / MAX_REWARD
+        assert abs(F_i - 1.5 / 4.5) < 1e-9
+
+    def test_whitespace_think_no_eval_perverse_incentive(self):
+        """INCONSISTENCY: Adding whitespace to an empty <think> flips
+        format_reward from 0.0 to 1.0 (Pattern 1 .+? matches whitespace).
+        A single space gives +1.0 format score — a perverse incentive."""
+        empty = "<think></think><answer>ans</answer>"
+        space = "<think> </think><answer>ans</answer>"
+        assert format_reward(empty) == 0.0
+        assert format_reward(space) == 1.0
+        # But both get the same thinking penalty
+        assert _compute_thinking_penalty(empty) == -1.0
+        assert _compute_thinking_penalty(space) == -1.0
+
+
 class TestRemoveThinkingSection:
     """Tests for remove_thinking_section."""
 
