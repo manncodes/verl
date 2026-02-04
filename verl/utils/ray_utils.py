@@ -90,3 +90,43 @@ def get_event_loop():
         asyncio.set_event_loop(loop)
 
     return loop
+
+
+def run_coroutine_sync(coro):
+    """Run an async coroutine synchronously, safe even if an event loop is already running.
+
+    When called from within a running event loop (e.g. Ray async actor, vLLM internals),
+    asyncio.run_until_complete() raises "RuntimeError: this event loop is already running".
+    This helper detects that case and runs the coroutine in a separate thread with its own
+    event loop, avoiding the conflict.
+    """
+    try:
+        asyncio.get_running_loop()
+        # A loop is already running — can't use run_until_complete on it.
+        # Run in a new thread with a fresh event loop instead.
+        result = None
+        exception = None
+
+        def _run():
+            nonlocal result, exception
+            new_loop = asyncio.new_event_loop()
+            try:
+                result = new_loop.run_until_complete(coro)
+            except BaseException as e:
+                exception = e
+            finally:
+                new_loop.close()
+
+        import threading
+
+        t = threading.Thread(target=_run)
+        t.start()
+        t.join()
+        if exception is not None:
+            raise exception
+        return result
+    except RuntimeError:
+        # No running loop — safe to create one and use run_until_complete.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
