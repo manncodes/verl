@@ -9,9 +9,9 @@
 #   - Field Coverage  (0.3): what fraction of required fields are correct type?
 #   - Content Score   (0.2): does the content match expected values (if available)?
 #
-# Key insight: Schema validation is a fine-grained reward, NOT binary.
+# Key insight: Schema validation provides a FINE-GRAINED reward, not binary.
 #   Missing one field out of twelve should score higher than producing garbage.
-#   This gradient signal is what makes GRPO work for structural compliance.
+#   This gradient signal is what makes GRPO converge for structural compliance.
 #
 # Dataset: nvidia/Nemotron-RL-instruction_following-structured_outputs
 #   - 9.4K train / 512 validation examples
@@ -67,8 +67,8 @@ TRAIN_FILES="[${DATA_DIR}/structured_output_train.parquet]"
 VAL_FILES=("${DATA_DIR}/structured_output_val.parquet")
 VAL_FILES_STR=$(IFS=,; echo "[${VAL_FILES[*]}]")
 
-# Structured output prompts include document text + schema instructions
-# Schemas can be large (up to 18K chars), so we need generous prompt length
+# Structured output prompts include document text + schema instructions.
+# Schemas can be large (up to 18K chars), so we need generous prompt length.
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
 
@@ -80,7 +80,7 @@ N_GPUS="${N_GPUS:-8}"
 NNODES="${NNODES:-1}"
 TOTAL_GPUS=$((N_GPUS * NNODES))
 
-TP_SIZE="${TP_SIZE:-2}"
+TP_SIZE="${TP_SIZE:-4}"
 PP_SIZE="${PP_SIZE:-1}"
 SP_SIZE="${SP_SIZE:-1}"
 
@@ -103,8 +103,8 @@ MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-$((8 * NNODES))}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-4}"
 
 # Schema compliance has high variance across different schema complexities
-# (5-field vs 12-field schemas behave very differently)
-# More samples per prompt -> better advantage estimation for heterogeneous schemas
+# (5-field vs 12-field schemas behave very differently).
+# More samples per prompt -> better advantage estimation for heterogeneous schemas.
 N_RESPONSES="${N_RESPONSES:-8}"
 
 log_info "Batch: train=$TRAIN_BATCH_SIZE, mini=$MINI_BATCH_SIZE, micro=$MICRO_BATCH_SIZE, n=$N_RESPONSES"
@@ -176,17 +176,12 @@ VAL_TOP_K="${VAL_TOP_K:--1}"
 #   - fine_grained: weighted sum of parsability + validity + coverage + content
 #   - binary: 0 or 1 based on full schema compliance (stricter)
 #   - crane: CRANE-style with reasoning section bonus
+#
+# The reward function is loaded as a custom reward function and used by the
+# structured_output reward manager, which handles decoding, schema lookup,
+# and CRANE-style output splitting.
 
 REWARD_MODE="${REWARD_MODE:-fine_grained}"
-
-# Reward function weights (for fine_grained mode)
-# These control how much each component contributes to the total reward.
-# Schema validity and field coverage are weighted highest because they
-# directly measure structural compliance.
-#   json_parse:     0.2 - basic JSON parsability (easy to achieve)
-#   schema_valid:   0.3 - full schema validation (the ultimate goal)
-#   field_coverage: 0.3 - partial credit for correct fields (enables learning)
-#   content:        0.2 - content correctness (less important for format training)
 
 REWARD_FUNCTION_PATH="${REWARD_FUNCTION_PATH:-verl/utils/reward_score/structured_output.py}"
 REWARD_FUNCTION_NAME="${REWARD_FUNCTION_NAME:-compute_score}"
@@ -289,12 +284,7 @@ if [[ "$REWARD_MODE" == "crane" ]]; then
     )
 fi
 
-python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=grpo \
-    algorithm.norm_adv_by_std_in_grpo=True \
-    algorithm.kl_ctrl.kl_coef="$KL_COEF" \
-    algorithm.use_kl_in_reward="$USE_KL_IN_REWARD" \
-    \
+python3 -m recipe.structured_output.main_structured_output \
     data.train_files="$TRAIN_FILES" \
     data.val_files="$VAL_FILES_STR" \
     data.train_batch_size="$TRAIN_BATCH_SIZE" \
@@ -361,6 +351,11 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size="$SP_SIZE" \
     actor_rollout_ref.ref.fsdp_config.param_offload="$FSDP_PARAM_OFFLOAD" \
+    \
+    algorithm.adv_estimator=grpo \
+    algorithm.norm_adv_by_std_in_grpo=True \
+    algorithm.kl_ctrl.kl_coef="$KL_COEF" \
+    algorithm.use_kl_in_reward="$USE_KL_IN_REWARD" \
     \
     reward_model.reward_manager=structured_output \
     custom_reward_function.path="$REWARD_FUNCTION_PATH" \
