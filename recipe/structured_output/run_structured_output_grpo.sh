@@ -183,9 +183,6 @@ VAL_TOP_K="${VAL_TOP_K:--1}"
 
 REWARD_MODE="${REWARD_MODE:-fine_grained}"
 
-REWARD_FUNCTION_PATH="${REWARD_FUNCTION_PATH:-verl/utils/reward_score/structured_output.py}"
-REWARD_FUNCTION_NAME="${REWARD_FUNCTION_NAME:-compute_score}"
-
 # =============================================================================
 # GUIDED DECODING (OPTIONAL)
 # =============================================================================
@@ -269,15 +266,18 @@ if [[ "$REWARD_MODE" == "crane" ]]; then
 fi
 log_info "=========================================="
 
-# Build guided decoding args
-GUIDED_DECODING_ARGS=()
+# Build extra args for guided decoding and CRANE mode
+EXTRA_ARGS=()
 if [[ -n "$GUIDED_DECODING_BACKEND" ]]; then
-    GUIDED_DECODING_ARGS+=(
+    EXTRA_ARGS+=(
         "actor_rollout_ref.rollout.guided_decoding.backend=$GUIDED_DECODING_BACKEND"
     )
 fi
 if [[ "$REWARD_MODE" == "crane" ]]; then
-    GUIDED_DECODING_ARGS+=(
+    EXTRA_ARGS+=(
+        "reward_model.reward_kwargs.reasoning_delimiter=$CRANE_REASONING_DELIMITER"
+        "reward_model.reward_kwargs.reasoning_end_delimiter=$CRANE_REASONING_END_DELIMITER"
+        "reward_model.reward_kwargs.reasoning_bonus=$CRANE_REASONING_BONUS"
         "actor_rollout_ref.rollout.guided_decoding.enable_reasoning=True"
         "actor_rollout_ref.rollout.guided_decoding.reasoning_delimiter=$CRANE_REASONING_DELIMITER"
         "actor_rollout_ref.rollout.guided_decoding.reasoning_end_delimiter=$CRANE_REASONING_END_DELIMITER"
@@ -323,9 +323,7 @@ python3 -m recipe.structured_output.main_structured_output \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size="$SP_SIZE" \
     \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.mode=sync \
-    +rollout.nnodes="$NNODES" \
-    +rollout.n_gpus_per_node="$N_GPUS" \
+    actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.rollout.n="$N_RESPONSES" \
     actor_rollout_ref.rollout.temperature="$TRAIN_TEMPERATURE" \
     actor_rollout_ref.rollout.top_p="$TRAIN_TOP_P" \
@@ -358,8 +356,7 @@ python3 -m recipe.structured_output.main_structured_output \
     algorithm.use_kl_in_reward="$USE_KL_IN_REWARD" \
     \
     reward_model.reward_manager=structured_output \
-    custom_reward_function.path="$REWARD_FUNCTION_PATH" \
-    custom_reward_function.name="$REWARD_FUNCTION_NAME" \
+    reward_model.reward_kwargs.reward_mode="$REWARD_MODE" \
     \
     trainer.val_before_train=True \
     trainer.logger='["console", "wandb"]' \
@@ -374,7 +371,7 @@ python3 -m recipe.structured_output.main_structured_output \
     trainer.default_local_dir="$CHECKPOINT_DIR" \
     trainer.rollout_data_dir="$LOG_DIR" \
     \
-    "${GUIDED_DECODING_ARGS[@]}" \
+    "${EXTRA_ARGS[@]}" \
     "${@:2}"
 
 log_info "Training completed. Checkpoints: $CHECKPOINT_DIR"

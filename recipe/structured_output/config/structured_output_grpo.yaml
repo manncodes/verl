@@ -22,17 +22,16 @@ data:
   # Override reward function key for structured output data
   reward_fn_key: data_source
 
-# Use the structured_output reward manager
+# Use the structured_output reward manager.
+# reward_kwargs are passed through to StructuredOutputRewardManager.__init__().
 reward_model:
-  reward_manager:
-    source: register
-    name: structured_output
+  reward_manager: structured_output
   enable: False
-
-# Custom reward function for structured output validation
-custom_reward_function:
-  path: null
-  name: compute_score
+  reward_kwargs:
+    reward_mode: fine_grained
+    reasoning_delimiter: "<answer>"
+    reasoning_end_delimiter: "</answer>"
+    reasoning_bonus: 0.1
 
 # GRPO algorithm config
 algorithm:

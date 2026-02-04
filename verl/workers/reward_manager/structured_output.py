@@ -36,7 +36,6 @@ from typing import Any, Optional
 import torch
 
 from verl import DataProto
-from verl.utils.reward_score import default_compute_score
 from verl.utils.reward_score.structured_output import compute_score as structured_compute_score
 from verl.workers.reward_manager import register
 from verl.workers.reward_manager.abstract import AbstractRewardManager
@@ -119,7 +118,10 @@ class StructuredOutputRewardManager(AbstractRewardManager):
     ) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine
-        self.compute_score = compute_score or structured_compute_score
+        # Always use structured_compute_score for schema validation.
+        # The compute_score from load_reward_manager defaults to default_compute_score
+        # which has an incompatible signature (expects data_source as first arg).
+        self.compute_score = structured_compute_score
         self.reward_fn_key = reward_fn_key
         self.reward_mode = reward_mode
         self.reasoning_delimiter = reasoning_delimiter
