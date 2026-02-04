@@ -26,6 +26,7 @@ from omegaconf import ListConfig
 from torch.distributed.device_mesh import DeviceMesh
 from vllm import LLM, SamplingParams
 from vllm.config import CompilationConfig, CompilationLevel
+from vllm.sampling_params import GuidedDecodingParams
 
 from verl.third_party.vllm import VLLM_SLEEP_LEVEL
 from verl.utils.device import get_device_name
@@ -213,6 +214,25 @@ class vLLMRollout(vLLMRolloutBase):
             if hasattr(SamplingParams(), str(k)) and k != "seed":
                 kwargs[k] = config.get(k)
         kwargs["n"] = 1  # already repeat in ray_trainer
+
+        # Convert guided_decoding dict to GuidedDecodingParams object if present.
+        # OmegaConf serializes the config as a plain dict, but vLLM expects a
+        # GuidedDecodingParams instance (it accesses .backend as an attribute).
+        guided_decoding = kwargs.pop("guided_decoding", None)
+        if guided_decoding is not None:
+            if isinstance(guided_decoding, dict):
+                # Only set guided_decoding if there's an actual constraint
+                gd_kwargs = {}
+                for field in ("json_schema", "regex", "grammar", "choice", "json_object"):
+                    if guided_decoding.get(field):
+                        gd_kwargs[field] = guided_decoding[field]
+                if guided_decoding.get("backend"):
+                    gd_kwargs["backend"] = guided_decoding["backend"]
+                if gd_kwargs:
+                    kwargs["guided_decoding"] = GuidedDecodingParams(**gd_kwargs)
+            elif isinstance(guided_decoding, GuidedDecodingParams):
+                kwargs["guided_decoding"] = guided_decoding
+
         logger.info(f"vllm sampling kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
 
