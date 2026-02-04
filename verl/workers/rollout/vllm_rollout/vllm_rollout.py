@@ -262,6 +262,41 @@ class vLLMAsyncRollout(BaseRollout):
                 logger.info("Loading standard weights (non-FP8, async)")
                 model.load_weights(weights)
 
+    @staticmethod
+    def build_sampling_params_from_config(config):
+        """Build vLLM SamplingParams from a rollout config, handling guided_decoding conversion.
+
+        The config loop picks up all keys that match SamplingParams attributes. The
+        guided_decoding field needs special handling: RolloutConfig stores it as a
+        GuidedDecodingConfig dataclass (or OmegaConf serializes it as a dict), but
+        vLLM expects a GuidedDecodingParams object.
+        """
+        from vllm import SamplingParams
+
+        from verl.workers.rollout.vllm_rollout.utils import convert_guided_decoding_config
+
+        kwargs = dict(
+            n=1,
+            logprobs=0,
+            max_tokens=config.response_length,
+            repetition_penalty=config.get("repetition_penalty", 1.0),
+        )
+        kwargs["detokenize"] = False
+
+        # Copy matching SamplingParams fields from config
+        for k in config.keys():
+            if hasattr(SamplingParams(), str(k)) and k != "seed":
+                kwargs[k] = config.get(k)
+        kwargs["n"] = 1  # already repeat in ray_trainer
+
+        # Convert guided_decoding dict/dataclass to GuidedDecodingParams
+        guided_decoding = kwargs.pop("guided_decoding", None)
+        converted = convert_guided_decoding_config(guided_decoding)
+        if converted is not None:
+            kwargs["guided_decoding"] = converted
+
+        return SamplingParams(**kwargs)
+
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Batch generate sequences in sync mode."""
         raise NotImplementedError

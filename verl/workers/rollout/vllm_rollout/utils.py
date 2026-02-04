@@ -32,3 +32,43 @@ def get_vllm_max_lora_rank(lora_rank: int):
             return rank
 
     raise ValueError(f"lora_rank must be less than or equal to {vllm_max_lora_ranks[-1]}, but got {lora_rank}")
+
+
+def convert_guided_decoding_config(guided_decoding):
+    """Convert a guided_decoding dict or dataclass to a vLLM GuidedDecodingParams object.
+
+    In sync SPMD mode, the rollout config loop picks up guided_decoding as a plain dict
+    (or dataclass) and passes it to SamplingParams. vLLM expects a GuidedDecodingParams
+    object (it accesses .backend as an attribute). This helper handles the conversion.
+
+    Returns GuidedDecodingParams if there's an actual constraint, otherwise None.
+    """
+    from vllm.sampling_params import GuidedDecodingParams
+
+    if guided_decoding is None:
+        return None
+
+    if isinstance(guided_decoding, GuidedDecodingParams):
+        return guided_decoding
+
+    # Convert dataclass to dict if needed
+    if hasattr(guided_decoding, "__dataclass_fields__"):
+        from dataclasses import asdict
+
+        guided_decoding = asdict(guided_decoding)
+
+    if not isinstance(guided_decoding, dict):
+        return None
+
+    # Only create GuidedDecodingParams if there's an actual constraint
+    gd_kwargs = {}
+    for field in ("json_schema", "regex", "grammar", "choice", "json_object"):
+        if guided_decoding.get(field):
+            gd_kwargs[field] = guided_decoding[field]
+    if guided_decoding.get("backend"):
+        gd_kwargs["backend"] = guided_decoding["backend"]
+
+    if gd_kwargs:
+        return GuidedDecodingParams(**gd_kwargs)
+
+    return None
