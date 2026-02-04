@@ -72,7 +72,7 @@ actor_rollout_ref:
 
   rollout:
     name: vllm
-    mode: async
+    mode: sync
 
     # Sampling params for GRPO
     temperature: 1.0
@@ -85,19 +85,11 @@ actor_rollout_ref:
     response_length: 2048
     max_num_seqs: 512
 
-    # Guided decoding configuration (optional - enable for constrained generation)
-    # Set json_schema to enforce JSON output format during generation
-    # For per-sample schemas, set per_sample_schema: true
-    guided_decoding:
-      # json_schema: null  # Set a global JSON schema or leave null for per-sample
-      # regex: null
-      # grammar: null
-      # choice: null
-      backend: null  # "xgrammar" (fastest), "outlines", "lm-format-enforcer"
-      enable_reasoning: false
-      reasoning_delimiter: "<answer>"
-      reasoning_end_delimiter: "</answer>"
-      per_sample_schema: false
+    # NOTE: guided_decoding is intentionally NOT set here.
+    # In sync mode, any keys under rollout.* get serialized into vLLM
+    # SamplingParams kwargs, and guided_decoding is not a valid SamplingParams field.
+    # To enable guided decoding, pass it via CLI override:
+    #   actor_rollout_ref.rollout.guided_decoding.backend=xgrammar
 
     # Validation sampling params
     val_kwargs:

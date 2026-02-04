@@ -323,7 +323,7 @@ python3 -m recipe.structured_output.main_structured_output \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size="$SP_SIZE" \
     \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.mode=async \
+    actor_rollout_ref.rollout.mode=sync \
     actor_rollout_ref.rollout.n="$N_RESPONSES" \
     actor_rollout_ref.rollout.temperature="$TRAIN_TEMPERATURE" \
     actor_rollout_ref.rollout.top_p="$TRAIN_TOP_P" \
