@@ -348,6 +348,21 @@ class AgentLoopWorkerBase:
             sampling_params["top_p"] = config.val_kwargs.top_p
             sampling_params["temperature"] = config.val_kwargs.temperature
 
+        # Add guided decoding params if configured
+        guided_decoding_cfg = getattr(config, "guided_decoding", None)
+        if guided_decoding_cfg and any([
+            getattr(guided_decoding_cfg, "json_schema", None),
+            getattr(guided_decoding_cfg, "regex", None),
+            getattr(guided_decoding_cfg, "grammar", None),
+            getattr(guided_decoding_cfg, "choice", None),
+        ]):
+            from dataclasses import asdict
+            gd_dict = asdict(guided_decoding_cfg) if hasattr(guided_decoding_cfg, "__dataclass_fields__") else dict(guided_decoding_cfg)
+            # Remove None values and internal config fields
+            gd_dict = {k: v for k, v in gd_dict.items() if v is not None and k not in ("enable_reasoning", "reasoning_delimiter", "reasoning_end_delimiter", "per_sample_schema")}
+            if gd_dict:
+                sampling_params["guided_decoding"] = gd_dict
+
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:
             default_agent_loop = config.agent.default_agent_loop

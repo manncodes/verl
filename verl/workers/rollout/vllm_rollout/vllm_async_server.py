@@ -403,7 +403,34 @@ class vLLMHttpServerBase:
         max_tokens = self.config.max_model_len - len(prompt_ids)
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+
+        # Extract guided decoding params before constructing SamplingParams
+        guided_decoding_params = sampling_params.pop("guided_decoding", None)
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+
+        # Apply guided decoding constraints if configured
+        if guided_decoding_params:
+            from vllm.sampling_params import GuidedDecodingParams
+
+            gd_kwargs = {}
+            if "json_schema" in guided_decoding_params and guided_decoding_params["json_schema"]:
+                schema = guided_decoding_params["json_schema"]
+                if isinstance(schema, str):
+                    gd_kwargs["json"] = json.loads(schema)
+                else:
+                    gd_kwargs["json"] = schema
+            elif "regex" in guided_decoding_params and guided_decoding_params["regex"]:
+                gd_kwargs["regex"] = guided_decoding_params["regex"]
+            elif "grammar" in guided_decoding_params and guided_decoding_params["grammar"]:
+                gd_kwargs["grammar"] = guided_decoding_params["grammar"]
+            elif "choice" in guided_decoding_params and guided_decoding_params["choice"]:
+                gd_kwargs["choice"] = guided_decoding_params["choice"]
+
+            if "backend" in guided_decoding_params and guided_decoding_params["backend"]:
+                gd_kwargs["backend"] = guided_decoding_params["backend"]
+
+            if gd_kwargs:
+                sampling_params.guided_decoding = GuidedDecodingParams(**gd_kwargs)
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         prompt = TokensPrompt(
             prompt_token_ids=prompt_ids, multi_modal_data={"image": image_data} if image_data else None

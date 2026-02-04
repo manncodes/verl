@@ -1,0 +1,121 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  # Train data: Nemotron structured output dataset (preprocessed to parquet)
+  train_files: ${data.train_files}
+  val_files: ${data.val_files}
+
+  # Prompt and response lengths
+  max_prompt_length: 2048
+  max_response_length: 2048
+
+  # Generation batch size
+  gen_batch_size: ${data.train_batch_size}
+  train_batch_size: 128
+
+  # Override reward function key for structured output data
+  reward_fn_key: data_source
+
+# Use the structured_output reward manager
+reward_model:
+  reward_manager:
+    source: register
+    name: structured_output
+  enable: False
+
+# Custom reward function for structured output validation
+custom_reward_function:
+  path: null
+  name: compute_score
+
+# GRPO algorithm config
+algorithm:
+  _target_: verl.trainer.config.AlgoConfig
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: True
+  gamma: 1.0
+  lam: 1.0
+  use_kl_in_reward: False
+  kl_penalty: kl
+  kl_ctrl:
+    _target_: verl.trainer.config.KLControlConfig
+    type: fixed
+    kl_coef: 0.001
+    horizon: 10000
+    target_kl: 0.1
+
+# Actor rollout reference config
+actor_rollout_ref:
+  hybrid_engine: true
+
+  actor:
+    # Use KL loss for stability
+    use_kl_loss: True
+    kl_loss_type: low_var_kl
+    kl_loss_coef: 0.001
+
+    # PPO clip range
+    ppo_mini_batch_size: 64
+    ppo_micro_batch_size_per_gpu: 8
+    ppo_epochs: 1
+
+    # Loss aggregation
+    loss_agg_mode: token-mean
+
+    # Entropy bonus to encourage exploration of diverse JSON structures
+    entropy_coeff: 0.01
+
+  rollout:
+    name: vllm
+    mode: async
+
+    # Sampling params for GRPO
+    temperature: 1.0
+    top_p: 0.95
+    top_k: -1
+    n: 5  # Number of samples per prompt for GRPO group
+
+    # Model capacity
+    prompt_length: 2048
+    response_length: 2048
+    max_num_seqs: 512
+
+    # Guided decoding configuration (optional - enable for constrained generation)
+    # Set json_schema to enforce JSON output format during generation
+    # For per-sample schemas, set per_sample_schema: true
+    guided_decoding:
+      # json_schema: null  # Set a global JSON schema or leave null for per-sample
+      # regex: null
+      # grammar: null
+      # choice: null
+      backend: null  # "xgrammar" (fastest), "outlines", "lm-format-enforcer"
+      enable_reasoning: false
+      reasoning_delimiter: "<answer>"
+      reasoning_end_delimiter: "</answer>"
+      per_sample_schema: false
+
+    # Validation sampling params
+    val_kwargs:
+      temperature: 0.7
+      top_p: 0.9
+      do_sample: true
+      n: 1
+
+# Trainer config
+trainer:
+  project_name: verl-structured-output
+  experiment_name: grpo_json_schema
+  total_epochs: 10
+  critic_warmup: 0  # No critic in GRPO
+  val_before_train: True
+  test_freq: 50
+  save_freq: 100
+  nnodes: 1
+  n_gpus_per_node: 8
+  logger: ["console", "wandb"]

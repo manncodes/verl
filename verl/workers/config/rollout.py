@@ -22,6 +22,7 @@ from verl.utils.profiler import ProfilerConfig
 
 __all__ = [
     "SamplingConfig",
+    "GuidedDecodingConfig",
     "MultiTurnConfig",
     "CustomAsyncServerConfig",
     "AgentLoopConfig",
@@ -39,6 +40,40 @@ class SamplingConfig(BaseConfig):
     top_p: float = 1.0
     do_sample: bool = True
     n: int = 1
+
+
+@dataclass
+class GuidedDecodingConfig(BaseConfig):
+    """Configuration for structured/guided decoding during rollout.
+
+    Supports JSON Schema, regex, EBNF grammar, and choice-based constraints.
+    These are passed to vLLM/SGLang's guided_decoding parameter in SamplingParams.
+
+    Only one constraint type should be active at a time. If json_schema is set,
+    it takes precedence. The backend field controls which guided decoding engine
+    is used (xgrammar is the fastest default in vLLM v0.8+).
+
+    For CRANE-style hybrid decoding (reasoning + constrained output), set
+    enable_reasoning=True. The model will generate free-form reasoning first,
+    then switch to constrained decoding at the reasoning_delimiter.
+    """
+
+    # Constraint type (mutually exclusive - only set one)
+    json_schema: Optional[str] = None  # JSON schema string or path
+    regex: Optional[str] = None  # Regex pattern
+    grammar: Optional[str] = None  # EBNF grammar string
+    choice: Optional[list] = None  # List of valid choices
+
+    # Backend selection for guided decoding engine
+    backend: Optional[str] = None  # "xgrammar" (default), "outlines", "lm-format-enforcer"
+
+    # CRANE-style hybrid decoding: reasoning + constrained output
+    enable_reasoning: bool = False
+    reasoning_delimiter: str = "<answer>"  # Delimiter to switch from free-form to constrained
+    reasoning_end_delimiter: str = "</answer>"  # End delimiter for the constrained section
+
+    # Per-sample schema: if True, schema is loaded from each sample's extra_info
+    per_sample_schema: bool = False
 
 
 @dataclass
@@ -172,6 +207,9 @@ class RolloutConfig(BaseConfig):
     trace: TraceConfig = field(default_factory=TraceConfig)
 
     multi_turn: MultiTurnConfig = field(default_factory=MultiTurnConfig)
+
+    # Guided decoding configuration for structured output generation
+    guided_decoding: GuidedDecodingConfig = field(default_factory=GuidedDecodingConfig)
 
     # Server configuration for sglang server mode
     server: ServerConfig = field(default_factory=ServerConfig)
