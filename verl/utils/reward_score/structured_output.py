@@ -26,6 +26,7 @@ Requires: pip install openapi-schema-validator
 
 import json
 import random
+import re
 from typing import Any, Dict
 
 
@@ -72,8 +73,12 @@ def validate_json_schema(schema_str: str, response_text: str) -> bool:
 def extract_json_from_response(response_text: str) -> str:
     """Extract JSON content from a model response.
 
-    Handles cases where the model wraps JSON in markdown code blocks
-    or includes extra text before/after the JSON.
+    Handles real-world LLM output patterns including:
+    - Plain JSON
+    - Markdown code blocks (```json ... ```)
+    - <think>...</think> reasoning tags (DeepSeek-R1 style)
+    - Preamble/postamble text around JSON
+    - Multiple JSON blocks (picks the first valid one)
 
     Args:
         response_text: The raw model response text.
@@ -83,18 +88,34 @@ def extract_json_from_response(response_text: str) -> str:
     """
     text = response_text.strip()
 
-    # Handle markdown code blocks: ```json ... ``` or ``` ... ```
-    if text.startswith("```"):
-        lines = text.split("\n")
-        # Remove first line (```json or ```) and last line (```)
-        if lines[-1].strip() == "```":
-            lines = lines[1:-1]
-        else:
-            lines = lines[1:]
-        text = "\n".join(lines).strip()
+    # Strip <think>...</think> blocks (DeepSeek-R1 / reasoning model style)
+    # These tags wrap chain-of-thought reasoning that precedes the actual answer
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
-    # Try to find JSON object or array boundaries
-    for start_char, end_char in [("{", "}"), ("[", "]")]:
+    # Handle markdown code blocks: ```json ... ``` or ``` ... ```
+    # Try to find the last code block (models often put the final answer last)
+    code_block_pattern = re.compile(r"```(?:json|JSON)?\s*\n(.*?)```", re.DOTALL)
+    code_blocks = code_block_pattern.findall(text)
+    if code_blocks:
+        # Try each code block from last to first (final answer is usually last)
+        for block in reversed(code_blocks):
+            block = block.strip()
+            try:
+                json.loads(block)
+                return block
+            except json.JSONDecodeError:
+                continue
+
+    # Try to find JSON object or array boundaries.
+    # Order by which delimiter appears first in the text so that the outermost
+    # structure is preferred (e.g., an array wrapping objects is tried before
+    # extracting a nested object from within).
+    pairs = [("{", "}"), ("[", "]")]
+    obj_idx = text.find("{")
+    arr_idx = text.find("[")
+    if arr_idx != -1 and (obj_idx == -1 or arr_idx < obj_idx):
+        pairs = [("[", "]"), ("{", "}")]
+    for start_char, end_char in pairs:
         start_idx = text.find(start_char)
         end_idx = text.rfind(end_char)
         if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
