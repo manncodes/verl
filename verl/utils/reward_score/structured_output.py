@@ -140,6 +140,17 @@ def _compute_field_scores(
 
     for field_name, field_schema in properties.items():
         field_path = f"{prefix}.{field_name}" if prefix else field_name
+
+        # field_schema can be a list (e.g., from anyOf/oneOf constructs) instead of a dict.
+        # In that case we can't extract type info, so just credit presence.
+        if not isinstance(field_schema, dict):
+            if field_name not in data:
+                if field_name in required:
+                    scores[field_path] = 0.0
+            else:
+                scores[field_path] = 1.0
+            continue
+
         field_type = field_schema.get("type", None)
 
         if field_name not in data:
