@@ -269,6 +269,7 @@ def compute_score(
         "schema_valid_score": 0.0,
         "field_coverage_score": 0.0,
         "content_score": 0.0,
+        "required_field_ratio": 0.0,
     }
 
     # Parse the schema
