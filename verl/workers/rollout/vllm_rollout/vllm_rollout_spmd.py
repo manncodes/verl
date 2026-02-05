@@ -237,6 +237,15 @@ class vLLMRollout(BaseRollout):
             else:
                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 
+        # Extract guided_decoding backend for engine-level config.
+        # In vLLM v1, the backend must be set at engine init time, not per-request.
+        _gd_cfg = config.get("guided_decoding", {})
+        if hasattr(_gd_cfg, "__dataclass_fields__"):
+            from dataclasses import asdict
+
+            _gd_cfg = asdict(_gd_cfg)
+        _gd_backend = _gd_cfg.get("backend", None) if isinstance(_gd_cfg, dict) else None
+
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=config.free_cache_engine,
@@ -256,6 +265,7 @@ class vLLMRollout(BaseRollout):
             enable_prefix_caching=config.enable_prefix_caching,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
+            **({} if not _gd_backend else {"guided_decoding_backend": _gd_backend}),
             **compilation_config,
             **self.lora_kwargs,
             **engine_kwargs,

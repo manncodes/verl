@@ -60,13 +60,14 @@ def convert_guided_decoding_config(guided_decoding):
     if not isinstance(guided_decoding, dict):
         return None
 
-    # Only create GuidedDecodingParams if there's an actual constraint
+    # Only create GuidedDecodingParams if there's an actual constraint.
+    # NOTE: Do NOT include "backend" here. In vLLM v1, request-level backend
+    # selection is no longer supported — the backend must be set at engine
+    # init time via guided_decoding_backend in the LLM() constructor.
     gd_kwargs = {}
     for field in ("json_schema", "regex", "grammar", "choice", "json_object"):
         if guided_decoding.get(field):
             gd_kwargs[field] = guided_decoding[field]
-    if guided_decoding.get("backend"):
-        gd_kwargs["backend"] = guided_decoding["backend"]
 
     if gd_kwargs:
         return GuidedDecodingParams(**gd_kwargs)
