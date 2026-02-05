@@ -88,8 +88,18 @@ def _try_extract_json(text: str) -> Optional[str]:
     return None
 
 
-def _validate_type(value: Any, type_spec: str) -> bool:
-    """Check if a value matches a JSON Schema type specification."""
+def _validate_type(value: Any, type_spec) -> bool:
+    """Check if a value matches a JSON Schema type specification.
+
+    Args:
+        value: The value to check.
+        type_spec: A JSON Schema type string (e.g., "string") or a list of
+            type strings for union types (e.g., ["string", "null"]).
+    """
+    # Handle union types (e.g., ["string", "null"])
+    if isinstance(type_spec, list):
+        return any(_validate_type(value, t) for t in type_spec)
+
     type_map = {
         "string": str,
         "integer": int,
@@ -151,8 +161,11 @@ def _compute_field_scores(
             scores[field_path] = 0.0
             continue
 
+        # Normalize field_type for checks below (handles union types like ["object", "null"])
+        _type_set = set(field_type) if isinstance(field_type, list) else {field_type} if field_type else set()
+
         # Nested object validation
-        if field_type == "object" and isinstance(value, dict):
+        if "object" in _type_set and isinstance(value, dict):
             nested_scores = _compute_field_scores(value, field_schema, prefix=field_path)
             scores.update(nested_scores)
             # The parent field is valid if all nested fields are valid
@@ -163,7 +176,7 @@ def _compute_field_scores(
             continue
 
         # Array validation
-        if field_type == "array" and isinstance(value, list):
+        if "array" in _type_set and isinstance(value, list):
             items_schema = field_schema.get("items", {})
             if value and items_schema:
                 item_scores = []
