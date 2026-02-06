@@ -1069,3 +1069,95 @@ class TestBugsAndEdgeCases:
         # This test documents the issue — format_chat_prompt is not
         # referenced by any scoring function in the module.
         pass
+
+    def test_bug_float_kwargs_causes_strip_error(self):
+        """BUG: When ground_truth kwargs contain float values (e.g., from JSON
+        parsing), the IFEVAL instruction classes call .strip() on them,
+        causing: AttributeError: 'float' object has no attribute 'strip'.
+
+        Example triggering data:
+            ground_truth = {
+                "instruction_id_list": ["length_constraints:number_paragraphs"],
+                "kwargs": [{"num_paragraphs": 5.0}]  # float instead of str/int
+            }
+
+        Root cause: The compute_score function passes kwargs directly to
+        instruction classes like NumberParagraphs, which expect string values
+        and call .strip() on them.
+
+        Fix: Coerce kwargs values before passing to instruction classes:
+            def _coerce_kwarg_value(v):
+                if v is None:
+                    return None
+                if isinstance(v, float):
+                    return str(int(v)) if v == int(v) else str(v)
+                if isinstance(v, int) and not isinstance(v, bool):
+                    return str(v)
+                return v
+
+            clean_kw = {k: _coerce_kwarg_value(v) for k, v in (kw or {}).items() if v is not None}
+        """
+        import pytest
+
+        # Simulate the problematic data
+        kwargs_with_float = {"num_paragraphs": 5.0}
+
+        # Without fix, calling .strip() raises AttributeError
+        with pytest.raises(AttributeError) as exc_info:
+            kwargs_with_float["num_paragraphs"].strip()
+        assert "float" in str(exc_info.value)
+        assert "strip" in str(exc_info.value)
+
+        # The fix function
+        def _coerce_kwarg_value(v):
+            if v is None:
+                return None
+            if isinstance(v, float):
+                return str(int(v)) if v == int(v) else str(v)
+            if isinstance(v, int) and not isinstance(v, bool):
+                return str(v)
+            return v
+
+        # Apply fix and verify .strip() works
+        fixed_kw = {k: _coerce_kwarg_value(v) for k, v in kwargs_with_float.items() if v is not None}
+        assert fixed_kw["num_paragraphs"] == "5"
+        assert fixed_kw["num_paragraphs"].strip() == "5"
+
+    def test_coerce_kwarg_value_edge_cases(self):
+        """Test the _coerce_kwarg_value helper for all edge cases."""
+        def _coerce_kwarg_value(v):
+            if v is None:
+                return None
+            if isinstance(v, float):
+                return str(int(v)) if v == int(v) else str(v)
+            if isinstance(v, int) and not isinstance(v, bool):
+                return str(v)
+            return v
+
+        # Float that equals its int (common from JSON)
+        assert _coerce_kwarg_value(5.0) == "5"
+        assert _coerce_kwarg_value(100.0) == "100"
+
+        # Float with decimals (preserve precision)
+        assert _coerce_kwarg_value(3.14) == "3.14"
+        assert _coerce_kwarg_value(0.5) == "0.5"
+
+        # Integers
+        assert _coerce_kwarg_value(5) == "5"
+        assert _coerce_kwarg_value(100) == "100"
+        assert _coerce_kwarg_value(0) == "0"
+
+        # Booleans should pass through (they're a subclass of int)
+        assert _coerce_kwarg_value(True) is True
+        assert _coerce_kwarg_value(False) is False
+
+        # Strings pass through unchanged
+        assert _coerce_kwarg_value("hello") == "hello"
+        assert _coerce_kwarg_value("5") == "5"
+
+        # None stays None
+        assert _coerce_kwarg_value(None) is None
+
+        # Other types pass through
+        assert _coerce_kwarg_value(["a", "b"]) == ["a", "b"]
+        assert _coerce_kwarg_value({"key": "val"}) == {"key": "val"}
