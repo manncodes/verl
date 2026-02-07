@@ -58,7 +58,7 @@ def convert_json_to_parquet(json_path, train_data_ratio, output_dir, seed):
             "The reasoning process and answer are enclosed within <think> </think> "
             "and <answer> </answer> tags, respectively, i.e., "
             "<think> reasoning process here </think><answer> answer here </answer>. "
-            "Put your final answer within \\\\boxed{}. "
+            "Put your final answer within \\boxed{}. "
         )
         converted_item = {
             "data_source": "deepscaler",
