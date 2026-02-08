@@ -31,6 +31,7 @@ Usage:
 """
 
 import argparse
+import ast
 import json
 import os
 import random
@@ -73,15 +74,67 @@ def format_hint_system_prompt(hint: str, hint_level: int) -> str:
     return f"{DEFAULT_SYSTEM_PROMPT} \nYou are given a hint to help solve this problem.\n\nHint (Level {hint_level}/5): {hint}"
 
 
+def _parse_as_messages(prompt) -> Optional[List[Dict]]:
+    """Try to interpret prompt as a list of message dicts (role/content pairs)."""
+    if isinstance(prompt, list) and prompt:
+        if isinstance(prompt[0], dict) and "role" in prompt[0]:
+            return prompt
+        return None
+    if isinstance(prompt, str):
+        # Try JSON first (double-quoted keys)
+        try:
+            parsed = json.loads(prompt)
+            if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict) and "role" in parsed[0]:
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+        # Try Python literal eval (handles single-quoted dicts from repr())
+        try:
+            parsed = ast.literal_eval(prompt)
+            if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict) and "role" in parsed[0]:
+                return parsed
+        except (ValueError, SyntaxError):
+            pass
+    return None
+
+
+def _extract_user_content(messages: List[Dict]) -> str:
+    """Extract text content from the first user message in a message list."""
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                # Handle multimodal content (list of content parts)
+                parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        parts.append(part.get("text", ""))
+                    elif isinstance(part, str):
+                        parts.append(part)
+                return "\n".join(parts)
+            return str(content) if content else ""
+    # Fallback: return first element's content
+    if messages:
+        first = messages[0]
+        if isinstance(first, dict):
+            return str(first.get("content", ""))
+        return str(first)
+    return ""
+
+
 def extract_prompt_text(prompt) -> str:
-    """Extract text content from prompt field."""
+    """Extract text content from prompt field.
+
+    Handles:
+    - Plain text string
+    - List of message dicts [{'role': 'user', 'content': '...'}]
+    - Serialized string representation of a message list (JSON or Python repr)
+    """
+    messages = _parse_as_messages(prompt)
+    if messages is not None:
+        return _extract_user_content(messages)
     if isinstance(prompt, str):
         return prompt
-    if isinstance(prompt, list) and prompt:
-        first = prompt[0]
-        if isinstance(first, dict):
-            return first.get("content", "")
-        return str(first)
     return str(prompt) if prompt else ""
 
 
