@@ -288,27 +288,29 @@ def process_enriched_parquet(
     return processed
 
 
-def split_by_ability(
+def split_by_ability_and_difficulty(
     examples: List[Dict[str, Any]],
-    test_per_ability: int,
+    test_per_bucket: int,
     seed: int,
 ) -> tuple[List[Dict], List[Dict]]:
-    """Split examples into train/test with uniform test distribution per ability."""
+    """Split examples into train/test with test_per_bucket samples per (ability, difficulty) combo."""
     rng = random.Random(seed)
 
-    # Group by ability
-    by_ability: Dict[str, List[Dict]] = defaultdict(list)
+    # Group by (ability, difficulty_bucket)
+    by_group: Dict[tuple, List[Dict]] = defaultdict(list)
     for ex in examples:
         ability = ex.get("ability", "unknown")
-        by_ability[ability].append(ex)
+        difficulty = ex.get("extra_info", {}).get("estimated_difficulty")
+        bucket = get_difficulty_bucket(difficulty)
+        by_group[(ability, bucket)].append(ex)
 
     train, test = [], []
 
-    for ability in sorted(by_ability.keys()):
-        items = by_ability[ability]
+    for key in sorted(by_group.keys()):
+        items = by_group[key]
         rng.shuffle(items)
 
-        n_test = min(test_per_ability, len(items))
+        n_test = min(test_per_bucket, len(items))
         test.extend(items[:n_test])
         train.extend(items[n_test:])
 
@@ -316,20 +318,27 @@ def split_by_ability(
     rng.shuffle(test)
 
     print(f"\nSplit: {len(train)} train, {len(test)} test")
-    for ability in sorted(by_ability.keys()):
+    # Print per-ability summary
+    abilities = sorted({k[0] for k in by_group.keys()})
+    for ability in abilities:
         n_train = sum(1 for ex in train if ex.get("ability") == ability)
         n_test = sum(1 for ex in test if ex.get("ability") == ability)
-        print(f"  {ability}: {n_train} train, {n_test} test")
+        buckets_detail = []
+        for bucket in sorted({k[1] for k in by_group.keys() if k[0] == ability}):
+            bt = sum(1 for ex in test
+                     if ex.get("ability") == ability
+                     and get_difficulty_bucket(ex.get("extra_info", {}).get("estimated_difficulty")) == bucket)
+            buckets_detail.append(f"{bucket}={bt}")
+        print(f"  {ability}: {n_train} train, {n_test} test ({', '.join(buckets_detail)})")
 
     return train, test
 
 
-def save_partitioned(
+def save_train_partitioned(
     examples: List[Dict[str, Any]],
     output_dir: str,
-    split_name: str,
 ) -> Dict[str, Dict[str, int]]:
-    """Save partitioned by ability and difficulty bucket."""
+    """Save train data partitioned by ability and difficulty into domain dirs."""
     partitions: Dict[str, Dict[str, List[Dict]]] = defaultdict(lambda: defaultdict(list))
     stats: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
@@ -349,10 +358,57 @@ def save_partitioned(
             if not items:
                 continue
 
-            filepath = os.path.join(ability_dir, f"{split_name}_{bucket}.parquet")
+            filepath = os.path.join(ability_dir, f"train_{bucket}.parquet")
             ds = datasets.Dataset.from_list(items)
             ds.to_parquet(filepath)
             print(f"  {filepath} ({len(items)} examples)")
+
+    return dict(stats)
+
+
+def save_test_partitioned(
+    examples: List[Dict[str, Any]],
+    output_dir: str,
+) -> Dict[str, Dict[str, int]]:
+    """Save test data: split by difficulty in test/ folder, combined per domain dir."""
+    partitions: Dict[str, Dict[str, List[Dict]]] = defaultdict(lambda: defaultdict(list))
+    stats: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    for ex in examples:
+        ability = ex.get("ability", "unknown")
+        difficulty = ex.get("extra_info", {}).get("estimated_difficulty")
+        bucket = get_difficulty_bucket(difficulty)
+
+        partitions[ability][bucket].append(ex)
+        stats[ability][bucket] += 1
+
+    # Save per-difficulty files into test/ folder
+    test_dir = os.path.join(output_dir, "test")
+    os.makedirs(test_dir, exist_ok=True)
+
+    for ability, buckets in partitions.items():
+        for bucket, items in buckets.items():
+            if not items:
+                continue
+            filepath = os.path.join(test_dir, f"{ability}_{bucket}.parquet")
+            ds = datasets.Dataset.from_list(items)
+            ds.to_parquet(filepath)
+            print(f"  {filepath} ({len(items)} examples)")
+
+    # Save combined test per domain dir
+    for ability, buckets in partitions.items():
+        ability_dir = os.path.join(output_dir, ability)
+        os.makedirs(ability_dir, exist_ok=True)
+
+        all_items = []
+        for items in buckets.values():
+            all_items.extend(items)
+
+        if all_items:
+            filepath = os.path.join(ability_dir, "test.parquet")
+            ds = datasets.Dataset.from_list(all_items)
+            ds.to_parquet(filepath)
+            print(f"  {filepath} ({len(all_items)} examples)")
 
     return dict(stats)
 
@@ -399,10 +455,10 @@ def main():
         help="Partition output by domain (ability) and difficulty",
     )
     parser.add_argument(
-        "--test_per_ability",
+        "--test_per_bucket",
         type=int,
         default=50,
-        help="Test samples per ability",
+        help="Test samples per (ability, difficulty) bucket",
     )
     parser.add_argument(
         "--seed",
@@ -449,9 +505,9 @@ def main():
         examples = [ex for ex in examples if ex.get("ability") not in exclude_set]
         print(f"Filtered to {len(examples)} excluding abilities: {args.exclude_abilities}")
 
-    # Split train/test
-    train_examples, test_examples = split_by_ability(
-        examples, args.test_per_ability, args.seed
+    # Split train/test (50 per domain x difficulty bucket)
+    train_examples, test_examples = split_by_ability_and_difficulty(
+        examples, args.test_per_bucket, args.seed
     )
 
     # Save
@@ -460,10 +516,10 @@ def main():
 
     if args.partition_by_domain:
         print("\nSaving train partitioned by domain/difficulty...")
-        train_stats = save_partitioned(train_examples, output_dir, "train")
+        train_stats = save_train_partitioned(train_examples, output_dir)
 
-        print("\nSaving test partitioned by domain/difficulty...")
-        test_stats = save_partitioned(test_examples, output_dir, "test")
+        print("\nSaving test: per-difficulty in test/, combined in domain dirs...")
+        test_stats = save_test_partitioned(test_examples, output_dir)
 
         # Print stats
         print("\nPartition statistics:")
