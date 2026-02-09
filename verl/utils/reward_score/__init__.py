@@ -86,6 +86,16 @@ def default_compute_score(
 
             # Assuming prime_code doesn't need the URL
             res = prime_code.compute_score(solution_str, ground_truth, continuous=True)
+    elif data_source in ["livecodebench/code_generation_lite", "livecodebench/code_generation"]:
+        from . import livecodebench
+
+        res = livecodebench.compute_score(
+            solution_str,
+            ground_truth,
+            sandbox_fusion_url=sandbox_fusion_url,
+            concurrent_semaphore=concurrent_semaphore,
+            memory_limit_mb=memory_limit_mb,
+        )
     elif data_source in ["hiyouga/geometry3k"]:
         from . import geo3k
 
