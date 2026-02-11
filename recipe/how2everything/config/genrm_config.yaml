@@ -1,0 +1,49 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+reward_model:
+  _target_: verl.workers.config.RewardModelConfig
+
+  reward_manager: naive
+  enable: False
+
+  # Whether to deploy the judge model to a separate resource pool.
+  enable_resource_pool: False
+  n_gpus_per_node: 0
+  nnodes: 0
+
+  model:
+    type: discriminative
+    path: how2everything/how2judge  # 8B judge model from HuggingFace
+    external_lib: ${actor_rollout_ref.model.external_lib}
+    trust_remote_code: False
+
+  rollout:
+    _target_: verl.workers.config.RolloutConfig
+    name: vllm
+    dtype: bfloat16
+    gpu_memory_utilization: 0.90
+    enforce_eager: true
+    cudagraph_capture_sizes: null
+    free_cache_engine: true
+    data_parallel_size: 1
+    expert_parallel_size: 1
+    tensor_model_parallel_size: 1  # 8B model fits on 1 GPU in bf16
+    max_num_batched_tokens: 8192
+    max_model_len: null
+    max_num_seqs: 256
+    load_format: auto
+    engine_kwargs: {}
+    limit_images: null
+    enable_chunked_prefill: true
+    enable_prefix_caching: true
+    disable_log_stats: true
+    skip_tokenizer_init: true
+
+    prompt_length: 2048
+    response_length: 2048
