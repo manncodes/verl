@@ -4,6 +4,14 @@
 # This uses the How2Judge 8B model as a generative reward model to evaluate
 # generated procedures via the How2Score LLM-as-judge protocol.
 #
+# Architecture:
+#   - actor_rollout_ref.rollout.mode=async triggers AgentLoopManager
+#   - AgentLoopManager creates RewardLoopManager which deploys How2Judge as a
+#     sglang server and creates RewardLoopWorker instances
+#   - RewardLoopWorker uses NaiveRewardLoopManager which calls the async
+#     compute_score_how2() with reward_router_address and reward_model_tokenizer
+#     injected automatically
+#
 # Prerequisites:
 #   1. Preprocess data: python recipe/how2everything/data_preprocess.py
 #   2. Set MODEL_PATH and JUDGE_PATH environment variables
@@ -75,6 +83,7 @@ python3 -m verl.trainer.main_ppo \
     data.return_raw_chat=True \
     data.filter_overlong_prompts=True \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
+    actor_rollout_ref.rollout.mode=async \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
@@ -113,10 +122,11 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     reward_model.enable=True \
     reward_model.enable_resource_pool=True \
+    reward_model.reward_manager=naive \
     reward_model.n_gpus_per_node=8 \
     reward_model.nnodes="${RM_NODES}" \
     reward_model.model.path="${JUDGE_PATH}" \
-    reward_model.rollout.name=vllm \
+    reward_model.rollout.name=sglang \
     reward_model.rollout.gpu_memory_utilization=0.90 \
     reward_model.rollout.tensor_model_parallel_size=1 \
     reward_model.rollout.free_cache_engine=False \

@@ -15,13 +15,19 @@
 Custom reward functions for How2Everything VeRL integration.
 
 Provides two reward functions:
-1. compute_score_how2: Async GenRM reward using How2Judge model
-2. compute_score_how2_rule: Rule-based heuristic reward (no judge model needed)
+1. compute_score_how2: Async GenRM reward using How2Judge model (requires rollout.mode=async)
+2. compute_score_how2_rule: Sync rule-based heuristic reward (no judge model needed)
+
+The async variant is called by NaiveRewardLoopManager.run_single() which provides
+reward_router_address and reward_model_tokenizer as extra kwargs. This requires:
+    actor_rollout_ref.rollout.mode=async
+    reward_model.enable=True
+    reward_model.enable_resource_pool=True
 
 Usage in VeRL config:
     custom_reward_function.path=recipe/how2everything/reward_fn.py
-    custom_reward_function.name=compute_score_how2          # For GenRM
-    custom_reward_function.name=compute_score_how2_rule     # For rule-only ablation
+    custom_reward_function.name=compute_score_how2          # For GenRM (async mode)
+    custom_reward_function.name=compute_score_how2_rule     # For rule-only ablation (sync mode)
 
 Reference: https://github.com/lilakk/how2everything
 """
@@ -35,14 +41,125 @@ import re
 import aiohttp
 from transformers import PreTrainedTokenizer
 
-from recipe.how2everything.judge_prompt import (
-    JUDGE_SAMPLING_PARAMS,
-    build_judge_prompt,
-    parse_judge_verdict,
-)
-
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+# ---------------------------------------------------------------------------
+# How2Score judge prompt template (upstream: prompts/judge.txt)
+#
+# The How2Judge model was trained to output structured JSON:
+#   {"reasoning": str, "critical_failures": [{"failure": str, "L1_steps": [int], "L2_steps": [int]}]}
+# Pass/fail is determined by whether critical_failures is empty.
+#
+# Template variables: {goal}, {reference_steps}, {steps}
+# Note: resources are NOT part of the upstream judge prompt.
+# ---------------------------------------------------------------------------
+
+HOW2SCORE_JUDGE_TEMPLATE = (
+    "You are evaluating whether a candidate procedure (L2) correctly achieves "
+    "a stated goal, using a reference procedure (L1) as a reliable guide.\n\n"
+    "[Goal]\n{goal}\n\n"
+    "[Reference Procedure (L1)]\n{reference_steps}\n\n"
+    "[Candidate Procedure (L2)]\n{steps}\n\n"
+    'A "critical failure" is any issue that would prevent achieving the goal. '
+    "This includes:\n"
+    "- Steps that contradict the goal or diverge significantly from the reference\n"
+    "- Internal inconsistencies, incoherence, or severe vagueness\n"
+    "- Missing essential steps or unnecessary additions that would prevent success\n\n"
+    "L1 reliably achieves the goal as written, but it may not be the only valid way "
+    "to do so. Use it as a reliable reference, not the exclusive solution. "
+    "Minor phrasing differences and additional practical steps that don't interfere "
+    "with the outcome are acceptable.\n\n"
+    "Return only valid json."
+)
+
+JUDGE_SAMPLING_PARAMS = {
+    "max_new_tokens": 2048,
+}
+
+
+# ---------------------------------------------------------------------------
+# Judge prompt construction and response parsing
+# ---------------------------------------------------------------------------
+
+
+def _format_steps(steps):
+    """Format a list of steps into numbered lines."""
+    if isinstance(steps, list):
+        return "\n".join(f"{i + 1}. {step}" for i, step in enumerate(steps))
+    return str(steps)
+
+
+def _build_judge_prompt(goal, reference_steps, candidate_steps):
+    """Build the How2Score judge prompt.
+
+    Args:
+        goal: The procedural goal string.
+        reference_steps: List of reference steps (ground truth).
+        candidate_steps: The candidate procedure text (model output).
+
+    Returns:
+        Formatted judge prompt string.
+    """
+    return HOW2SCORE_JUDGE_TEMPLATE.format(
+        goal=goal,
+        reference_steps=_format_steps(reference_steps),
+        steps=candidate_steps,
+    )
+
+
+def _parse_judge_response(judge_output):
+    """Parse the How2Judge model JSON output into a reward signal.
+
+    The How2Judge model outputs JSON with:
+        {"reasoning": str, "critical_failures": [{"failure": str, "L1_steps": [...], "L2_steps": [...]}]}
+
+    Pass/fail is determined by whether critical_failures is empty.
+
+    Args:
+        judge_output: Raw text output from the How2Judge model.
+
+    Returns:
+        Dict with keys: score (float), has_failure (bool), n_failures (int), parse_failed (bool).
+    """
+    if not judge_output or not judge_output.strip():
+        return {"score": 0.0, "has_failure": False, "n_failures": 0, "parse_failed": True}
+
+    text = judge_output.strip()
+
+    # Try to parse as JSON directly
+    try:
+        result = json.loads(text)
+        failures = result.get("critical_failures", [])
+        has_failure = len(failures) > 0
+        return {
+            "score": -1.0 if has_failure else 1.0,
+            "has_failure": has_failure,
+            "n_failures": len(failures),
+            "parse_failed": False,
+        }
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Fallback: try to extract JSON from within the text (model may add preamble)
+    json_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if json_match:
+        try:
+            result = json.loads(json_match.group(0))
+            failures = result.get("critical_failures", [])
+            has_failure = len(failures) > 0
+            return {
+                "score": -1.0 if has_failure else 1.0,
+                "has_failure": has_failure,
+                "n_failures": len(failures),
+                "parse_failed": False,
+            }
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Could not parse JSON -- treat as parse failure
+    return {"score": 0.0, "has_failure": False, "n_failures": 0, "parse_failed": True}
 
 
 # ---------------------------------------------------------------------------
@@ -51,16 +168,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 async def generate_aiohttp(router_address, prompt_ids, sampling_params):
-    """Send a generation request to the GenRM vLLM/SGLang server.
-
-    Args:
-        router_address: Host:port of the reward model server.
-        prompt_ids: Tokenized prompt as a list of int IDs.
-        sampling_params: Dict of sampling parameters.
-
-    Returns:
-        Dict with 'output_ids' key on success, empty dict on failure.
-    """
+    """Send a generation request to the GenRM server."""
     payload = {
         "input_ids": prompt_ids,
         "sampling_params": sampling_params,
@@ -82,6 +190,10 @@ async def generate_aiohttp(router_address, prompt_ids, sampling_params):
 
 # ---------------------------------------------------------------------------
 # Variant A: Async GenRM reward using How2Judge
+#
+# Called by NaiveRewardLoopManager.run_single() which provides
+# reward_router_address and reward_model_tokenizer as kwargs.
+# Requires actor_rollout_ref.rollout.mode=async.
 # ---------------------------------------------------------------------------
 
 
@@ -95,21 +207,16 @@ async def compute_score_how2(
 ):
     """Compute How2Score reward using the How2Judge generative reward model.
 
-    This function is called by VeRL's reward manager for each generated response.
-    It constructs a judge prompt comparing the generated procedure against the
-    reference, sends it to the How2Judge model, and parses the verdict.
-
     Args:
         data_source: Dataset identifier (e.g., "how2everything/how2train").
         solution_str: The generated procedure text from the policy model.
-        ground_truth: JSON-encoded reference procedure with keys:
-            goal, resources, steps, n_steps.
+        ground_truth: JSON-encoded reference procedure with keys: goal, steps.
         extra_info: Additional metadata (split, index, topic, etc.).
-        reward_router_address: Host:port of the How2Judge vLLM server.
-        reward_model_tokenizer: Tokenizer for the How2Judge model.
+        reward_router_address: Host:port of the How2Judge server (injected by RewardLoopWorker).
+        reward_model_tokenizer: Tokenizer for the How2Judge model (injected by RewardLoopWorker).
 
     Returns:
-        Dict with keys: score (float), verdict (str), has_critical_failure (bool|None).
+        Dict with keys: score, has_failure, n_failures, parse_failed.
     """
     loop = asyncio.get_running_loop()
 
@@ -118,17 +225,16 @@ async def compute_score_how2(
         ref = json.loads(ground_truth)
     except (json.JSONDecodeError, TypeError):
         logger.warning(f"Failed to parse ground_truth JSON: {ground_truth[:200]}")
-        return {"score": 0.0, "verdict": "error", "has_critical_failure": None}
+        return {"score": 0.0, "has_failure": False, "n_failures": 0, "parse_failed": True}
 
-    # Skip judge for empty or refusal responses → direct penalty
+    # Empty or trivially short responses get a direct penalty
     stripped = solution_str.strip()
     if not stripped or len(stripped) < 20:
-        return {"score": -1.0, "verdict": "fail", "has_critical_failure": True}
+        return {"score": -1.0, "has_failure": True, "n_failures": 1, "parse_failed": False}
 
-    # Build judge prompt
-    judge_prompt = build_judge_prompt(
+    # Build judge prompt (uses only goal, reference_steps, candidate_steps -- no resources)
+    judge_prompt = _build_judge_prompt(
         goal=ref["goal"],
-        resources=ref.get("resources", []),
         reference_steps=ref.get("steps", []),
         candidate_steps=solution_str,
     )
@@ -143,7 +249,7 @@ async def compute_score_how2(
         ),
     )
 
-    # Call GenRM
+    # Call GenRM server
     grm_outputs = await generate_aiohttp(
         router_address=reward_router_address,
         prompt_ids=prompt_ids,
@@ -157,20 +263,19 @@ async def compute_score_how2(
             None,
             lambda: reward_model_tokenizer.decode(grm_response_ids, skip_special_tokens=True),
         )
-        result = parse_judge_verdict(grm_response)
+        result = _parse_judge_response(grm_response)
     else:
-        logger.warning("How2Judge returned no output_ids, scoring as ambiguous")
-        result = {"score": 0.0, "verdict": "error", "has_critical_failure": None}
+        logger.warning("How2Judge returned no output_ids")
+        result = {"score": 0.0, "has_failure": False, "n_failures": 0, "parse_failed": True}
 
-    return {
-        "score": result["score"],
-        "verdict": result["verdict"],
-        "has_critical_failure": result["has_critical_failure"],
-    }
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Variant B: Rule-based heuristic reward (no judge model needed)
+#
+# Called by NaiveRewardManager.__call__() in sync mode.
+# Does NOT require async rollout mode or a reward model server.
 # ---------------------------------------------------------------------------
 
 
@@ -181,9 +286,6 @@ def compute_score_how2_rule(
     extra_info: dict = None,
 ):
     """Heuristic reward for procedural generation without a judge model.
-
-    Useful for ablation studies, debugging the data pipeline, or environments
-    where the How2Judge model is not available.
 
     Scoring criteria (total 0.0 to 1.0):
     - +0.3: Response contains numbered steps
@@ -201,13 +303,11 @@ def compute_score_how2_rule(
     Returns:
         Dict with keys: score (float), acc (bool).
     """
-    # Parse ground truth
     try:
         ref = json.loads(ground_truth)
     except (json.JSONDecodeError, TypeError):
         return {"score": 0.0, "acc": False}
 
-    # Penalize empty or refusal responses
     stripped = solution_str.strip()
     if not stripped:
         return {"score": -1.0, "acc": False}
