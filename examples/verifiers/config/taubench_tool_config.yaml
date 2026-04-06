@@ -1,0 +1,31 @@
+# Tau-bench tool configuration for verl's multi-turn agent loop.
+#
+# The TauBenchTool acts as a proxy: it forwards LLM tool calls to the
+# underlying tau-bench environment instance for execution.
+
+tools:
+  - class_name: "verl.envs.taubench_tools.TauBenchTool"
+    config:
+      type: native
+      domain: retail
+    tool_schema:
+      type: "function"
+      function:
+        name: "execute_action"
+        description: >-
+          Execute a customer service action in the tau-bench environment.
+          Supports tool calls (order lookup, returns, etc.) and direct
+          responses to the customer.
+        parameters:
+          type: "object"
+          properties:
+            name:
+              type: "string"
+              description: "The name of the tool/action to execute"
+            arguments:
+              type: "object"
+              description: "Arguments for the tool call"
+            action:
+              type: "string"
+              description: "Alternative: plain text action or response to customer"
+          required: []

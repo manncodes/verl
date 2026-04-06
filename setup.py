@@ -58,6 +58,8 @@ SGLANG_REQUIRES = [
 TRL_REQUIRES = ["trl<=0.9.6"]
 MCORE_REQUIRES = ["mbridge"]
 TRANSFERQUEUE_REQUIRES = ["TransferQueue==0.1.2.dev0"]
+VERIFIERS_REQUIRES = ["verifiers>=0.1.11"]
+TAUBENCH_REQUIRES = ["tau_bench"]
 
 extras_require = {
     "test": TEST_REQUIRES,
@@ -70,6 +72,8 @@ extras_require = {
     "trl": TRL_REQUIRES,
     "mcore": MCORE_REQUIRES,
     "transferqueue": TRANSFERQUEUE_REQUIRES,
+    "verifiers": VERIFIERS_REQUIRES,
+    "taubench": TAUBENCH_REQUIRES,
 }
 
 

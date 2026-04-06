@@ -1,0 +1,53 @@
+# Tau-bench multi-turn GRPO training config for verl.
+#
+# This config trains an agent on tau-bench retail customer service tasks
+# using multi-turn rollouts with tool use.
+#
+# Prerequisites:
+#   pip install tau-bench   (or clone & pip install -e .)
+#
+# Usage:
+#   python -m verl.trainer.main_ppo \
+#       --config-path examples/verifiers/config \
+#       --config-name taubench_multiturn_grpo
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  max_prompt_length: 2048
+  max_response_length: 2048
+  train_batch_size: 64
+  return_raw_chat: True
+  reward_fn_key: data_source
+
+actor_rollout_ref:
+  hybrid_engine: True
+  model:
+    path: ${model.path}
+  rollout:
+    name: sglang
+    temperature: 0.7
+    response_length: 2048
+    multi_turn:
+      enable: True
+      max_user_turns: 10
+      max_assistant_turns: 10
+      tool_config_path: examples/verifiers/config/taubench_tool_config.yaml
+      interaction_config_path: examples/verifiers/config/taubench_interaction_config.yaml
+      format: hermes
+
+algorithm:
+  adv_estimator: grpo
+  gamma: 1.0
+  lam: 1.0
+
+trainer:
+  total_epochs: 3
+  project_name: taubench_grpo
+  experiment_name: taubench_retail_multiturn

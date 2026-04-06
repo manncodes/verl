@@ -104,7 +104,16 @@ def default_compute_score(
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
 
     else:
-        raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
+        # Fallback: try environment-based scoring via verl.envs registry
+        try:
+            from verl.envs.reward_adapter import env_compute_score, is_env_data_source
+
+            if is_env_data_source(data_source):
+                res = env_compute_score(data_source, solution_str, ground_truth, extra_info)
+            else:
+                raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
+        except ImportError:
+            raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
     if isinstance(res, dict):
         return res

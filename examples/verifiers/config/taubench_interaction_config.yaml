@@ -1,0 +1,14 @@
+# Tau-bench interaction configuration for verl's multi-turn agent loop.
+#
+# Uses the generic EnvironmentInteraction adapter to bridge the tau-bench
+# environment (registered as "taubench-retail") into verl's interaction system.
+
+interaction:
+  - name: "taubench"
+    class_name: "verl.envs.interaction_adapter.EnvironmentInteraction"
+    config:
+      env_name: "taubench-retail"
+      env_kwargs:
+        domain: retail
+        task_split: test
+        max_turns: 20
