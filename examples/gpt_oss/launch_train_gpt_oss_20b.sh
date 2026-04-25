@@ -268,6 +268,7 @@ fi
     data.truncation='error' \
     +data.apply_chat_template_kwargs.reasoning_effort="${REASONING_EFFORT}" \
     actor_rollout_ref.model.path="${MODEL_DIR}" \
+    +actor_rollout_ref.model.override_config.attn_implementation=eager \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \

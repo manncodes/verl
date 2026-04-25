@@ -109,6 +109,7 @@ correctness check if you only want that piece.
 
 | flag (env var → hydra override) | default | why it matters for gpt-oss |
 | --- | --- | --- |
+| `model.override_config.attn_implementation=eager` | `eager` | verl's HFModelConfig defaults to `flash_attention_2`; FA2 silently bypasses gpt-oss attention sinks (and 2.8.x has an ABI mismatch with torch 2.9.1 → ImportError on `c10_cuda_check_implementation`). Forcing `eager` matches what `prepare_model.py` saved into `config.json` and what the precheck verifies. |
 | `TRAIN_BATCH_SIZE_PER_NODE` × `NNODES` (`data.train_batch_size`) | `256 * NNODES` | Global batch scales linearly with `NNODES`. `TRAIN_BATCH_SIZE` overrides if set explicitly. |
 | `TRAIN_BATCH_SIZE == PPO_MINI_BATCH_SIZE` (`actor.ppo_mini_batch_size`) | equal | MoE training diverges quickly when the two differ; upstream example keeps them equal. |
 | `ENABLE_TIS=1` (`algorithm.rollout_correction.rollout_is`, `rollout.calculate_log_probs`) | on, token-level | Issue #3894 reports `rollout_actor_probs_pearson_corr ~ 0.5` from training/rollout drift — TIS is the supported mitigation. Set `TIS_LEVEL=sequence` for higher-variance unbiased weights. |
