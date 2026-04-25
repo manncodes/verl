@@ -9,8 +9,9 @@
 #         bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
 #
 # Skip stages with:
-#     SKIP_CHECK=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # no fwd/bwd check
-#     SKIP_TRAIN=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # check only
+#     SKIP_SINKS_TEST=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # no sinks test
+#     SKIP_CHECK=1      bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # no fwd/bwd check
+#     SKIP_TRAIN=1      bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # checks only
 #
 # Recipe consolidated from examples/grpo_trainer/run_gptoss_20b.sh and the
 # upstream issues/PRs noted in examples/gpt_oss/README.md. Caveats baked in:
@@ -106,6 +107,7 @@ TIS_THRESHOLD=${TIS_THRESHOLD:-2.0}             # 1.5–5.0 typical for token; 2
 USE_DYNAMIC_BSZ=${USE_DYNAMIC_BSZ:-False}
 USE_TORCH_COMPILE=${USE_TORCH_COMPILE:-False}   # actor + ref
 
+SKIP_SINKS_TEST=${SKIP_SINKS_TEST:-0}
 SKIP_CHECK=${SKIP_CHECK:-0}
 SKIP_TRAIN=${SKIP_TRAIN:-0}
 CHECK_SEQ_LEN=${CHECK_SEQ_LEN:-64}
@@ -171,7 +173,21 @@ else
     log "reusing existing gsm8k parquet at ${DATA_DIR}"
 fi
 
-# ---- 2. forward/backward correctness check (default: on) ------------------
+# ---- 2. attention sinks correctness test (default: on) -------------------
+# gpt-oss attention layers carry learnable per-head sink scores. Most attention
+# backends (SDPA, FA2, FlashInfer, TE) silently drop them — only eager / FA3 /
+# TRTLLM honour them. This test fails fast if a config drift puts the actor on
+# a sink-blind backend, which would silently corrupt training.
+if [ "${SKIP_SINKS_TEST}" != "1" ]; then
+    log "running attention sinks correctness test"
+    "${PYTHON}" "${HERE}/test_attention_sinks.py" \
+        --model-dir "${MODEL_DIR}" \
+        --seq-len "${CHECK_SEQ_LEN}"
+else
+    log "SKIP_SINKS_TEST=1, skipping attention sinks test"
+fi
+
+# ---- 3. forward/backward correctness check (default: on) ------------------
 if [ "${SKIP_CHECK}" != "1" ]; then
     log "running forward/backward correctness check"
     "${PYTHON}" "${HERE}/check_gpt_oss_fwd_bwd.py" \
@@ -231,7 +247,7 @@ fi
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    +actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
+    actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.calculate_log_probs="${CALC_LOGP}" \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
     actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP_SIZE}" \

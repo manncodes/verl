@@ -11,6 +11,7 @@ the forward/backward pass before kicking off a real run.
 | `Dockerfile` | gpt-oss image: sglang base + verl + Mxfp4-capable transformers |
 | `build_with_colima.sh` | Clone verl + start colima + build the image |
 | `prepare_model.py` | Dequantize the HF MXFP4 release to bf16 (one-time) |
+| `test_attention_sinks.py` | Verify gpt-oss sinks are wired through the actor's attention path |
 | `check_gpt_oss_fwd_bwd.py` | Standalone forward/backward correctness check |
 | `run_check.sh` | Wrapper around the check that also dequantizes if needed |
 | `launch_train_gpt_oss_20b.sh` | GRPO training on GSM8K with FSDP + sglang |
@@ -153,6 +154,41 @@ TRAIN_BATCH_SIZE=384 NNODES=3 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
 The launcher prints the effective topology + batch shape just before training
 starts, plus warnings if the global batch is not divisible by total GPUs or
 if `train_batch_size` and `ppo_mini_batch_size` differ.
+
+### Attention sinks correctness
+
+gpt-oss attention layers carry learnable per-head **sink scores** that are
+added to the softmax denominator. Most attention backends silently drop them
+and the model trains on subtly wrong logits. Only `eager` (HF default for
+gpt-oss), FlashAttention 3, and TRTLLM honour sinks.
+
+`test_attention_sinks.py` runs as the first preflight in the launcher and
+asserts:
+
+1. Every layer exposes a `sinks` parameter of shape `[num_heads]`.
+2. The sinks tensor is non-zero (i.e. the bf16 checkpoint actually loaded
+   the trained values).
+3. `model.config._attn_implementation == "eager"`.
+4. **Forward logits change when sinks are zeroed** — proves the attention
+   kernel is using them, catches the silent SDPA / FA2 / FlashInfer bypass.
+5. Backward through the loss accumulates non-zero gradient on every sinks
+   parameter — proves they're in the autograd graph.
+
+Run standalone:
+
+```bash
+python examples/gpt_oss/test_attention_sinks.py --model-dir ~/models/gpt-oss-20b-bf16
+```
+
+Skip the auto-run: `SKIP_SINKS_TEST=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh`.
+
+References for the bug class:
+[unsloth #3142](https://github.com/unslothai/unsloth/issues/3142)
+(SDPA bypass);
+[vllm #22331](https://github.com/vllm-project/vllm/issues/22331),
+[#22279](https://github.com/vllm-project/vllm/issues/22279) (FA2 errors);
+[vllm #30919](https://github.com/vllm-project/vllm/issues/30919) (FlashInfer);
+[NVIDIA/TE #2070](https://github.com/NVIDIA/TransformerEngine/issues/2070).
 
 ### Not enabled (Megatron-only)
 
