@@ -72,6 +72,12 @@ PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-4}
 ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-2}
 ROLLOUT_N=${ROLLOUT_N:-5}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-512}
+# Hybrid-engine memory budget. sglang reserves this fraction for KV cache,
+# but the FSDP actor still occupies ~20 GB/GPU (params+grads+optimizer even
+# with offload, eager attention activations). 0.7 was the upstream default
+# and OOMs at sglang's resume_memory_occupation when the actor's training
+# step finishes. 0.55 leaves enough headroom for the handoff on 8x H100.
+ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.55}
 # gsm8k responses are typically <500 tokens. 8192 was the upstream default but
 # wastes a lot of compute on padding and blows up eager attention's seq^2
 # memory cost. 2048 leaves >4x headroom and matches the natural answer length.
@@ -296,8 +302,8 @@ fi
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
-    actor_rollout_ref.actor.fsdp_config.param_offload=False \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.calculate_log_probs="${CALC_LOGP}" \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
@@ -305,7 +311,7 @@ fi
     actor_rollout_ref.rollout.name=sglang \
     actor_rollout_ref.rollout.mode=async \
     +actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=triton \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEM_UTIL}" \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
