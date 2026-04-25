@@ -8,8 +8,10 @@
 #     N_GPUS_PER_NODE=4 TRAIN_BATCH_SIZE=128 \
 #         bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
 #
-# Skip stages with:
+# Skip / opt-in stages with:
 #     SKIP_SINKS_TEST=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # no sinks test
+#     SKIP_R3_TEST=1    bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # no R3 capability check
+#     RUN_ROLLOUT_TEST=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh  # heavy: launches sglang/vllm
 #     SKIP_CHECK=1      bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # no fwd/bwd check
 #     SKIP_TRAIN=1      bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # checks only
 #
@@ -108,6 +110,8 @@ USE_DYNAMIC_BSZ=${USE_DYNAMIC_BSZ:-False}
 USE_TORCH_COMPILE=${USE_TORCH_COMPILE:-False}   # actor + ref
 
 SKIP_SINKS_TEST=${SKIP_SINKS_TEST:-0}
+SKIP_R3_TEST=${SKIP_R3_TEST:-0}
+RUN_ROLLOUT_TEST=${RUN_ROLLOUT_TEST:-0}    # heavyweight; opt-in. Boots sglang/vllm.
 SKIP_CHECK=${SKIP_CHECK:-0}
 SKIP_TRAIN=${SKIP_TRAIN:-0}
 CHECK_SEQ_LEN=${CHECK_SEQ_LEN:-64}
@@ -187,7 +191,32 @@ else
     log "SKIP_SINKS_TEST=1, skipping attention sinks test"
 fi
 
-# ---- 3. forward/backward correctness check (default: on) ------------------
+# ---- 3. R3 (router replay) capability check (default: on) ----------------
+# Verifies the routing-replay recording stack is present and the HF gpt-oss
+# router is deterministic — preconditions for R3 to work end-to-end. Cheap
+# (one HF forward pass), so we run it eagerly.
+if [ "${SKIP_R3_TEST}" != "1" ]; then
+    log "running R3 (router replay) capability check"
+    "${PYTHON}" "${HERE}/test_router_replay_capability.py" \
+        --model-dir "${MODEL_DIR}" \
+        --seq-len "${CHECK_SEQ_LEN}"
+else
+    log "SKIP_R3_TEST=1, skipping R3 capability check"
+fi
+
+# ---- 4. rollout end-to-end test (opt-in, heavyweight) ---------------------
+# Actually boots sglang (and vLLM if installed), generates ~16 tokens, then
+# runs forward+backward on the (prompt + response) sequence via HF. Catches
+# FA2/sinks bypass, harmony pre-warm regressions, tokenizer drift between
+# rollout and actor. Off by default — each engine load is ~30s + ~40GB GPU.
+if [ "${RUN_ROLLOUT_TEST}" = "1" ]; then
+    log "running rollout end-to-end test (sglang + vLLM + backward)"
+    "${PYTHON}" "${HERE}/test_rollout_e2e.py" \
+        --model-dir "${MODEL_DIR}" \
+        --tensor-parallel-size "${ROLLOUT_TP_SIZE}"
+fi
+
+# ---- 5. forward/backward correctness check (default: on) ------------------
 if [ "${SKIP_CHECK}" != "1" ]; then
     log "running forward/backward correctness check"
     "${PYTHON}" "${HERE}/check_gpt_oss_fwd_bwd.py" \
@@ -253,7 +282,7 @@ fi
     actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP_SIZE}" \
     actor_rollout_ref.rollout.name=sglang \
     actor_rollout_ref.rollout.mode=async \
-    actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=triton \
+    +actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=triton \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
     actor_rollout_ref.rollout.load_format=safetensors \

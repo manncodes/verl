@@ -12,6 +12,8 @@ the forward/backward pass before kicking off a real run.
 | `build_with_colima.sh` | Clone verl + start colima + build the image |
 | `prepare_model.py` | Dequantize the HF MXFP4 release to bf16 (one-time) |
 | `test_attention_sinks.py` | Verify gpt-oss sinks are wired through the actor's attention path |
+| `test_router_replay_capability.py` | R3 capability check (sglang recorder, hf_config, router determinism) |
+| `test_rollout_e2e.py` | Heavyweight: boot sglang/vllm, generate, then HF backward through the response |
 | `check_gpt_oss_fwd_bwd.py` | Standalone forward/backward correctness check |
 | `run_check.sh` | Wrapper around the check that also dequantizes if needed |
 | `launch_train_gpt_oss_20b.sh` | GRPO training on GSM8K with FSDP + sglang |
@@ -189,6 +191,52 @@ References for the bug class:
 [#22279](https://github.com/vllm-project/vllm/issues/22279) (FA2 errors);
 [vllm #30919](https://github.com/vllm-project/vllm/issues/30919) (FlashInfer);
 [NVIDIA/TE #2070](https://github.com/NVIDIA/TransformerEngine/issues/2070).
+
+### R3 routing replay
+
+`test_router_replay_capability.py` runs after the sinks test and checks
+the recording side of router replay is wired:
+
+1. `verl.workers.config.RouterReplayConfig` exists; the rollout YAML has
+   `enable_rollout_routing_replay`.
+2. The hf_config exposes `num_hidden_layers`, `num_experts_per_tok`,
+   `num_local_experts`.
+3. sglang has `extract_routed_experts_from_meta_info` (the patched build
+   from sgl-project/sglang commit `bed301a5`); warns (not fails) if not.
+4. The HF router is **deterministic** under fixed inputs — two forward
+   passes produce bit-identical top-k expert ids per layer. Without
+   this, replaying recorded routes is meaningless.
+
+The actor-side replay is still megatron-only
+(`verl/workers/engine_workers.py:477`); on FSDP this test is mainly a
+discovery + correctness check for a future megatron switch.
+
+Skip with `SKIP_R3_TEST=1`.
+
+### Rollout end-to-end (opt-in)
+
+`test_rollout_e2e.py` is the heavyweight precheck — opt in with
+`RUN_ROLLOUT_TEST=1`. It actually boots the rollout engine on the bf16
+checkpoint, generates ~16 tokens, then feeds (prompt + generated tokens)
+through the HF actor for forward+backward. This catches the bug class
+that the static tests can't:
+
+- vLLM gpt-oss FA2/SDPA sinks bypass on Hopper / earlier ([vllm #22331](https://github.com/vllm-project/vllm/issues/22331), [#22279](https://github.com/vllm-project/vllm/issues/22279), [#30919](https://github.com/vllm-project/vllm/issues/30919))
+- vLLM 0.12+ harmony encoding pre-warm requirement
+- sglang attention-backend defaults
+- tokenizer drift between rollout and training stacks
+
+Both sglang and vLLM are tested if installed; skip individually with
+`--skip-sglang` / `--skip-vllm` when invoking the script directly. Each
+engine load is ~30s and grabs ~40GB of GPU memory.
+
+```bash
+# from the launcher (off by default)
+RUN_ROLLOUT_TEST=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
+
+# standalone
+python examples/gpt_oss/test_rollout_e2e.py --model-dir ~/models/gpt-oss-20b-bf16 --tensor-parallel-size 2
+```
 
 ### Not enabled (Megatron-only)
 
