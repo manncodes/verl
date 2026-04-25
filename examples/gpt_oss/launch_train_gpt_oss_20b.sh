@@ -48,6 +48,28 @@ SAVE_FREQ=${SAVE_FREQ:-50}
 TEST_FREQ=${TEST_FREQ:-10}
 LOGGER=${LOGGER:-'["console","wandb"]'}
 
+# ---- MoE stability knobs --------------------------------------------------
+# Background:
+#   * Issue #3894 reports rollout_actor_probs_pearson_corr ~ 0.5 on gpt-oss-20B,
+#     i.e. severe drift between training (FSDP bf16) and rollout (sglang) policies.
+#     Truncated Importance Sampling (TIS) via algorithm.rollout_correction is
+#     the supported mitigation (docs/algo/rollout_corr.md).
+#   * MoE training is unstable when train_batch_size != ppo_mini_batch_size; we
+#     keep them equal by default.
+#   * use_dynamic_bsz=False is required for gpt-oss megatron (PR #4323) and is
+#     safer for FSDP+MoE too because dynamic packing changes routing per step.
+#   * torch.compile + MoE has a long history of breakage (see qwen3-fsdp NPU
+#     examples). Default to off for both actor and ref.
+#   * router_replay (R2/R3) is currently wired only for the megatron actor
+#     (verl/workers/engine_workers.py:477); it is intentionally NOT enabled here.
+#     Use examples/router_replay/* if you switch to the megatron backend.
+# Tunables — all opt-out:
+ENABLE_TIS=${ENABLE_TIS:-1}                     # set 0 to disable TIS
+TIS_LEVEL=${TIS_LEVEL:-token}                   # token | sequence
+TIS_THRESHOLD=${TIS_THRESHOLD:-2.0}             # 1.5–5.0 typical for token; 2.0–10.0 for sequence
+USE_DYNAMIC_BSZ=${USE_DYNAMIC_BSZ:-False}
+USE_TORCH_COMPILE=${USE_TORCH_COMPILE:-False}   # actor + ref
+
 SKIP_CHECK=${SKIP_CHECK:-0}
 SKIP_TRAIN=${SKIP_TRAIN:-0}
 CHECK_SEQ_LEN=${CHECK_SEQ_LEN:-64}
@@ -122,8 +144,22 @@ if [ "${SKIP_TRAIN}" = "1" ]; then
 fi
 
 log "launching GRPO training"
+
+# Build optional MoE-stability args (TIS via rollout correction).
+TIS_ARGS=()
+CALC_LOGP=False
+if [ "${ENABLE_TIS}" = "1" ]; then
+    log "enabling truncated importance sampling: level=${TIS_LEVEL} threshold=${TIS_THRESHOLD}"
+    TIS_ARGS=(
+        algorithm.rollout_correction.rollout_is="${TIS_LEVEL}"
+        algorithm.rollout_correction.rollout_is_threshold="${TIS_THRESHOLD}"
+    )
+    CALC_LOGP=True
+fi
+
 "${PYTHON}" -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
+    "${TIS_ARGS[@]}" \
     data.train_files="${DATA_DIR}/train.parquet" \
     data.val_files="${DATA_DIR}/test.parquet" \
     data.train_batch_size="${TRAIN_BATCH_SIZE}" \
@@ -138,6 +174,8 @@ log "launching GRPO training"
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
+    actor_rollout_ref.actor.use_dynamic_bsz="${USE_DYNAMIC_BSZ}" \
+    actor_rollout_ref.actor.use_torch_compile="${USE_TORCH_COMPILE}" \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -145,6 +183,7 @@ log "launching GRPO training"
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     +actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
+    actor_rollout_ref.rollout.calculate_log_probs="${CALC_LOGP}" \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
     actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP_SIZE}" \
     actor_rollout_ref.rollout.name=sglang \
@@ -154,6 +193,7 @@ log "launching GRPO training"
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
+    actor_rollout_ref.ref.use_torch_compile="${USE_TORCH_COMPILE}" \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \

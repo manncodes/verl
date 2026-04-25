@@ -47,12 +47,12 @@ correctness check if you only want that piece.
 
 ## Why these defaults
 
+### Loading / runtime
+
 - **MXFP4 -> bf16 once**: the FSDP/Megatron training paths cannot ingest the
   shipped MXFP4 weights; we dequantize via `Mxfp4Config(dequantize=True)` and
   stamp `attn_implementation=eager` on the saved config so training picks the
   supported attention path.
-- **`train_batch_size == ppo_mini_batch_size`**: MoE training is unstable
-  when these differ; the upstream example and issue #3894 keep them equal.
 - **`rollout.name=sglang` + `attention_backend=triton` + `mode=async`**: the
   combination explicitly supported for gpt-oss in the upstream example.
 - **`load_format=safetensors`**: required after dequantization so the rollout
@@ -61,6 +61,29 @@ correctness check if you only want that piece.
   packed format. Megatron currently needs BSHD (PR #4323) — switch to the
   Megatron recipe under `examples/grpo_trainer/run_qwen3moe-30b_megatron_*.sh`
   as a starting template if you need the Megatron backend.
+
+### MoE training stability
+
+| flag (env var → hydra override) | default | why it matters for gpt-oss |
+| --- | --- | --- |
+| `TRAIN_BATCH_SIZE == PPO_MINI_BATCH_SIZE` (`data.train_batch_size`, `actor.ppo_mini_batch_size`) | equal | MoE training diverges quickly when the two differ; upstream example keeps them equal. |
+| `ENABLE_TIS=1` (`algorithm.rollout_correction.rollout_is`, `rollout.calculate_log_probs`) | on, token-level | Issue #3894 reports `rollout_actor_probs_pearson_corr ~ 0.5` from training/rollout drift — TIS is the supported mitigation. Set `TIS_LEVEL=sequence` for higher-variance unbiased weights. |
+| `TIS_THRESHOLD` (`algorithm.rollout_correction.rollout_is_threshold`) | `2.0` | Per the upstream guide: 1.5–5.0 for token-TIS, 2.0–10.0 for sequence-TIS. |
+| `USE_DYNAMIC_BSZ=False` (`actor.use_dynamic_bsz`) | off | Required by the gpt-oss megatron path (PR #4323) and safer for FSDP MoE since dynamic packing changes routing per step. |
+| `USE_TORCH_COMPILE=False` (`actor.use_torch_compile`, `ref.use_torch_compile`) | off | torch.compile + MoE has been a recurring source of breakage; several fsdp/sglang examples hard-code it off. |
+| `actor.use_kl_loss=True`, `kl_loss_type=low_var_kl`, `kl_loss_coef=0.001` | on | GRPO low-variance KL penalty; recommended by the upstream gpt-oss recipe. |
+| `actor.entropy_coeff=0` | 0 | Extra entropy on top of GRPO can destabilise the router. |
+| `actor.model.enable_gradient_checkpointing=True` | on | Memory pressure dominates with 32 experts × ~3.6B params each. |
+
+Set `ENABLE_TIS=0` to drop back to vanilla GRPO (matches the existing
+`examples/grpo_trainer/run_gptoss_20b.sh` baseline).
+
+### Not enabled (Megatron-only)
+
+- **Router replay (R2/R3)** is wired only for the Megatron actor today
+  (`verl/workers/engine_workers.py:477` gates on `actor.strategy=="megatron"`).
+  If you switch backends, see `examples/router_replay/` for the recipe.
+- **Expert parallel (EP/ETP)** lives under `actor.megatron.*`; n/a for FSDP.
 
 ## References
 
