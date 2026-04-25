@@ -7,6 +7,9 @@ the forward/backward pass before kicking off a real run.
 
 | file | purpose |
 | --- | --- |
+| `install.sh` | One-shot uv install (torch + verl + sglang + flash-attn) |
+| `Dockerfile` | gpt-oss image: sglang base + verl + Mxfp4-capable transformers |
+| `build_with_colima.sh` | Clone verl + start colima + build the image |
 | `prepare_model.py` | Dequantize the HF MXFP4 release to bf16 (one-time) |
 | `check_gpt_oss_fwd_bwd.py` | Standalone forward/backward correctness check |
 | `run_check.sh` | Wrapper around the check that also dequantizes if needed |
@@ -35,6 +38,28 @@ SKIP_FLASH_ATTN=1 bash examples/gpt_oss/install.sh
 
 verl runs fine without flash-attn — gpt-oss uses `attn_implementation=eager`
 by default in this recipe.
+
+### Or: containerised build via colima
+
+Prefer a sealed environment over installing into the host? Use the colima
+wrapper to clone the repo, bring up colima, and build the image in one shot:
+
+```bash
+# from anywhere; clones https://github.com/manncodes/verl into ./verl
+bash <(curl -sL https://raw.githubusercontent.com/manncodes/verl/main/examples/gpt_oss/build_with_colima.sh)
+
+# or from an existing checkout
+bash examples/gpt_oss/build_with_colima.sh
+```
+
+Knobs (env vars): `VERL_REPO`, `VERL_REF`, `IMAGE_TAG`, `COLIMA_CPU`,
+`COLIMA_MEMORY`, `COLIMA_DISK`, `COLIMA_ARCH`. The defaults pin
+`COLIMA_ARCH=x86_64` because the sglang + CUDA base image is amd64-only,
+which matters on Apple Silicon.
+
+Note: colima on macOS has no GPU passthrough — the image builds on macOS,
+but training itself still needs to run on a Linux box with CUDA-capable
+GPUs. Push the image to a registry and pull it on the GPU host.
 
 Each stage is idempotent: re-running skips work that's already done. To run
 just the correctness check (no training):
