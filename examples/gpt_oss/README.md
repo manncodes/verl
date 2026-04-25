@@ -176,6 +176,14 @@ asserts:
    kernel is using them, catches the silent SDPA / FA2 / FlashInfer bypass.
 5. Backward through the loss accumulates non-zero gradient on every sinks
    parameter — proves they're in the autograd graph.
+6. **Cross-backend probe** (default on; `--no-compare-backends` to skip):
+   reload the model with each of `sdpa` and `flash_attention_2`, rerun the
+   sink-effect probe on each. Backends that load successfully but produce
+   bit-identical logits with and without sinks are silently bypassing them
+   — that's the regression class, and it fails the test loudly. Backends
+   that fail to load (e.g. flash-attn ABI mismatch with the active torch)
+   are reported and skipped — that's a different failure mode and doesn't
+   indicate a correctness bug, just an install issue.
 
 Run standalone:
 

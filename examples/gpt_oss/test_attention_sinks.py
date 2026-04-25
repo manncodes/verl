@@ -39,6 +39,7 @@ Usage:
 """
 
 import argparse
+import gc
 import os
 import sys
 from typing import Any
@@ -49,6 +50,19 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 def log(msg: str) -> None:
     print(f"[sinks] {msg}", flush=True)
+
+
+# Backends that gpt-oss is known to silently mishandle. flash_attention_2 and
+# sdpa are documented in the upstream issues at the top of this file. Any
+# entry here is loaded fresh and probed for the sink-effect — if the logits
+# don't change when sinks are zeroed, the backend is bypassing them.
+COMPARE_BACKENDS = ("sdpa", "flash_attention_2")
+
+
+def free_gpu() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def find_sink_params(model: torch.nn.Module) -> list[tuple[str, torch.nn.Parameter]]:
@@ -95,6 +109,129 @@ def assert_(cond: bool, msg: str) -> None:
         raise AssertionError(msg)
 
 
+def load_for_probe(model_dir: str, attn_impl: str, device_map):
+    """Load a fresh model copy with the requested attention implementation.
+
+    Raises whatever the loader raises (caller decides how to react). Returns
+    a model in eval mode, ready for forward-only probing.
+    """
+    kwargs = dict(
+        torch_dtype=torch.bfloat16,
+        attn_implementation=attn_impl,
+        use_cache=False,
+        low_cpu_mem_usage=True,
+    )
+    if device_map is not None:
+        kwargs["device_map"] = device_map
+    model = AutoModelForCausalLM.from_pretrained(model_dir, **kwargs)
+    if device_map is None:
+        model.to("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval()
+    return model
+
+
+def sink_effect_delta(model, inputs) -> torch.Tensor:
+    """Run two forwards (sinks intact; sinks zeroed) and return |Δlogits|.
+
+    Restores the sinks before returning so the caller can keep using the
+    model. The caller is responsible for whatever subsequent state it needs
+    (e.g. re-enabling grads for a backward pass).
+    """
+    sink_params = find_sink_params(model)
+    assert_(
+        len(sink_params) > 0,
+        "no '*.sinks' parameters found on the loaded model — wrong model class?",
+    )
+
+    with torch.no_grad():
+        logits_with = model(**inputs).logits.float().cpu()
+
+    saved = [p.detach().clone() for _, p in sink_params]
+    try:
+        with torch.no_grad():
+            for _, p in sink_params:
+                p.zero_()
+            logits_zero = model(**inputs).logits.float().cpu()
+    finally:
+        with torch.no_grad():
+            for (_, p), saved_p in zip(sink_params, saved):
+                p.copy_(saved_p)
+
+    return (logits_with - logits_zero).abs()
+
+
+def probe_other_backend(
+    model_dir: str,
+    attn_impl: str,
+    inputs_template,
+    seq_len: int,
+    device_map,
+    tol: float,
+    eager_logits: torch.Tensor,
+    eager_delta: torch.Tensor,
+) -> None:
+    """Load with `attn_impl` and assert it doesn't silently bypass sinks.
+
+    Outcomes:
+      * Backend can't load (e.g. flash-attn ABI mismatch) — log and return.
+      * Backend loads and `|Δlogits when sinks zeroed| > tol` — pass.
+      * Backend loads but logits don't change when sinks zeroed — FAIL with
+        a loud message: this is the silent-correctness regression class.
+
+    Also reports raw logit drift versus the eager baseline for context.
+    """
+    log(f"loading {attn_impl!r} for sink-bypass comparison")
+    try:
+        model_x = load_for_probe(model_dir, attn_impl, device_map)
+    except Exception as exc:
+        # We expect this for FA2 on the H100 box (torch 2.9.1 ABI mismatch
+        # against flash-attn 2.8.x). That itself is a useful signal — log it
+        # and move on; the *correctness* failure mode requires the backend
+        # to actually load.
+        log(
+            f"  -- {attn_impl} could not load: {type(exc).__name__}: {exc}\n"
+            f"     this is the install-side failure mode (e.g. flash-attn ABI "
+            "mismatch). The eager override on the actor sidesteps it."
+        )
+        return
+
+    try:
+        # Inputs need to ride on the same device as the embedding under
+        # device_map="auto" — re-pin per-model.
+        inp_device = next(model_x.parameters()).device
+        inputs = {k: v.to(inp_device) for k, v in inputs_template.items()}
+
+        delta_x = sink_effect_delta(model_x, inputs)
+        log(
+            f"  {attn_impl} sink-effect: max={delta_x.max():.4e} "
+            f"mean={delta_x.mean():.4e} (eager max={eager_delta.max():.4e})"
+        )
+        # The headline assertion: if sinks have no effect, the backend
+        # silently dropped them.
+        if delta_x.max().item() <= tol:
+            raise AssertionError(
+                f"backend {attn_impl!r} produces logits that are bit-identical "
+                f"with and without sinks (max-abs Δ={delta_x.max():.2e} <= "
+                f"tol={tol:.0e}). It is silently bypassing the gpt-oss sink "
+                "scores — training with this backend will produce a corrupted "
+                "model. Force attn_implementation=eager."
+            )
+        log(f"  {attn_impl} honours sinks (Δ > tol)")
+
+        # Drift against eager. Bf16 numerical noise alone gives ~1e-2 max-abs;
+        # a backend dropping sinks would give a much larger gap (often >1.0).
+        with torch.no_grad():
+            logits_x = model_x(**inputs).logits.float().cpu()
+        cross = (logits_x - eager_logits).abs()
+        log(
+            f"  {attn_impl} vs eager logits: max={cross.max():.4e} "
+            f"mean={cross.mean():.4e}"
+        )
+    finally:
+        del model_x
+        free_gpu()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -109,6 +246,11 @@ def main() -> int:
         type=float,
         default=1e-3,
         help="max-abs logit delta required between with-sinks and zeroed-sinks; if smaller, sinks are not wired in",
+    )
+    parser.add_argument(
+        "--no-compare-backends",
+        action="store_true",
+        help="skip the cross-backend (sdpa, flash_attention_2) sink-bypass probe",
     )
     args = parser.parse_args()
 
@@ -186,37 +328,28 @@ def main() -> int:
         "FlashInfer all silently produce wrong logits for gpt-oss.",
     )
 
-    # ---- 4. forward differs when sinks are zeroed -------------------------
+    # ---- 4. forward differs when sinks are zeroed (eager) -----------------
     inputs = build_inputs(tokenizer, next(model.parameters()).device, args.seq_len)
-    with torch.no_grad():
-        logits_with_sinks = model(**inputs).logits.float().cpu()
-
-    saved = [p.detach().clone() for _, p in sink_params]
-    try:
-        with torch.no_grad():
-            for _, p in sink_params:
-                p.zero_()
-            logits_no_sinks = model(**inputs).logits.float().cpu()
-    finally:
-        # Restore so the backward test below sees the real values.
-        with torch.no_grad():
-            for (_, p), saved_p in zip(sink_params, saved):
-                p.copy_(saved_p)
-
-    delta = (logits_with_sinks - logits_no_sinks).abs()
+    eager_delta = sink_effect_delta(model, inputs)
     log(
-        f"  logit delta (with-sinks vs zeroed): max={delta.max():.6f}  "
-        f"mean={delta.mean():.6f}"
+        f"  eager sink-effect: max={eager_delta.max():.6f}  "
+        f"mean={eager_delta.mean():.6f}"
     )
     assert_(
-        delta.max().item() > args.logit_tol,
-        f"zeroing the sinks did not change the logits (max-abs delta={delta.max():.2e} "
+        eager_delta.max().item() > args.logit_tol,
+        f"zeroing the sinks did not change the logits (max-abs delta={eager_delta.max():.2e} "
         f"<= tol={args.logit_tol:.0e}). The sinks are NOT being used by the attention "
         "kernel — likely an SDPA / FA2 / FlashInfer fallback. This is a silent "
         "correctness bug; do not train.",
     )
+    # Capture the with-sinks eager logits as ground truth for cross-backend
+    # comparison below. We have to recompute (sink_effect_delta restored
+    # them) under no_grad, then move to CPU so we can free the eager model
+    # later if we need the GPU memory for other backends.
+    with torch.no_grad():
+        eager_logits = model(**inputs).logits.float().cpu()
 
-    # ---- 5. backward accumulates grad on sinks ----------------------------
+    # ---- 5. backward accumulates grad on sinks (eager) --------------------
     model.train()
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
@@ -254,6 +387,37 @@ def main() -> int:
         "won't be trained.",
     )
     log(f"  all {len(sink_params)} sink params received finite, non-zero gradient")
+
+    # ---- 6. cross-backend sink-bypass probe -------------------------------
+    # The previous five checks all run on the eager model we explicitly
+    # loaded. The silent-correctness regression class (verl actor flipping
+    # to flash_attention_2 by default; users with SDPA-only installs;
+    # future kernels that lose sinks) only shows up when a *different*
+    # backend is loaded for the same model. Probe each candidate.
+    if args.no_compare_backends:
+        log("--no-compare-backends, skipping cross-backend sink-bypass probe")
+    else:
+        # Free the eager model now — we may need its GPU memory for the next
+        # load. Inputs were also tied to its devices; rebuild them as a
+        # template that probe_other_backend re-pins per-model.
+        inputs_template = {
+            "input_ids": inputs["input_ids"].cpu(),
+            "attention_mask": inputs["attention_mask"].cpu(),
+        }
+        del model, sink_params
+        free_gpu()
+
+        for impl in COMPARE_BACKENDS:
+            probe_other_backend(
+                model_dir=args.model_dir,
+                attn_impl=impl,
+                inputs_template=inputs_template,
+                seq_len=args.seq_len,
+                device_map=device_map,
+                tol=args.logit_tol,
+                eager_logits=eager_logits,
+                eager_delta=eager_delta,
+            )
 
     log("attention sinks test PASSED")
     return 0
