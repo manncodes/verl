@@ -108,6 +108,14 @@ TIS_LEVEL=${TIS_LEVEL:-token}                   # token | sequence
 TIS_THRESHOLD=${TIS_THRESHOLD:-2.0}             # 1.5–5.0 typical for token; 2.0–10.0 for sequence
 USE_DYNAMIC_BSZ=${USE_DYNAMIC_BSZ:-False}
 USE_TORCH_COMPILE=${USE_TORCH_COMPILE:-False}   # actor + ref
+# use_remove_padding=True triggers verl/utils/attention_utils.py, which imports
+# flash_attn.bert_padding with NO CUDA fallback. On boxes where flash-attn was
+# built against a different torch ABI (we hit this on torch 2.9.1 + cu13: the
+# .so is missing _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_jb), verl
+# crashes at step 1 in _compute_old_log_prob even though the actor uses eager
+# attention. Default to False so the recipe runs end-to-end on a stock install;
+# flip back to True once you have a flash-attn wheel matched to your torch.
+USE_REMOVE_PADDING=${USE_REMOVE_PADDING:-False}
 
 SKIP_SINKS_TEST=${SKIP_SINKS_TEST:-0}
 SKIP_R3_TEST=${SKIP_R3_TEST:-0}
@@ -269,7 +277,7 @@ fi
     +data.apply_chat_template_kwargs.reasoning_effort="${REASONING_EFFORT}" \
     actor_rollout_ref.model.path="${MODEL_DIR}" \
     +actor_rollout_ref.model.override_config.attn_implementation=eager \
-    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.model.use_remove_padding="${USE_REMOVE_PADDING}" \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
