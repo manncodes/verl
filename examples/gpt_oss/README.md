@@ -18,6 +18,11 @@ A single command does dependency check -> dequantize -> preprocess gsm8k ->
 forward/backward correctness check -> launch GRPO training:
 
 ```bash
+# 0. (one-time) install verl + sglang + transformers in a uv-managed venv
+bash examples/gpt_oss/install.sh
+source .venv/bin/activate
+
+# 1. run everything
 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
 ```
 

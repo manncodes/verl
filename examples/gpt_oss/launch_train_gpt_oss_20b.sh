@@ -96,6 +96,7 @@ for mod, hint in required.items():
         missing.append(f"  - {mod}: {hint} ({exc})")
 if missing:
     print("Missing required packages:\n" + "\n".join(missing), file=sys.stderr)
+    print("\nFix with: bash examples/gpt_oss/install.sh", file=sys.stderr)
     sys.exit(1)
 
 # Mxfp4Config landed in transformers 4.46; bail early if older.
@@ -103,7 +104,7 @@ try:
     from transformers import Mxfp4Config  # noqa: F401
 except Exception as exc:
     print(f"transformers is missing Mxfp4Config: {exc}", file=sys.stderr)
-    print("Upgrade with: pip install -U 'transformers>=4.46'", file=sys.stderr)
+    print("Fix with: bash examples/gpt_oss/install.sh", file=sys.stderr)
     sys.exit(1)
 PY
 
