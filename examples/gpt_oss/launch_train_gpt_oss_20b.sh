@@ -60,13 +60,22 @@ TOTAL_GPUS=$((NNODES * N_GPUS_PER_NODE))
 TRAIN_BATCH_SIZE_PER_NODE=${TRAIN_BATCH_SIZE_PER_NODE:-256}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-$((TRAIN_BATCH_SIZE_PER_NODE * NNODES))}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-${TRAIN_BATCH_SIZE}}
-PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-32}
+# gpt-oss requires eager attention (only path that honours sinks). Eager
+# materialises [bs, heads, seq, seq] in bf16: a single attention forward at
+# seq=2560 with 64 heads costs ~3.4 GB per micro-batch element. micro_batch=4
+# is the headroom-vs-throughput sweet spot for an 8 x H100 box where sglang
+# already pins ~32 GB/GPU through hybrid-engine colocation. If you OOM in
+# eager_attention_forward (combined_logits or attn_weights), drop this further.
+PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-4}
 
 # ---- rollout / generation ------------------------------------------------
 ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-2}
 ROLLOUT_N=${ROLLOUT_N:-5}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-512}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-8192}
+# gsm8k responses are typically <500 tokens. 8192 was the upstream default but
+# wastes a lot of compute on padding and blows up eager attention's seq^2
+# memory cost. 2048 leaves >4x headroom and matches the natural answer length.
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-2048}
 REASONING_EFFORT=${REASONING_EFFORT:-medium}
 
 # ---- training schedule ---------------------------------------------------
@@ -277,6 +286,7 @@ fi
     +actor_rollout_ref.model.override_config.attn_implementation=eager \
     actor_rollout_ref.model.use_remove_padding="${USE_REMOVE_PADDING}" \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.model.enable_activation_offload=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
