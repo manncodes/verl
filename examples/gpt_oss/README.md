@@ -26,6 +26,16 @@ source .venv/bin/activate
 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
 ```
 
+If `flash-attn` fails to build (no CUDA toolchain, or no prebuilt wheel for
+your torch/cuda combo), re-run with:
+
+```bash
+SKIP_FLASH_ATTN=1 bash examples/gpt_oss/install.sh
+```
+
+verl runs fine without flash-attn — gpt-oss uses `attn_implementation=eager`
+by default in this recipe.
+
 Each stage is idempotent: re-running skips work that's already done. To run
 just the correctness check (no training):
 

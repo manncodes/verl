@@ -53,36 +53,51 @@ source "${VENV_DIR}/bin/activate"
 
 # ---- 3. one-shot install -------------------------------------------------
 # verl[sglang] pulls torch==2.9.1 + sglang==0.5.8 (the gpt-oss-supported combo).
-# verl[gpu] pulls liger-kernel + flash-attn (we drop flash-attn separately if
-# the toolchain isn't available, see SKIP_FLASH_ATTN below).
+# verl[gpu] pulls liger-kernel + flash-attn (set SKIP_FLASH_ATTN=1 if no CUDA
+# toolchain or no compatible prebuilt wheel is available).
 # verl[math] adds math-verify for the gsm8k reward.
 # verl[test] adds pytest + pre-commit for dev workflow.
 # transformers>=4.46 is required for Mxfp4Config (gpt-oss MXFP4 dequantization).
-log "installing verl[${EXTRAS}] + gpt-oss runtime deps"
 
-INSTALL_TARGETS=(
-    "-e" ".[${EXTRAS}]"
-    "transformers>=4.46"
-    "hf-transfer"      # faster HF downloads for the 20B checkpoint
-    "accelerate"
-)
+# flash-attn does NOT declare torch as a build dependency (despite needing it
+# at build time), so a single-pass `uv pip install` fails inside uv's isolated
+# build env with "ModuleNotFoundError: No module named 'torch'". Workaround:
+# install torch + build helpers FIRST, then disable build isolation just for
+# flash-attn on the second pass.
 
 if [ "${SKIP_FLASH_ATTN}" = "1" ]; then
     log "SKIP_FLASH_ATTN=1, dropping flash-attn from the install set"
-    # remove flash-attn from the resolution by using sglang extra without gpu extra
-    EXTRAS_NO_FA=${EXTRAS//gpu,/}
-    EXTRAS_NO_FA=${EXTRAS_NO_FA//,gpu/}
-    EXTRAS_NO_FA=${EXTRAS_NO_FA//gpu/}
-    INSTALL_TARGETS=(
-        "-e" ".[${EXTRAS_NO_FA}]"
-        "transformers>=4.46"
-        "hf-transfer"
+    # Strip 'gpu' extra so flash-attn is not pulled in.
+    EXTRAS_EFFECTIVE=${EXTRAS//gpu,/}
+    EXTRAS_EFFECTIVE=${EXTRAS_EFFECTIVE//,gpu/}
+    EXTRAS_EFFECTIVE=${EXTRAS_EFFECTIVE//gpu/}
+    log "installing verl[${EXTRAS_EFFECTIVE}] + gpt-oss runtime deps (single pass)"
+    uv pip install \
+        -e ".[${EXTRAS_EFFECTIVE}]" \
+        "transformers>=4.46" \
+        "hf-transfer" \
         "accelerate"
-    )
-fi
+else
+    log "pass 1/2: installing torch + flash-attn build deps"
+    # Pin torch to whatever sglang extra wants; the second pass will re-resolve
+    # but having it present satisfies flash-attn's build-time `import torch`.
+    uv pip install \
+        "torch==2.9.1" \
+        "packaging>=20.0" \
+        wheel \
+        setuptools \
+        ninja
 
-# Single resolve+install pass — uv's equivalent of `uv sync`.
-uv pip install "${INSTALL_TARGETS[@]}"
+    log "pass 2/2: installing verl[${EXTRAS}] + gpt-oss runtime deps"
+    # --no-build-isolation-package flash-attn lets flash-attn see the torch we
+    # just installed instead of getting an empty isolated build env.
+    uv pip install \
+        --no-build-isolation-package flash-attn \
+        -e ".[${EXTRAS}]" \
+        "transformers>=4.46" \
+        "hf-transfer" \
+        "accelerate"
+fi
 
 # ---- 4. pre-commit -------------------------------------------------------
 if [ "${SKIP_PRE_COMMIT}" != "1" ] && [ -f .pre-commit-config.yaml ]; then
