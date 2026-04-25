@@ -77,7 +77,10 @@ if [ "${SKIP_FLASH_ATTN}" = "1" ]; then
         "transformers>=4.46" \
         "datasets>=3.0" \
         "hf-transfer" \
-        "accelerate"
+        "accelerate" \
+        "cachetools" \
+        "nvidia-ml-py" \
+        "mathruler"
 else
     log "pass 1/2: installing torch + flash-attn build deps"
     # Pin torch to whatever sglang extra wants; the second pass will re-resolve
@@ -95,13 +98,19 @@ else
     # datasets>=3.0 because verl's setup.py is unpinned and the resolver
     # otherwise picks 2.14.x, which calls the removed pyarrow.PyExtensionType
     # against the modern pyarrow that sglang pulls in.
+    # cachetools / nvidia-ml-py / mathruler are eagerly imported by verl
+    # (agent_loop, profiler, reward score) but missing from setup.py — they
+    # crash training ~4min in (after FSDP wrap) without these explicit pins.
     uv pip install \
         --no-build-isolation-package flash-attn \
         -e ".[${EXTRAS}]" \
         "transformers>=4.46" \
         "datasets>=3.0" \
         "hf-transfer" \
-        "accelerate"
+        "accelerate" \
+        "cachetools" \
+        "nvidia-ml-py" \
+        "mathruler"
 fi
 
 # ---- 4. pre-commit -------------------------------------------------------
@@ -111,29 +120,62 @@ if [ "${SKIP_PRE_COMMIT}" != "1" ] && [ -f .pre-commit-config.yaml ]; then
 fi
 
 # ---- 5. smoke check ------------------------------------------------------
+# We check both top-level packages AND the deep verl import chain that the
+# launcher actually exercises — the agent loop module pulls in cachetools
+# (and friends) on every training launch, so a missing transitive there
+# crashes ~4 minutes into the run, after FSDP wrap. Catching it here
+# instead saves a lot of GPU time on a misconfigured install.
 log "verifying imports"
 python - <<'PY'
 import importlib, sys
-required = ["torch", "transformers", "datasets", "verl", "ray", "hydra"]
-optional = ["sglang", "flash_attn"]
+
+required_top = ["torch", "transformers", "datasets", "verl", "ray", "hydra"]
+optional_top = ["sglang", "flash_attn"]
+
+# Deep verl chains that get hit on the FSDP+sglang+gsm8k launch path. If any
+# of these fail with a missing third-party dep, install.sh needs to add it.
+required_chains = [
+    "verl.experimental.agent_loop",     # pulls cachetools, regex, pydantic, ...
+    "verl.utils.tracking",              # pulls orjson, wandb
+    "verl.workers.engine.fsdp.transformer_impl",  # pulls accelerate, peft, ...
+    "verl.workers.rollout.sglang_rollout.async_sglang_server",  # pulls sglang internals
+    "verl.trainer.main_ppo",            # pulls hydra, omegaconf, ray, ...
+]
+
 missing = []
-for mod in required:
+
+for mod in required_top:
     try:
         importlib.import_module(mod)
         print(f"  ok  {mod}")
     except Exception as exc:
         missing.append(f"  MISS {mod}: {exc}")
-for mod in optional:
+
+for mod in optional_top:
     try:
         importlib.import_module(mod)
         print(f"  ok  {mod} (optional)")
     except Exception as exc:
         print(f"  --  {mod} (optional, skipped): {type(exc).__name__}")
+
 try:
     from transformers import Mxfp4Config  # noqa: F401
     print("  ok  Mxfp4Config")
 except Exception as exc:
     missing.append(f"  MISS Mxfp4Config: {exc}")
+
+print("verifying verl deep import chains (catches missing transitive deps)")
+for chain in required_chains:
+    try:
+        importlib.import_module(chain)
+        print(f"  ok  {chain}")
+    except ModuleNotFoundError as exc:
+        missing.append(f"  MISS {chain}: {exc}")
+    except Exception as exc:
+        # Other errors (CUDA-unavailable inside an import, etc.) we just warn —
+        # they're environmental, not missing-dep.
+        print(f"  ??  {chain} raised {type(exc).__name__}: {exc} (likely env, not a missing dep)")
+
 if missing:
     print("\n".join(missing), file=sys.stderr)
     sys.exit(1)
