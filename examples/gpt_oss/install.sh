@@ -75,6 +75,7 @@ if [ "${SKIP_FLASH_ATTN}" = "1" ]; then
     uv pip install \
         -e ".[${EXTRAS_EFFECTIVE}]" \
         "transformers>=4.46" \
+        "datasets>=3.0" \
         "hf-transfer" \
         "accelerate"
 else
@@ -91,10 +92,14 @@ else
     log "pass 2/2: installing verl[${EXTRAS}] + gpt-oss runtime deps"
     # --no-build-isolation-package flash-attn lets flash-attn see the torch we
     # just installed instead of getting an empty isolated build env.
+    # datasets>=3.0 because verl's setup.py is unpinned and the resolver
+    # otherwise picks 2.14.x, which calls the removed pyarrow.PyExtensionType
+    # against the modern pyarrow that sglang pulls in.
     uv pip install \
         --no-build-isolation-package flash-attn \
         -e ".[${EXTRAS}]" \
         "transformers>=4.46" \
+        "datasets>=3.0" \
         "hf-transfer" \
         "accelerate"
 fi
@@ -134,5 +139,12 @@ if missing:
     sys.exit(1)
 PY
 
+log ""
 log "done. Activate with: source ${VENV_DIR}/bin/activate"
 log "Then run:           bash examples/gpt_oss/launch_train_gpt_oss_20b.sh"
+log ""
+log "Notes:"
+log "  * 'sglang has no extra named srt/openai' is benign — sglang 0.5.8 dropped"
+log "    those extras; verl's setup.py request is harmless and sglang installs."
+log "  * If flash_attn fails to import (ABI mismatch with newer CUDA drivers),"
+log "    the recipe still works: gpt-oss uses attn_implementation=eager by default."

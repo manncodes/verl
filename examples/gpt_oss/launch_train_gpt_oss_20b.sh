@@ -77,6 +77,14 @@ CHECK_BATCH_SIZE=${CHECK_BATCH_SIZE:-1}
 
 PYTHON=${PYTHON:-python3}
 
+# Auto-pick the local .venv if the caller forgot to activate it. install.sh
+# creates ${REPO_ROOT}/.venv by default; without this, the preflight runs
+# against the system python and reports every dep as missing.
+if [ -z "${VIRTUAL_ENV:-}" ] && [ -x "${REPO_ROOT}/.venv/bin/python" ]; then
+    PYTHON="${REPO_ROOT}/.venv/bin/python"
+    log "auto-using ${PYTHON} (run 'source .venv/bin/activate' to make it sticky)"
+fi
+
 # ---- preflight: required python packages ---------------------------------
 log "checking python dependencies"
 "${PYTHON}" - <<'PY'
