@@ -121,9 +121,14 @@ PYTHON=${PYTHON:-python3}
 
 # Auto-pick the local .venv if the caller forgot to activate it. install.sh
 # creates ${REPO_ROOT}/.venv by default; without this, the preflight runs
-# against the system python and reports every dep as missing.
+# against the system python and reports every dep as missing. Also prepend
+# .venv/bin to PATH so subprocesses (notably flashinfer's JIT, which spawns
+# `ninja`) find the venv-local binaries — without this, sglang crashes
+# during CUDA graph capture with FileNotFoundError on ninja.
 if [ -z "${VIRTUAL_ENV:-}" ] && [ -x "${REPO_ROOT}/.venv/bin/python" ]; then
     PYTHON="${REPO_ROOT}/.venv/bin/python"
+    export PATH="${REPO_ROOT}/.venv/bin:${PATH}"
+    export VIRTUAL_ENV="${REPO_ROOT}/.venv"
     log "auto-using ${PYTHON} (run 'source .venv/bin/activate' to make it sticky)"
 fi
 
