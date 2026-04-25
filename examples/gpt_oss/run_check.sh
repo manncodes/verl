@@ -4,7 +4,7 @@
 # or environment issues (eager attention, dtype mismatches, MoE routing, ...).
 set -euxo pipefail
 
-MODEL_DIR=${MODEL_DIR:-$HOME/models/gpt-oss-20b-bf16}
+MODEL_DIR=${MODEL_DIR:-/model/Huggingface/openai/gpt-oss-20b-bf16}
 SEQ_LEN=${SEQ_LEN:-64}
 BATCH_SIZE=${BATCH_SIZE:-1}
 DTYPE=${DTYPE:-bfloat16}

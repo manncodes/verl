@@ -179,7 +179,7 @@ asserts:
 Run standalone:
 
 ```bash
-python examples/gpt_oss/test_attention_sinks.py --model-dir ~/models/gpt-oss-20b-bf16
+python examples/gpt_oss/test_attention_sinks.py --model-dir /model/Huggingface/openai/gpt-oss-20b-bf16
 ```
 
 Skip the auto-run: `SKIP_SINKS_TEST=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh`.
@@ -235,7 +235,7 @@ engine load is ~30s and grabs ~40GB of GPU memory.
 RUN_ROLLOUT_TEST=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
 
 # standalone
-python examples/gpt_oss/test_rollout_e2e.py --model-dir ~/models/gpt-oss-20b-bf16 --tensor-parallel-size 2
+python examples/gpt_oss/test_rollout_e2e.py --model-dir /model/Huggingface/openai/gpt-oss-20b-bf16 --tensor-parallel-size 2
 ```
 
 ### Not enabled (Megatron-only)

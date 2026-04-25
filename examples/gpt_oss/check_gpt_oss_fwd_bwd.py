@@ -16,7 +16,7 @@ so it can be run before kicking off a real training job.
 
 Usage:
     python examples/gpt_oss/check_gpt_oss_fwd_bwd.py \
-        --model-dir ~/models/gpt-oss-20b-bf16 \
+        --model-dir /model/Huggingface/openai/gpt-oss-20b-bf16 \
         --device cuda \
         --seq-len 64
 """
@@ -234,7 +234,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model-dir",
-        default=os.path.expanduser("~/models/gpt-oss-20b-bf16"),
+        default="/model/Huggingface/openai/gpt-oss-20b-bf16",
         help="bf16 checkpoint produced by prepare_model.py",
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")

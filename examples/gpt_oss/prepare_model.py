@@ -17,7 +17,7 @@ def main() -> None:
     parser.add_argument("--model-id", default="openai/gpt-oss-20b")
     parser.add_argument(
         "--output-dir",
-        default=os.path.expanduser("~/models/gpt-oss-20b-bf16"),
+        default="/model/Huggingface/openai/gpt-oss-20b-bf16",
     )
     parser.add_argument("--device-map", default="auto")
     args = parser.parse_args()

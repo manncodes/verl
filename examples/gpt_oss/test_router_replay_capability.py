@@ -29,7 +29,7 @@ Invariants checked
 
 Usage:
     python examples/gpt_oss/test_router_replay_capability.py \
-        --model-dir ~/models/gpt-oss-20b-bf16
+        --model-dir /model/Huggingface/openai/gpt-oss-20b-bf16
 """
 
 import argparse
@@ -195,7 +195,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model-dir",
-        default=os.path.expanduser("~/models/gpt-oss-20b-bf16"),
+        default="/model/Huggingface/openai/gpt-oss-20b-bf16",
     )
     parser.add_argument("--seq-len", type=int, default=64)
     parser.add_argument(

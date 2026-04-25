@@ -32,7 +32,7 @@ log() { printf '[launch] %s\n' "$*"; }
 
 # ---- model / data --------------------------------------------------------
 MODEL_ID=${MODEL_ID:-openai/gpt-oss-20b}
-MODEL_DIR=${MODEL_DIR:-$HOME/models/gpt-oss-20b-bf16}
+MODEL_DIR=${MODEL_DIR:-/model/Huggingface/openai/gpt-oss-20b-bf16}
 DATA_DIR=${DATA_DIR:-$HOME/data/gsm8k}
 PROJECT_NAME=${PROJECT_NAME:-verl_gpt_oss_20b}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-gpt_oss_20b_grpo_gsm8k}
