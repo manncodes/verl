@@ -1,27 +1,31 @@
 #!/bin/bash
-# Launch GRPO training on openai/gpt-oss-20b using verl's FSDP actor + sglang rollout.
+# One-shot launcher: dequantize -> preprocess -> forward/backward check -> train.
 #
-# This recipe is consolidated from the existing example at
-# examples/grpo_trainer/run_gptoss_20b.sh and the discussion in upstream issues
-# #2930, #3794, #3865, #3894 and PRs #4323, #4750, #5131.
-#
-# Caveats baked in:
-#   * gpt-oss ships in MXFP4 -> we dequantize once to bf16 (see prepare_model.py).
-#   * gpt-oss kernels assume eager attention; verl reads attn_implementation from
-#     the saved config so we stamp it before saving.
-#   * MoE training is unstable when train_batch_size != ppo_mini_batch_size;
-#     keep them equal (issue #3894 noted high actor/rollout pearson_corr but the
-#     equal-batch recipe is the recommended starting point).
-#   * sglang + triton attention backend is the supported rollout combination.
-#   * load_format=safetensors is required so weight transfer works after the
-#     mxfp4->bf16 dequantization.
-#
-# Usage:
-#   bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
+# Run from the repo root:
+#     bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
 #
 # Override any tunable via environment variables, e.g.:
-#   N_GPUS_PER_NODE=4 TRAIN_BATCH_SIZE=128 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
-set -euxo pipefail
+#     N_GPUS_PER_NODE=4 TRAIN_BATCH_SIZE=128 \
+#         bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
+#
+# Skip stages with:
+#     SKIP_CHECK=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # no fwd/bwd check
+#     SKIP_TRAIN=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # check only
+#
+# Recipe consolidated from examples/grpo_trainer/run_gptoss_20b.sh and the
+# upstream issues/PRs noted in examples/gpt_oss/README.md. Caveats baked in:
+#   * gpt-oss ships in MXFP4 -> we dequantize once to bf16.
+#   * gpt-oss kernels assume eager attention; saved config carries that flag.
+#   * Keep train_batch_size == ppo_mini_batch_size for MoE training stability.
+#   * sglang + triton attention backend is the supported rollout combination.
+#   * load_format=safetensors is required after the mxfp4->bf16 dequantization.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${HERE}/../.." && pwd)"
+cd "${REPO_ROOT}"
+
+log() { printf '[launch] %s\n' "$*"; }
 
 # ---- knobs ----------------------------------------------------------------
 MODEL_ID=${MODEL_ID:-openai/gpt-oss-20b}
@@ -44,22 +48,81 @@ SAVE_FREQ=${SAVE_FREQ:-50}
 TEST_FREQ=${TEST_FREQ:-10}
 LOGGER=${LOGGER:-'["console","wandb"]'}
 
+SKIP_CHECK=${SKIP_CHECK:-0}
+SKIP_TRAIN=${SKIP_TRAIN:-0}
+CHECK_SEQ_LEN=${CHECK_SEQ_LEN:-64}
+CHECK_BATCH_SIZE=${CHECK_BATCH_SIZE:-1}
+
+PYTHON=${PYTHON:-python3}
+
+# ---- preflight: required python packages ---------------------------------
+log "checking python dependencies"
+"${PYTHON}" - <<'PY'
+import importlib, sys
+
+required = {
+    "torch": "torch",
+    "transformers": "transformers (>=4.46 with Mxfp4Config)",
+    "datasets": "datasets",
+    "verl": "verl (pip install -e .)",
+}
+missing = []
+for mod, hint in required.items():
+    try:
+        importlib.import_module(mod)
+    except Exception as exc:
+        missing.append(f"  - {mod}: {hint} ({exc})")
+if missing:
+    print("Missing required packages:\n" + "\n".join(missing), file=sys.stderr)
+    sys.exit(1)
+
+# Mxfp4Config landed in transformers 4.46; bail early if older.
+try:
+    from transformers import Mxfp4Config  # noqa: F401
+except Exception as exc:
+    print(f"transformers is missing Mxfp4Config: {exc}", file=sys.stderr)
+    print("Upgrade with: pip install -U 'transformers>=4.46'", file=sys.stderr)
+    sys.exit(1)
+PY
+
 # ---- 0. dequantize weights -----------------------------------------------
 if [ ! -f "${MODEL_DIR}/config.json" ]; then
-    echo "[launch] dequantizing ${MODEL_ID} -> ${MODEL_DIR}"
-    python3 "$(dirname "$0")/prepare_model.py" \
+    log "dequantizing ${MODEL_ID} -> ${MODEL_DIR} (one-time, ~40GB download)"
+    "${PYTHON}" "${HERE}/prepare_model.py" \
         --model-id "${MODEL_ID}" \
         --output-dir "${MODEL_DIR}"
+else
+    log "reusing existing bf16 checkpoint at ${MODEL_DIR}"
 fi
 
 # ---- 1. preprocess gsm8k --------------------------------------------------
 if [ ! -f "${DATA_DIR}/train.parquet" ]; then
-    echo "[launch] preprocessing gsm8k -> ${DATA_DIR}"
-    python3 examples/data_preprocess/gsm8k.py --local_save_dir "${DATA_DIR}"
+    log "preprocessing gsm8k -> ${DATA_DIR}"
+    mkdir -p "${DATA_DIR}"
+    "${PYTHON}" examples/data_preprocess/gsm8k.py --local_save_dir "${DATA_DIR}"
+else
+    log "reusing existing gsm8k parquet at ${DATA_DIR}"
 fi
 
-# ---- 2. launch training ---------------------------------------------------
-python3 -m verl.trainer.main_ppo \
+# ---- 2. forward/backward correctness check (default: on) ------------------
+if [ "${SKIP_CHECK}" != "1" ]; then
+    log "running forward/backward correctness check"
+    "${PYTHON}" "${HERE}/check_gpt_oss_fwd_bwd.py" \
+        --model-dir "${MODEL_DIR}" \
+        --seq-len "${CHECK_SEQ_LEN}" \
+        --batch-size "${CHECK_BATCH_SIZE}"
+else
+    log "SKIP_CHECK=1, skipping correctness check"
+fi
+
+# ---- 3. launch training ---------------------------------------------------
+if [ "${SKIP_TRAIN}" = "1" ]; then
+    log "SKIP_TRAIN=1, exiting before training"
+    exit 0
+fi
+
+log "launching GRPO training"
+"${PYTHON}" -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files="${DATA_DIR}/train.parquet" \
     data.val_files="${DATA_DIR}/test.parquet" \

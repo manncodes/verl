@@ -12,24 +12,38 @@ the forward/backward pass before kicking off a real run.
 | `run_check.sh` | Wrapper around the check that also dequantizes if needed |
 | `launch_train_gpt_oss_20b.sh` | GRPO training on GSM8K with FSDP + sglang |
 
-## Typical flow
+## One-shot flow
+
+A single command does dependency check -> dequantize -> preprocess gsm8k ->
+forward/backward correctness check -> launch GRPO training:
 
 ```bash
-# 1. sanity check the model end-to-end (forward + backward, finite grads,
-#    every expected submodule receives gradient).
-bash examples/gpt_oss/run_check.sh
-
-# 2. start training
 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
 ```
 
-Override knobs via env vars, e.g.:
+Each stage is idempotent: re-running skips work that's already done. To run
+just the correctness check (no training):
+
+```bash
+SKIP_TRAIN=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
+```
+
+To skip the correctness check (e.g. on a re-launch after a crash):
+
+```bash
+SKIP_CHECK=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
+```
+
+Override any other knob via env vars, e.g.:
 
 ```bash
 N_GPUS_PER_NODE=4 ROLLOUT_TP_SIZE=2 \
 TRAIN_BATCH_SIZE=128 PPO_MICRO_BATCH_SIZE_PER_GPU=16 \
 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
 ```
+
+`run_check.sh` is also available as a standalone wrapper around the
+correctness check if you only want that piece.
 
 ## Why these defaults
 
