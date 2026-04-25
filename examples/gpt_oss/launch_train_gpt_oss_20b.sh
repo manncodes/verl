@@ -27,26 +27,62 @@ cd "${REPO_ROOT}"
 
 log() { printf '[launch] %s\n' "$*"; }
 
-# ---- knobs ----------------------------------------------------------------
+# ---- model / data --------------------------------------------------------
 MODEL_ID=${MODEL_ID:-openai/gpt-oss-20b}
 MODEL_DIR=${MODEL_DIR:-$HOME/models/gpt-oss-20b-bf16}
 DATA_DIR=${DATA_DIR:-$HOME/data/gsm8k}
 PROJECT_NAME=${PROJECT_NAME:-verl_gpt_oss_20b}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-gpt_oss_20b_grpo_gsm8k}
-N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
+
+# ---- topology ------------------------------------------------------------
+# Defaults assume one 8 x H100 80GB node. Set NNODES=N to scale out.
 NNODES=${NNODES:-1}
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-256}
+N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
+TOTAL_GPUS=$((NNODES * N_GPUS_PER_NODE))
+
+# ---- batch-size scaling rule ---------------------------------------------
+# What scales linearly with NNODES (set per-node, multiplied here):
+#     - TRAIN_BATCH_SIZE        (global #prompts per training step)
+#     - PPO_MINI_BATCH_SIZE     (= TRAIN_BATCH_SIZE for MoE stability)
+# What stays per-GPU (no scaling):
+#     - PPO_MICRO_BATCH_SIZE_PER_GPU
+#     - log_prob_micro_batch_size_per_gpu (actor + ref)
+# What is independent of NNODES:
+#     - ROLLOUT_TP_SIZE         (decided by model size, not node count)
+#     - ROLLOUT_N               (algorithmic, # generations per prompt)
+#     - max_prompt/response_length, KL/loss settings
+#
+# 1 H100 node default: 32 prompts/GPU * 8 GPUs = 256 train_batch_size.
+# 2 nodes:             32 prompts/GPU * 16 GPUs = 512.
+TRAIN_BATCH_SIZE_PER_NODE=${TRAIN_BATCH_SIZE_PER_NODE:-256}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-$((TRAIN_BATCH_SIZE_PER_NODE * NNODES))}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-${TRAIN_BATCH_SIZE}}
 PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-32}
+
+# ---- rollout / generation ------------------------------------------------
 ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-2}
 ROLLOUT_N=${ROLLOUT_N:-5}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-512}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-8192}
 REASONING_EFFORT=${REASONING_EFFORT:-medium}
+
+# ---- training schedule ---------------------------------------------------
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-15}
 SAVE_FREQ=${SAVE_FREQ:-50}
 TEST_FREQ=${TEST_FREQ:-10}
 LOGGER=${LOGGER:-'["console","wandb"]'}
+
+# ---- topology sanity checks ----------------------------------------------
+if (( N_GPUS_PER_NODE % ROLLOUT_TP_SIZE != 0 )); then
+    echo "[launch] ERROR: N_GPUS_PER_NODE=${N_GPUS_PER_NODE} not divisible by ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE}" >&2
+    exit 1
+fi
+if (( TRAIN_BATCH_SIZE % TOTAL_GPUS != 0 )); then
+    echo "[launch] WARNING: TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} not divisible by TOTAL_GPUS=${TOTAL_GPUS}; verl may pad or error" >&2
+fi
+if (( PPO_MINI_BATCH_SIZE != TRAIN_BATCH_SIZE )); then
+    echo "[launch] WARNING: PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE} != TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE}; MoE training is unstable when these differ (see issue #3894)" >&2
+fi
 
 # ---- MoE stability knobs --------------------------------------------------
 # Background:
@@ -152,6 +188,10 @@ if [ "${SKIP_TRAIN}" = "1" ]; then
     exit 0
 fi
 
+log "topology: NNODES=${NNODES}  N_GPUS_PER_NODE=${N_GPUS_PER_NODE}  TOTAL_GPUS=${TOTAL_GPUS}"
+log "batch:    TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} (= ${TRAIN_BATCH_SIZE_PER_NODE} per-node x ${NNODES} nodes)"
+log "          PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE}  PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU}"
+log "rollout:  TP=${ROLLOUT_TP_SIZE}  DP=$((TOTAL_GPUS / ROLLOUT_TP_SIZE))  N=${ROLLOUT_N}"
 log "launching GRPO training"
 
 # Build optional MoE-stability args (TIS via rollout correction).

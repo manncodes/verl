@@ -51,20 +51,32 @@ def log(msg: str) -> None:
     print(f"[check] {msg}", flush=True)
 
 
-def load_model(model_dir: str, device: str, dtype: torch.dtype):
+def load_model(model_dir: str, device: str, dtype: torch.dtype, device_map: str | None):
     log(f"loading tokenizer from {model_dir}")
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
 
-    log(f"loading model from {model_dir} (dtype={dtype}, device={device})")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_dir,
+    # gpt-oss-20b in bf16 is ~40GB just for parameters; backward also needs
+    # grad tensors of equal size plus activations. That overflows a single
+    # 80GB H100. When CUDA + multiple GPUs are visible we let HF/accelerate
+    # shard the model across them via device_map="auto"; with one GPU we
+    # fall back to a plain .to(device).
+    log(f"loading model from {model_dir} (dtype={dtype}, device={device}, device_map={device_map})")
+    kwargs = dict(
         torch_dtype=dtype,
         attn_implementation="eager",
         use_cache=False,
         low_cpu_mem_usage=True,
     )
-    model.to(device)
+    if device_map is not None:
+        kwargs["device_map"] = device_map
+    model = AutoModelForCausalLM.from_pretrained(model_dir, **kwargs)
+    if device_map is None:
+        model.to(device)
     model.train()
+    # Free activation memory aggressively on the backward pass.
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        log("  enabled gradient checkpointing on the model")
     return tokenizer, model
 
 
@@ -230,6 +242,15 @@ def main() -> int:
     parser.add_argument("--seq-len", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
+        "--device-map",
+        default=None,
+        help=(
+            "HuggingFace device_map. Defaults to 'auto' on multi-GPU CUDA hosts "
+            "(gpt-oss-20b bf16 needs ~80GB+ for backward, so single-GPU OOMs); "
+            "pass 'none' to force the legacy single-device path."
+        ),
+    )
+    parser.add_argument(
         "--cross-check",
         action="store_true",
         help="also load a fp32 cpu copy and compare logits to the gpu bf16 forward",
@@ -247,11 +268,34 @@ def main() -> int:
 
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
 
-    tokenizer, model = load_model(args.model_dir, args.device, dtype)
+    # Pick device_map: explicit override wins; otherwise default to "auto" if
+    # we have >=2 CUDA GPUs visible (gpt-oss-20b bf16 backward won't fit on
+    # one 80GB H100), else None (legacy single-device behaviour).
+    if args.device_map is None:
+        if args.device.startswith("cuda") and torch.cuda.device_count() >= 2:
+            device_map = "auto"
+        else:
+            device_map = None
+    elif args.device_map.lower() == "none":
+        device_map = None
+    else:
+        device_map = args.device_map
+
+    tokenizer, model = load_model(args.model_dir, args.device, dtype, device_map)
     list_modules(model, EXPECTED_GRAD_SUBSTRINGS)
 
+    # When device_map shards the model, inputs must land on the same device as
+    # the embedding layer (the first submodule) — accelerate's hooks then
+    # forward activations across devices.
+    input_device = args.device
+    if device_map is not None:
+        try:
+            input_device = next(model.parameters()).device
+        except StopIteration:
+            pass
+
     input_ids, attention_mask, labels = build_batch(
-        tokenizer, args.device, args.seq_len, args.batch_size
+        tokenizer, input_device, args.seq_len, args.batch_size
     )
     loss = check_forward(model, input_ids, attention_mask, labels)
     check_backward(model, loss)

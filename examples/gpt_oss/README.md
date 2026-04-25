@@ -106,7 +106,8 @@ correctness check if you only want that piece.
 
 | flag (env var → hydra override) | default | why it matters for gpt-oss |
 | --- | --- | --- |
-| `TRAIN_BATCH_SIZE == PPO_MINI_BATCH_SIZE` (`data.train_batch_size`, `actor.ppo_mini_batch_size`) | equal | MoE training diverges quickly when the two differ; upstream example keeps them equal. |
+| `TRAIN_BATCH_SIZE_PER_NODE` × `NNODES` (`data.train_batch_size`) | `256 * NNODES` | Global batch scales linearly with `NNODES`. `TRAIN_BATCH_SIZE` overrides if set explicitly. |
+| `TRAIN_BATCH_SIZE == PPO_MINI_BATCH_SIZE` (`actor.ppo_mini_batch_size`) | equal | MoE training diverges quickly when the two differ; upstream example keeps them equal. |
 | `ENABLE_TIS=1` (`algorithm.rollout_correction.rollout_is`, `rollout.calculate_log_probs`) | on, token-level | Issue #3894 reports `rollout_actor_probs_pearson_corr ~ 0.5` from training/rollout drift — TIS is the supported mitigation. Set `TIS_LEVEL=sequence` for higher-variance unbiased weights. |
 | `TIS_THRESHOLD` (`algorithm.rollout_correction.rollout_is_threshold`) | `2.0` | Per the upstream guide: 1.5–5.0 for token-TIS, 2.0–10.0 for sequence-TIS. |
 | `USE_DYNAMIC_BSZ=False` (`actor.use_dynamic_bsz`) | off | Required by the gpt-oss megatron path (PR #4323) and safer for FSDP MoE since dynamic packing changes routing per step. |
@@ -117,6 +118,41 @@ correctness check if you only want that piece.
 
 Set `ENABLE_TIS=0` to drop back to vanilla GRPO (matches the existing
 `examples/grpo_trainer/run_gptoss_20b.sh` baseline).
+
+### Scaling across nodes
+
+The launcher follows a strict per-node convention so multi-node runs are a
+single env-var change. `TRAIN_BATCH_SIZE_PER_NODE` is the only batch knob
+you set; the launcher multiplies it by `NNODES` for the global batch.
+
+| knob | scaling | reason |
+| --- | --- | --- |
+| `TRAIN_BATCH_SIZE` | `TRAIN_BATCH_SIZE_PER_NODE * NNODES` | Linear weak scaling — keeps per-GPU work constant. |
+| `PPO_MINI_BATCH_SIZE` | `= TRAIN_BATCH_SIZE` | MoE stability requirement. |
+| `PPO_MICRO_BATCH_SIZE_PER_GPU` | constant | Fixed by GPU memory, not topology. |
+| `actor.rollout.log_prob_micro_batch_size_per_gpu` | constant | Same as above. |
+| `ROLLOUT_TP_SIZE` | constant | Picked by model size; gpt-oss-20b fits at TP=2. |
+| `ROLLOUT_N` | constant | Algorithmic — generations per prompt. |
+
+Examples:
+
+```bash
+# 1 H100 node (default): 256 prompts/step
+bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
+
+# 4 H100 nodes: auto-derives TRAIN_BATCH_SIZE=1024
+NNODES=4 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
+
+# Smaller per-node batch on a memory-tight cluster
+TRAIN_BATCH_SIZE_PER_NODE=128 NNODES=2 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
+
+# Override the auto-scaled global batch directly
+TRAIN_BATCH_SIZE=384 NNODES=3 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
+```
+
+The launcher prints the effective topology + batch shape just before training
+starts, plus warnings if the global batch is not divisible by total GPUs or
+if `train_batch_size` and `ppo_mini_batch_size` differ.
 
 ### Not enabled (Megatron-only)
 
