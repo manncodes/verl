@@ -108,14 +108,12 @@ TIS_LEVEL=${TIS_LEVEL:-token}                   # token | sequence
 TIS_THRESHOLD=${TIS_THRESHOLD:-2.0}             # 1.5–5.0 typical for token; 2.0–10.0 for sequence
 USE_DYNAMIC_BSZ=${USE_DYNAMIC_BSZ:-False}
 USE_TORCH_COMPILE=${USE_TORCH_COMPILE:-False}   # actor + ref
-# use_remove_padding=True triggers verl/utils/attention_utils.py, which imports
-# flash_attn.bert_padding with NO CUDA fallback. On boxes where flash-attn was
-# built against a different torch ABI (we hit this on torch 2.9.1 + cu13: the
-# .so is missing _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_jb), verl
-# crashes at step 1 in _compute_old_log_prob even though the actor uses eager
-# attention. Default to False so the recipe runs end-to-end on a stock install;
-# flip back to True once you have a flash-attn wheel matched to your torch.
-USE_REMOVE_PADDING=${USE_REMOVE_PADDING:-False}
+# True is the better-perf default. The verl trainer calls left_right_2_no_padding
+# unconditionally in _compute_old_log_prob (regardless of this flag), so its
+# flash_attn.bert_padding dependency is not bypassable by flipping this off —
+# we instead added a pure-torch fallback in verl/utils/attention_utils.py that
+# kicks in when the flash-attn .so has an ABI mismatch with torch.
+USE_REMOVE_PADDING=${USE_REMOVE_PADDING:-True}
 
 SKIP_SINKS_TEST=${SKIP_SINKS_TEST:-0}
 SKIP_R3_TEST=${SKIP_R3_TEST:-0}

@@ -27,7 +27,17 @@ def _get_attention_functions() -> tuple[Callable, Callable, Callable, Callable]:
     if is_torch_npu_available(check_device=False):
         from verl.utils.npu_flash_attn_utils import index_first_axis, pad_input, rearrange, unpad_input
     else:
-        from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+        try:
+            from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+        except ImportError:
+            # flash_attn unavailable or broken ABI (e.g. the prebuilt .so was
+            # compiled against a different torch — symbol like
+            # _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_jb is missing).
+            # Fall back to the pure-torch helpers in npu_flash_attn_utils;
+            # they use only torch + einops and run fine on CUDA.
+            from einops import rearrange
+
+            from verl.utils.npu_flash_attn_utils import index_first_axis, pad_input, unpad_input
 
     _index_first_axis, _pad_input, _rearrange, _unpad_input = index_first_axis, pad_input, rearrange, unpad_input
 
