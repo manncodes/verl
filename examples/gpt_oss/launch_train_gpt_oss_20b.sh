@@ -155,11 +155,14 @@ ACTIVATION_OFFLOAD=${ACTIVATION_OFFLOAD:-True}
 # the default 8x DP setup.
 ULYSSES_SP_SIZE=${ULYSSES_SP_SIZE:-1}
 
-# expandable_segments avoids fragmentation that hits us at step 3+: by then,
-# the allocator has 2 GB free out of 80 but it's split into too-small chunks
-# for a 6 GB attention-score allocation. Ray workers inherit this from the
-# parent process, so exporting here propagates to FSDP + sglang ranks.
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+# NOTE: do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here.
+# sglang's torch_memory_saver (the thing that releases KV cache between
+# rollout and training) is incompatible with expandable_segments and will
+# crash sglang init with "TorchMemorySaver is disabled for the current
+# process because expandable_segments is not supported yet". With
+# PPO_MICRO_BATCH_SIZE_PER_GPU=2 the per-allocation size is small enough
+# that fragmentation is rarely the OOM trigger; if you still hit one,
+# lower micro_batch to 1 instead of touching the allocator config.
 
 SKIP_SINKS_TEST=${SKIP_SINKS_TEST:-0}
 SKIP_R3_TEST=${SKIP_R3_TEST:-0}
