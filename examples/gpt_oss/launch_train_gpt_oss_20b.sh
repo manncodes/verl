@@ -130,6 +130,25 @@ USE_TORCH_COMPILE=${USE_TORCH_COMPILE:-False}   # actor + ref
 # kicks in when the flash-attn .so has an ABI mismatch with torch.
 USE_REMOVE_PADDING=${USE_REMOVE_PADDING:-True}
 
+# ---- offload knobs (perf/memory trade-off) -------------------------------
+# These three default to OFF for speed. Optimizer offload saves the most
+# memory (~16 GB/GPU for AdamW on 20B) at near-zero cost since it only
+# fires once per minibatch, not per micro-batch. Param + activation
+# offload move data over PCIe (64 GB/s) on every forward; with both on,
+# update_actor takes 8-14 min/step on H100 (MFU ~0.4%). With both off,
+# update_actor drops to ~60-90s (MFU ~5-10%). Memory math during training
+# (sglang asleep): params 5 + grads 5 + activations ~15 + optim 16 = 41 GB
+# / 80 GB. If you OOM in the actor backward, flip OPTIMIZER_OFFLOAD=True
+# first (cheapest mem saver), then PARAM_OFFLOAD=True.
+PARAM_OFFLOAD=${PARAM_OFFLOAD:-False}
+OPTIMIZER_OFFLOAD=${OPTIMIZER_OFFLOAD:-True}
+ACTIVATION_OFFLOAD=${ACTIVATION_OFFLOAD:-False}
+# Ulysses sequence parallelism: shards the seq dim across N GPUs, making
+# eager attention's seq^2 memory/compute scale as (seq/N)^2. Set to 2 if
+# you have spare GPUs and want a ~4x attention speedup. Leave at 1 for
+# the default 8x DP setup.
+ULYSSES_SP_SIZE=${ULYSSES_SP_SIZE:-1}
+
 SKIP_SINKS_TEST=${SKIP_SINKS_TEST:-0}
 SKIP_R3_TEST=${SKIP_R3_TEST:-0}
 RUN_ROLLOUT_TEST=${RUN_ROLLOUT_TEST:-0}    # heavyweight; opt-in. Boots sglang/vllm.
@@ -292,7 +311,7 @@ fi
     +actor_rollout_ref.model.override_config.attn_implementation=eager \
     actor_rollout_ref.model.use_remove_padding="${USE_REMOVE_PADDING}" \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.model.enable_activation_offload=True \
+    actor_rollout_ref.model.enable_activation_offload="${ACTIVATION_OFFLOAD}" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
@@ -302,8 +321,9 @@ fi
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
-    actor_rollout_ref.actor.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload="${PARAM_OFFLOAD}" \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload="${OPTIMIZER_OFFLOAD}" \
+    actor_rollout_ref.actor.ulysses_sequence_parallel_size="${ULYSSES_SP_SIZE}" \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.calculate_log_probs="${CALC_LOGP}" \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
