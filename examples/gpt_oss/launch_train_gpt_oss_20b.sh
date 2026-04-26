@@ -62,11 +62,14 @@ TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-$((TRAIN_BATCH_SIZE_PER_NODE * NNODES))}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-${TRAIN_BATCH_SIZE}}
 # gpt-oss requires eager attention (only path that honours sinks). Eager
 # materialises [bs, heads, seq, seq] in bf16: a single attention forward at
-# seq=2560 with 64 heads costs ~3.4 GB per micro-batch element. micro_batch=4
-# is the headroom-vs-throughput sweet spot for an 8 x H100 box where sglang
-# already pins ~32 GB/GPU through hybrid-engine colocation. If you OOM in
-# eager_attention_forward (combined_logits or attn_weights), drop this further.
-PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-4}
+# seq=2560 with 64 heads costs ~3.4 GB per micro-batch element. The actor's
+# backward pass also recomputes attention scores (gradient checkpointing),
+# adding another peak. With all three FSDP offloads ON, GPU peaks at ~50 GB
+# during backward (plus 26 GB sglang resident) on micro_batch=4 — leaving
+# only 4 GB free, which fragments and OOMs at step 3. micro_batch=2 cuts
+# the attention memory in half and reliably runs end-to-end on 8 x H100.
+# Bump back to 4 if you have HBM headroom (e.g. ROLLOUT_GPU_MEM_UTIL=0.4).
+PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-2}
 
 # ---- rollout / generation ------------------------------------------------
 ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-2}
@@ -131,23 +134,32 @@ USE_TORCH_COMPILE=${USE_TORCH_COMPILE:-False}   # actor + ref
 USE_REMOVE_PADDING=${USE_REMOVE_PADDING:-True}
 
 # ---- offload knobs (perf/memory trade-off) -------------------------------
-# These three default to OFF for speed. Optimizer offload saves the most
-# memory (~16 GB/GPU for AdamW on 20B) at near-zero cost since it only
-# fires once per minibatch, not per micro-batch. Param + activation
-# offload move data over PCIe (64 GB/s) on every forward; with both on,
-# update_actor takes 8-14 min/step on H100 (MFU ~0.4%). With both off,
-# update_actor drops to ~60-90s (MFU ~5-10%). Memory math during training
-# (sglang asleep): params 5 + grads 5 + activations ~15 + optim 16 = 41 GB
-# / 80 GB. If you OOM in the actor backward, flip OPTIMIZER_OFFLOAD=True
-# first (cheapest mem saver), then PARAM_OFFLOAD=True.
-PARAM_OFFLOAD=${PARAM_OFFLOAD:-False}
+# Defaults are conservative because sglang doesn't fully release its memory
+# when "asleep" — it keeps ~26 GB resident on every GPU (model weights +
+# workspace) even between rollout steps. With all three offloads ON, GPU
+# is already at 50/80 GB during the actor backward (the other 26 is sglang),
+# so disabling any of them risks OOM in update_actor's backward pass.
+#
+# Trade-off: with offloads ON, update_actor is 8-14 min/step (MFU ~0.4%).
+# With offloads OFF (and a less-resident sglang), update_actor drops to
+# ~60-90s (MFU ~5-10%). On a 8x H100 80GB box with hybrid-engine sglang,
+# OFF defaults OOM at step 3. If you have spare HBM (e.g. lower
+# ROLLOUT_GPU_MEM_UTIL, or only one engine on the GPU), flip these to
+# False via env to get a 5-10x speedup.
+PARAM_OFFLOAD=${PARAM_OFFLOAD:-True}
 OPTIMIZER_OFFLOAD=${OPTIMIZER_OFFLOAD:-True}
-ACTIVATION_OFFLOAD=${ACTIVATION_OFFLOAD:-False}
+ACTIVATION_OFFLOAD=${ACTIVATION_OFFLOAD:-True}
 # Ulysses sequence parallelism: shards the seq dim across N GPUs, making
 # eager attention's seq^2 memory/compute scale as (seq/N)^2. Set to 2 if
 # you have spare GPUs and want a ~4x attention speedup. Leave at 1 for
 # the default 8x DP setup.
 ULYSSES_SP_SIZE=${ULYSSES_SP_SIZE:-1}
+
+# expandable_segments avoids fragmentation that hits us at step 3+: by then,
+# the allocator has 2 GB free out of 80 but it's split into too-small chunks
+# for a 6 GB attention-score allocation. Ray workers inherit this from the
+# parent process, so exporting here propagates to FSDP + sglang ranks.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 SKIP_SINKS_TEST=${SKIP_SINKS_TEST:-0}
 SKIP_R3_TEST=${SKIP_R3_TEST:-0}
