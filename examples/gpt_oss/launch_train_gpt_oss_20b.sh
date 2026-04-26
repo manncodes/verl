@@ -146,9 +146,26 @@ USE_REMOVE_PADDING=${USE_REMOVE_PADDING:-True}
 # OFF defaults OOM at step 3. If you have spare HBM (e.g. lower
 # ROLLOUT_GPU_MEM_UTIL, or only one engine on the GPU), flip these to
 # False via env to get a 5-10x speedup.
+#
+# CONSTRAINT: PARAM_OFFLOAD=False + OPTIMIZER_OFFLOAD=True is invalid.
+# verl's FSDP engine init (workers/engine/fsdp/transformer_impl.py:187)
+# calls `to(model=param_offload, optimizer=optimizer_offload, grad=param_offload)`
+# and the base `to()` (workers/engine/base.py:180) asserts that if
+# model=False then optimizer and grad must also be False. Practically this
+# means: keep optimizer offload at most as aggressive as param offload.
+# The recommended fast config is BOTH False (along with ACTIVATION_OFFLOAD=False).
 PARAM_OFFLOAD=${PARAM_OFFLOAD:-True}
 OPTIMIZER_OFFLOAD=${OPTIMIZER_OFFLOAD:-True}
 ACTIVATION_OFFLOAD=${ACTIVATION_OFFLOAD:-True}
+
+# Enforce the coupling above before we get a 5-min-into-init crash.
+if [ "${PARAM_OFFLOAD}" = "False" ] && [ "${OPTIMIZER_OFFLOAD}" = "True" ]; then
+    echo "[launch] ERROR: PARAM_OFFLOAD=False with OPTIMIZER_OFFLOAD=True is unsupported." >&2
+    echo "        verl's FSDP engine cannot move just the optimizer to CPU while keeping" >&2
+    echo "        params on GPU (workers/engine/base.py:180 asserts on this combo)." >&2
+    echo "        Set OPTIMIZER_OFFLOAD=False as well, or leave PARAM_OFFLOAD=True." >&2
+    exit 1
+fi
 # Ulysses sequence parallelism: shards the seq dim across N GPUs, making
 # eager attention's seq^2 memory/compute scale as (seq/N)^2. Set to 2 if
 # you have spare GPUs and want a ~4x attention speedup. Leave at 1 for
@@ -296,7 +313,8 @@ fi
 log "topology: NNODES=${NNODES}  N_GPUS_PER_NODE=${N_GPUS_PER_NODE}  TOTAL_GPUS=${TOTAL_GPUS}"
 log "batch:    TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} (= ${TRAIN_BATCH_SIZE_PER_NODE} per-node x ${NNODES} nodes)"
 log "          PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE}  PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU}"
-log "rollout:  TP=${ROLLOUT_TP_SIZE}  DP=$((TOTAL_GPUS / ROLLOUT_TP_SIZE))  N=${ROLLOUT_N}"
+log "rollout:  TP=${ROLLOUT_TP_SIZE}  DP=$((TOTAL_GPUS / ROLLOUT_TP_SIZE))  N=${ROLLOUT_N}  GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL}"
+log "offload:  PARAM=${PARAM_OFFLOAD}  OPTIMIZER=${OPTIMIZER_OFFLOAD}  ACTIVATION=${ACTIVATION_OFFLOAD}  ULYSSES_SP=${ULYSSES_SP_SIZE}"
 log "launching GRPO training"
 
 # Build optional MoE-stability args (TIS via rollout correction).
