@@ -17,6 +17,7 @@ the forward/backward pass before kicking off a real run.
 | `check_gpt_oss_fwd_bwd.py` | Standalone forward/backward correctness check |
 | `run_check.sh` | Wrapper around the check that also dequantizes if needed |
 | `launch_train_gpt_oss_20b.sh` | GRPO training on GSM8K with FSDP + sglang |
+| `wandb_ray_metrics.py` | Sidecar: forward Ray's per-node Prometheus metrics to wandb |
 
 ## One-shot flow
 
@@ -253,6 +254,24 @@ python examples/gpt_oss/test_rollout_e2e.py --model-dir /model/Huggingface/opena
   (`verl/workers/engine_workers.py:477` gates on `actor.strategy=="megatron"`).
   If you switch backends, see `examples/router_replay/` for the recipe.
 - **Expert parallel (EP/ETP)** lives under `actor.megatron.*`; n/a for FSDP.
+
+## Per-node cluster metrics in wandb
+
+verl's wandb run only logs system metrics from rank 0. To get GPU/CPU/mem
+per node across the whole Ray cluster (matching what Ray dashboard shows),
+run the sidecar in a second shell **after** the trainer has started Ray:
+
+```bash
+python examples/gpt_oss/wandb_ray_metrics.py \
+    --project verl_gpt_oss_20b \
+    --run-name gpt_oss_20b_grpo_gsm8k \
+    --interval 15
+```
+
+It scrapes `/tmp/ray/session_latest/metrics/prometheus/prom_metrics_service_discovery.json`
+for the cluster's per-node `/metrics` endpoints and forwards them to a
+parallel wandb run named `<run-name>-cluster`. Stop with Ctrl-C when
+training finishes; safe to start/stop repeatedly. No verl changes needed.
 
 ## References
 
