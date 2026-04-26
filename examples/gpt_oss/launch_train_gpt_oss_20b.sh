@@ -9,11 +9,12 @@
 #         bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
 #
 # Skip / opt-in stages with:
-#     SKIP_SINKS_TEST=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # no sinks test
-#     SKIP_R3_TEST=1    bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # no R3 capability check
-#     RUN_ROLLOUT_TEST=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh  # heavy: launches sglang/vllm
-#     SKIP_CHECK=1      bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # no fwd/bwd check
-#     SKIP_TRAIN=1      bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # checks only
+#     SKIP_SINKS_TEST=1   bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # no sinks test
+#     SKIP_R3_TEST=1      bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # no R3 capability check
+#     RUN_ROLLOUT_TEST=1  bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # heavy: launches sglang/vllm
+#     RUN_SONIC_MOE_PROBE=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh # benchmark sonic-moe vs gpt-oss GLU
+#     SKIP_CHECK=1        bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # no fwd/bwd check
+#     SKIP_TRAIN=1        bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # checks only
 #
 # Recipe consolidated from examples/grpo_trainer/run_gptoss_20b.sh and the
 # upstream issues/PRs noted in examples/gpt_oss/README.md. Caveats baked in:
@@ -184,6 +185,8 @@ ULYSSES_SP_SIZE=${ULYSSES_SP_SIZE:-1}
 SKIP_SINKS_TEST=${SKIP_SINKS_TEST:-0}
 SKIP_R3_TEST=${SKIP_R3_TEST:-0}
 RUN_ROLLOUT_TEST=${RUN_ROLLOUT_TEST:-0}    # heavyweight; opt-in. Boots sglang/vllm.
+RUN_SONIC_MOE_PROBE=${RUN_SONIC_MOE_PROBE:-0}  # benchmark + numeric gap vs gpt-oss GLU
+USE_SONIC_MOE=${USE_SONIC_MOE:-0}          # placeholder — see sonic_moe_patch.py
 SKIP_CHECK=${SKIP_CHECK:-0}
 SKIP_TRAIN=${SKIP_TRAIN:-0}
 CHECK_SEQ_LEN=${CHECK_SEQ_LEN:-64}
@@ -291,6 +294,27 @@ if [ "${RUN_ROLLOUT_TEST}" = "1" ]; then
     "${PYTHON}" "${HERE}/test_rollout_e2e.py" \
         --model-dir "${MODEL_DIR}" \
         --tensor-parallel-size "${ROLLOUT_TP_SIZE}"
+fi
+
+# ---- 4b. sonic-moe probe (opt-in) -----------------------------------------
+# Forward-only benchmark + activation-parity check at gpt-oss-20b shapes
+# against vanilla SwiGLU. Cheap (one MoE forward, no full model). Sets up
+# the data needed to decide whether finishing the sonic-moe adapter in
+# examples/gpt_oss/sonic_moe_patch.py is worth the work.
+if [ "${RUN_SONIC_MOE_PROBE}" = "1" ]; then
+    log "running sonic-moe forward probe (Hopper/Blackwell only)"
+    "${PYTHON}" "${HERE}/test_sonic_moe.py"
+fi
+
+if [ "${USE_SONIC_MOE}" = "1" ]; then
+    # The adapter is intentionally a stub: gpt-oss's clamped + (up+1) GLU
+    # has no parity in sonic-moe's baked-in SwiGLU, so flipping this on
+    # without finishing the integration would silently corrupt training.
+    # Fail fast here so nobody burns GPU-hours on the misconfiguration.
+    echo "[launch] ERROR: USE_SONIC_MOE=1 is not yet supported." >&2
+    echo "        See examples/gpt_oss/sonic_moe_patch.py for the integration plan and" >&2
+    echo "        run RUN_SONIC_MOE_PROBE=1 first to confirm the win is worth the work." >&2
+    exit 1
 fi
 
 # ---- 5. forward/backward correctness check (default: on) ------------------

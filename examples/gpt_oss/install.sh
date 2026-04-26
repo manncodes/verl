@@ -19,6 +19,7 @@
 #     EXTRAS="sglang,gpu,math,test"  (verl extras to install)
 #     SKIP_FLASH_ATTN=0           (set 1 to skip flash-attn build)
 #     SKIP_PRE_COMMIT=0           (set 1 to skip pre-commit hook install)
+#     INSTALL_SONIC_MOE=0         (set 1 to install Dao-AILab/sonic-moe; Hopper/Blackwell only)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -29,6 +30,7 @@ VENV_DIR=${VENV_DIR:-.venv}
 EXTRAS=${EXTRAS:-sglang,gpu,math,test}
 SKIP_FLASH_ATTN=${SKIP_FLASH_ATTN:-0}
 SKIP_PRE_COMMIT=${SKIP_PRE_COMMIT:-0}
+INSTALL_SONIC_MOE=${INSTALL_SONIC_MOE:-0}
 
 log() { printf '[install] %s\n' "$*"; }
 
@@ -113,6 +115,23 @@ else
         "mathruler"
 fi
 
+# ---- 3b. sonic-moe (opt-in, Hopper/Blackwell only) -----------------------
+# https://github.com/Dao-AILab/sonic-moe — grouped-GEMM MoE kernels for H100/H200/B200.
+# Off by default: gpt-oss uses a *clamped* GELU-style SwiGLU (alpha=1.702,
+# limit=7.0) that sonic-moe does not implement natively, so the
+# `examples/gpt_oss/sonic_moe_patch.py` adapter wraps the kernel with the
+# clamps. Treat as experimental — run `python examples/gpt_oss/test_sonic_moe.py`
+# after install to verify forward parity against HF eager before enabling it
+# in the launcher (`USE_SONIC_MOE=1`).
+if [ "${INSTALL_SONIC_MOE}" = "1" ]; then
+    log "installing sonic-moe (experimental; runs only on Hopper/Blackwell)"
+    # sonic-moe needs torch>=2.7 and python>=3.12, both already satisfied above.
+    # PyPI name is `sonic-moe`, import name is `sonicmoe`.
+    uv pip install "sonic-moe" || {
+        log "sonic-moe install failed; continuing without it. set INSTALL_SONIC_MOE=0 to silence."
+    }
+fi
+
 # ---- 4. pre-commit -------------------------------------------------------
 if [ "${SKIP_PRE_COMMIT}" != "1" ] && [ -f .pre-commit-config.yaml ]; then
     log "installing pre-commit hooks"
@@ -130,7 +149,7 @@ python - <<'PY'
 import importlib, sys
 
 required_top = ["torch", "transformers", "datasets", "verl", "ray", "hydra"]
-optional_top = ["sglang", "flash_attn"]
+optional_top = ["sglang", "flash_attn", "sonicmoe"]
 
 # Deep verl chains that get hit on the FSDP+sglang+gsm8k launch path. If any
 # of these fail with a missing third-party dep, install.sh needs to add it.
@@ -190,3 +209,5 @@ log "  * 'sglang has no extra named srt/openai' is benign — sglang 0.5.8 dropp
 log "    those extras; verl's setup.py request is harmless and sglang installs."
 log "  * If flash_attn fails to import (ABI mismatch with newer CUDA drivers),"
 log "    the recipe still works: gpt-oss uses attn_implementation=eager by default."
+log "  * If you set INSTALL_SONIC_MOE=1, run examples/gpt_oss/test_sonic_moe.py"
+log "    on the H100 box to verify forward parity before turning on USE_SONIC_MOE=1."

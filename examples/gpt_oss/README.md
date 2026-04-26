@@ -18,6 +18,8 @@ the forward/backward pass before kicking off a real run.
 | `run_check.sh` | Wrapper around the check that also dequantizes if needed |
 | `launch_train_gpt_oss_20b.sh` | GRPO training on GSM8K with FSDP + sglang |
 | `wandb_ray_metrics.py` | Sidecar: forward Ray's per-node Prometheus metrics to wandb |
+| `sonic_moe_patch.py` | Scaffolding to swap HF's GptOssMoE with Dao-AILab/sonic-moe (experimental) |
+| `test_sonic_moe.py` | Forward probe: sonic-moe vs gpt-oss clamped GLU, numerics + wall-clock |
 
 ## One-shot flow
 
@@ -254,6 +256,76 @@ python examples/gpt_oss/test_rollout_e2e.py --model-dir /model/Huggingface/opena
   (`verl/workers/engine_workers.py:477` gates on `actor.strategy=="megatron"`).
   If you switch backends, see `examples/router_replay/` for the recipe.
 - **Expert parallel (EP/ETP)** lives under `actor.megatron.*`; n/a for FSDP.
+
+## sonic-moe integration (experimental)
+
+[Dao-AILab/sonic-moe](https://github.com/Dao-AILab/sonic-moe) ships
+grouped-GEMM MoE kernels for Hopper and Blackwell. Replacing HF's
+`GptOssMoE` with it could give a real wall-clock win on the actor's
+training step (where eager attention dominates today, but the MoE block
+is the next-largest cost). It is **not** wired up yet — gpt-oss uses a
+clamped, GELU-approximating SwiGLU with a `(up + 1)` shift that no entry
+in `sonicmoe.enums.ActivationType` matches, so a naive drop-in changes
+training numerics.
+
+What's in this directory:
+
+| file | role |
+| --- | --- |
+| `sonic_moe_patch.py` | Reference implementation of gpt-oss's GLU + a stub `apply_sonic_moe_to_model()` that documents the integration plan and currently raises |
+| `test_sonic_moe.py` | Forward-only probe: builds a sonic-moe MoE at gpt-oss-20b shapes, computes the activation gap vs the gpt-oss reference, benchmarks wall-clock |
+
+### Step 1: install (opt-in)
+
+```bash
+INSTALL_SONIC_MOE=1 bash examples/gpt_oss/install.sh
+```
+
+Adds `sonic-moe` to the venv. Hopper or Blackwell only; CUDA 12.9+ and
+torch ≥ 2.7 (both already pulled in by `verl[sglang]`).
+
+### Step 2: run the probe before doing anything else
+
+```bash
+RUN_SONIC_MOE_PROBE=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
+# or standalone
+python examples/gpt_oss/test_sonic_moe.py --tokens 8192
+```
+
+The probe reports:
+
+- The **numerical gap** between sonic-moe's vanilla SwiGLU output and
+  gpt-oss's clamped + `(up+1)` GLU at the same expert weights. If the
+  max abs diff exceeds the `--atol` (default 5e-2 for bf16), the
+  adapter must replace the activation before this can be used in
+  training. Expected outcome: gap is large, because the activations
+  really are different.
+- A **wall-clock comparison** against a naive eager reference. The
+  reference is slow (per-expert Python loop), so the speedup ratio it
+  reports is an upper bound, not a real-vs-real number — useful only
+  to sanity-check that sonic-moe runs at all on this hardware.
+
+### Step 3 (TODO): finish the adapter
+
+`USE_SONIC_MOE=1` in the launcher currently hard-fails. The integration
+plan lives in the `sonic_moe_patch.py` module docstring. Summary:
+
+1. Bypass `sonicmoe.MoE` (which bakes in SwiGLU) and compose
+   `sonicmoe.functional._up_projection_forward` (with a no-op
+   activation, if sonic-moe exposes one) + the gpt-oss clamped GLU in
+   PyTorch + `_down_projection_forward`.
+2. Map HF state-dict tensors (`gate_up_proj`, `down_proj`,
+   `router.weight`, `router.bias`) into sonic-moe's expected layout.
+   Note: gpt-oss-20b's `intermediate_size=2880` is not a power of two
+   — the chosen layout has to handle that or pad.
+3. Walk `model.model.layers[i].mlp` and replace the experts before
+   FSDP wrap (post-wrap is much harder).
+4. Verify forward parity at `atol=1e-2` against HF `GptOssExperts`,
+   then verify backward by comparing parameter gradients on the same
+   loss.
+
+Until step 3 lands, the launcher refuses `USE_SONIC_MOE=1` so nobody
+silently corrupts a training run.
 
 ## Per-node cluster metrics in wandb
 
