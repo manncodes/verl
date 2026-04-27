@@ -20,6 +20,7 @@ the forward/backward pass before kicking off a real run.
 | `wandb_ray_metrics.py` | Sidecar: forward Ray's per-node Prometheus metrics to wandb |
 | `sonic_moe_patch.py` | Scaffolding to swap HF's GptOssMoE with Dao-AILab/sonic-moe (experimental) |
 | `test_sonic_moe.py` | Forward probe: sonic-moe vs gpt-oss clamped GLU, numerics + wall-clock |
+| `test_sonic_moe_fwd_bwd.py` | Forward + backward parity test (vanilla SwiGLU on both sides) |
 
 ## One-shot flow
 
@@ -284,7 +285,36 @@ INSTALL_SONIC_MOE=1 bash examples/gpt_oss/install.sh
 Adds `sonic-moe` to the venv. Hopper or Blackwell only; CUDA 12.9+ and
 torch ≥ 2.7 (both already pulled in by `verl[sglang]`).
 
-### Step 2: run the probe before doing anything else
+### Step 2: run the parity test (forward + backward)
+
+```bash
+python examples/gpt_oss/test_sonic_moe_fwd_bwd.py
+python examples/gpt_oss/test_sonic_moe_fwd_bwd.py --tokens 8192   # bigger workload
+python examples/gpt_oss/test_sonic_moe_fwd_bwd.py --skip-backward # forward only
+```
+
+This is the test that decides whether the integration is feasible at
+all. It runs sonic-moe's grouped-GEMM kernel and a pure-pytorch reference
+on the *same* expert weights using vanilla SwiGLU on both sides, then
+checks:
+
+- **Forward parity**: max |sonic_out - ref_out| within `--atol-fwd`
+  (default 5e-2 for bf16). If this fails, the kernel and reference are
+  computing different things and the layout remap is wrong.
+- **Backward parity**: max |Δ grad| on `gate_up_proj`, `down_proj`,
+  `router_weight`, and the input `x`, all within `--atol-bwd` (default
+  1e-1 for bf16 gradient accumulation). If this fails, sonic-moe's
+  autograd path is incomplete and we can't use it for training.
+- **Activation gap** (informational): max |vanilla SwiGLU - gpt-oss
+  clamped GLU| on the same weights. Quantifies what the adapter has to
+  reconstruct.
+
+If both forward and backward PASS, the kernel is sound and the only
+remaining work is the activation swap (Step 3 below). If either FAILs,
+read the parameter dump it prints — the most likely cause is a layout
+the script didn't try to remap.
+
+### Step 2b: optional benchmark probe
 
 ```bash
 RUN_SONIC_MOE_PROBE=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
@@ -292,7 +322,7 @@ RUN_SONIC_MOE_PROBE=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
 python examples/gpt_oss/test_sonic_moe.py --tokens 8192
 ```
 
-The probe reports:
+The benchmark probe reports:
 
 - The **numerical gap** between sonic-moe's vanilla SwiGLU output and
   gpt-oss's clamped + `(up+1)` GLU at the same expert weights. If the
