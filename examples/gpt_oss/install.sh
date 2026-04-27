@@ -131,14 +131,30 @@ if [ "${INSTALL_SONIC_MOE}" = "1" ]; then
     # source install path is more reliable, so use git directly. Pin to main
     # rather than a tag because the project doesn't tag releases yet and
     # CuTeDSL kernel APIs are still in flux.
-    uv pip install --refresh "git+https://github.com/Dao-AILab/sonic-moe.git@main"
-    # Verify the install actually produced an importable package; if not,
-    # bail loud so nobody runs the parity test against a missing module.
+    #
+    # The [cu13] extra is the critical bit: bare `nvidia-cutlass-dsl` is
+    # metadata-only and `import cutlass` will fail inside sonic-moe's quack
+    # transitive dep ("ModuleNotFoundError: No module named 'cutlass'"). The
+    # cu13 variant ships the actual python module and matches a driver-13
+    # H100 box; if the box is on driver 12, swap to cu12 below.
+    SONIC_MOE_EXTRA=${SONIC_MOE_EXTRA:-cu13}
+    log "  using sonic-moe extra: [${SONIC_MOE_EXTRA}] (override with SONIC_MOE_EXTRA=cu12 if on CUDA 12 driver)"
+    uv pip install --refresh \
+        "sonic-moe[${SONIC_MOE_EXTRA}] @ git+https://github.com/Dao-AILab/sonic-moe.git@main"
+    # Verify both the package itself AND its transitive `cutlass` import
+    # are usable; one failed the other in the previous round and we want
+    # the exact failure mode to surface here, not in the parity test.
+    if ! python -c "import cutlass" >/dev/null 2>&1; then
+        log "ERROR: 'import cutlass' fails — nvidia-cutlass-dsl[${SONIC_MOE_EXTRA}] didn't ship the module."
+        log "       try: SONIC_MOE_EXTRA=cu12 INSTALL_SONIC_MOE=1 bash examples/gpt_oss/install.sh"
+        log "       or:  uv pip install -v 'nvidia-cutlass-dsl[cu12]>=4.4.2'    (then re-run import check)"
+        python -c "import cutlass" 2>&1 | tail -10
+        exit 1
+    fi
     if ! python -c "import sonicmoe" >/dev/null 2>&1; then
-        log "ERROR: sonic-moe install reported success but 'import sonicmoe' fails."
-        log "       run: uv pip list | grep -i sonic    to see what landed."
-        log "       run: uv pip install -v --refresh git+https://github.com/Dao-AILab/sonic-moe.git@main"
-        log "            and inspect the build log."
+        log "ERROR: 'import cutlass' works but 'import sonicmoe' still fails."
+        log "       full error:"
+        python -c "import sonicmoe" 2>&1 | tail -20
         exit 1
     fi
     log "sonic-moe import OK: $(python -c 'import sonicmoe; print(getattr(sonicmoe, \"__version__\", \"unknown\"))')"
