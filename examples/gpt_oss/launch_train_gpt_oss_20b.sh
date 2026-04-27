@@ -132,7 +132,18 @@ ENABLE_TIS=${ENABLE_TIS:-1}                     # set 0 to disable TIS
 TIS_LEVEL=${TIS_LEVEL:-token}                   # token | sequence
 TIS_THRESHOLD=${TIS_THRESHOLD:-2.0}             # 1.5–5.0 typical for token; 2.0–10.0 for sequence
 USE_DYNAMIC_BSZ=${USE_DYNAMIC_BSZ:-False}
-USE_TORCH_COMPILE=${USE_TORCH_COMPILE:-False}   # actor + ref
+# verl has TWO torch.compile flags per role and they aren't linked:
+#   * actor.use_torch_compile           — defaults True via actor.yaml
+#   * actor.fsdp_config.use_torch_compile — defaults True via fsdp.yaml,
+#     wraps compute_entropy_from_logits inside the FSDP engine. Note
+#     that the FSDP engine flag does NOT compile the full module, only
+#     the per-token entropy function (transformer_impl.py:147-151), so
+#     dynamo retracing of the FSDP forward is not the concern most
+#     "torch.compile + offload" warnings imply — but compile + MoE is
+#     fragile in general so we keep both off here.
+# Same for the ref policy (ref.use_torch_compile and
+# ref.fsdp_config.use_torch_compile). USE_TORCH_COMPILE drives all four.
+USE_TORCH_COMPILE=${USE_TORCH_COMPILE:-False}   # actor + ref, both layers
 # True is the better-perf default. The verl trainer calls left_right_2_no_padding
 # unconditionally in _compute_old_log_prob (regardless of this flag), so its
 # flash_attn.bert_padding dependency is not bypassable by flipping this off —
@@ -464,6 +475,7 @@ fi
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.fsdp_config.param_offload="${PARAM_OFFLOAD}" \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload="${OPTIMIZER_OFFLOAD}" \
+    actor_rollout_ref.actor.fsdp_config.use_torch_compile="${USE_TORCH_COMPILE}" \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size="${ULYSSES_SP_SIZE}" \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.calculate_log_probs="${CALC_LOGP}" \
@@ -477,6 +489,7 @@ fi
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
     actor_rollout_ref.ref.use_torch_compile="${USE_TORCH_COMPILE}" \
+    actor_rollout_ref.ref.fsdp_config.use_torch_compile="${USE_TORCH_COMPILE}" \
     actor_rollout_ref.ref.fsdp_config.param_offload="${REF_PARAM_OFFLOAD}" \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
