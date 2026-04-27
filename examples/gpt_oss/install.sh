@@ -125,11 +125,23 @@ fi
 # in the launcher (`USE_SONIC_MOE=1`).
 if [ "${INSTALL_SONIC_MOE}" = "1" ]; then
     log "installing sonic-moe (experimental; runs only on Hopper/Blackwell)"
-    # sonic-moe needs torch>=2.7 and python>=3.12, both already satisfied above.
-    # PyPI name is `sonic-moe`, import name is `sonicmoe`.
-    uv pip install "sonic-moe" || {
-        log "sonic-moe install failed; continuing without it. set INSTALL_SONIC_MOE=0 to silence."
-    }
+    # `uv pip install sonic-moe` against the PyPI sdist (0.1.2.post1, Apr 2026)
+    # has been observed to resolve+exit-0 without actually installing the
+    # package on this venv (only transitive deps move). The README's
+    # source install path is more reliable, so use git directly. Pin to main
+    # rather than a tag because the project doesn't tag releases yet and
+    # CuTeDSL kernel APIs are still in flux.
+    uv pip install --refresh "git+https://github.com/Dao-AILab/sonic-moe.git@main"
+    # Verify the install actually produced an importable package; if not,
+    # bail loud so nobody runs the parity test against a missing module.
+    if ! python -c "import sonicmoe" >/dev/null 2>&1; then
+        log "ERROR: sonic-moe install reported success but 'import sonicmoe' fails."
+        log "       run: uv pip list | grep -i sonic    to see what landed."
+        log "       run: uv pip install -v --refresh git+https://github.com/Dao-AILab/sonic-moe.git@main"
+        log "            and inspect the build log."
+        exit 1
+    fi
+    log "sonic-moe import OK: $(python -c 'import sonicmoe; print(getattr(sonicmoe, \"__version__\", \"unknown\"))')"
 fi
 
 # ---- 4. pre-commit -------------------------------------------------------
