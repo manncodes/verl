@@ -21,6 +21,8 @@ the forward/backward pass before kicking off a real run.
 | `sonic_moe_patch.py` | Scaffolding to swap HF's GptOssMoE with Dao-AILab/sonic-moe (experimental) |
 | `test_sonic_moe.py` | Forward probe: sonic-moe vs gpt-oss clamped GLU, numerics + wall-clock |
 | `test_sonic_moe_fwd_bwd.py` | Forward + backward parity test (vanilla SwiGLU on both sides) |
+| `flex_attention_sinks.py` | Sinks-aware attention via PyTorch flex_attention; self-test included |
+| `benchmark_speedups.py` | Microbenchmark: attention impls × MoE impls, correctness + stability + timing |
 
 ## One-shot flow
 
@@ -257,6 +259,77 @@ python examples/gpt_oss/test_rollout_e2e.py --model-dir /model/Huggingface/opena
   (`verl/workers/engine_workers.py:477` gates on `actor.strategy=="megatron"`).
   If you switch backends, see `examples/router_replay/` for the recipe.
 - **Expert parallel (EP/ETP)** lives under `actor.megatron.*`; n/a for FSDP.
+
+## Speedup options
+
+The 17-min/step baseline (with default offloads on) is dominated by
+`update_actor` at 87.7% of step time. Most of the speedups land there.
+
+### `FAST_PRESET=1` — bundled known-safe speedups
+
+```bash
+FAST_PRESET=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
+```
+
+Sets, in one go:
+
+- `PARAM_OFFLOAD=False`, `OPTIMIZER_OFFLOAD=False`, `ACTIVATION_OFFLOAD=False`
+  (5-10× on `update_actor`, costs HBM)
+- `REF_PARAM_OFFLOAD=False` (saves ~half the 63 s ref forward)
+- `ULYSSES_SP_SIZE=2` (eager-attention compute drops ~4×; only if
+  `N_GPUS_PER_NODE` is even)
+- `PPO_MICRO_BATCH_SIZE_PER_GPU=4` (works with offloads off)
+- `ENABLE_BYPASS_MODE=1` (skips the third actor forward each step; ~3%
+  on the measured profile, free)
+
+Each of these is overridable individually after the preset:
+`FAST_PRESET=1 PPO_MICRO_BATCH_SIZE_PER_GPU=2 bash …` if you OOM at 4.
+
+### Flex Attention with sinks (experimental, NOT wired into training yet)
+
+`flex_attention_sinks.py` implements the sinks-aware attention via
+PyTorch's `flex_attention`, using the "sink as extra K position" trick:
+append one extra key/value position with `V=0`, set the score there to
+the per-head learned `sinks[h]` via `score_mod`. This is mathematically
+equivalent to gpt-oss's `softmax([scores | sinks])[..., :-1] @ V` and
+runs a Triton-compiled kernel that supports backward (unlike FA3, which
+the community has confirmed broken for sinks backward).
+
+Validate before integrating:
+
+```bash
+# fp32 strict parity probe (small tensors)
+python examples/gpt_oss/flex_attention_sinks.py --self-test
+
+# bf16 broader benchmark including sdpa-bypass detection
+python examples/gpt_oss/benchmark_speedups.py
+python examples/gpt_oss/benchmark_speedups.py --sliding-window 128
+```
+
+Wiring this into the verl actor requires registering a custom
+`attn_implementation="flex"` in transformers' attention dispatch. That is
+NOT in this repo yet — once the self-test passes at fp32 with tight
+tolerance and the benchmark shows a speedup at bf16, the next step is to
+either monkey-patch `transformers.models.gpt_oss.modeling_gpt_oss` or
+contribute the impl upstream.
+
+### Combined microbenchmark
+
+```bash
+python examples/gpt_oss/benchmark_speedups.py            # attention only (fast)
+python examples/gpt_oss/benchmark_speedups.py --moe      # also exercise MoE
+python examples/gpt_oss/benchmark_speedups.py --dtype float32  # tighter correctness floor
+```
+
+Reports, for each variant:
+
+- **correctness**: max grad diff vs the gpt-oss-correct eager reference
+- **stability**: peak GPU memory and a finite-output check
+- **timing**: forward + backward wall-clock per pass
+
+The `sdpa (NO sinks)` variant is included as the reference for what
+silently dropping sinks looks like — its `out Δ` column quantifies how
+wrong "training on SDPA" actually is on gpt-oss.
 
 ## sonic-moe integration (experimental)
 

@@ -16,6 +16,12 @@
 #     SKIP_CHECK=1        bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # no fwd/bwd check
 #     SKIP_TRAIN=1        bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # checks only
 #
+# Speedup presets:
+#     FAST_PRESET=1       bash examples/gpt_oss/launch_train_gpt_oss_20b.sh   # all known-safe speedups on
+#     ENABLE_BYPASS_MODE=1 ...                                                # skip the third actor forward (~3%)
+#     ULYSSES_SP_SIZE=2   ...                                                 # 4x attention compute reduction
+#     PARAM_OFFLOAD=False OPTIMIZER_OFFLOAD=False ACTIVATION_OFFLOAD=False ...  # 5-10x update_actor
+#
 # Recipe consolidated from examples/grpo_trainer/run_gptoss_20b.sh and the
 # upstream issues/PRs noted in examples/gpt_oss/README.md. Caveats baked in:
 #   * gpt-oss ships in MXFP4 -> we dequantize once to bf16.
@@ -134,6 +140,31 @@ USE_TORCH_COMPILE=${USE_TORCH_COMPILE:-False}   # actor + ref
 # kicks in when the flash-attn .so has an ABI mismatch with torch.
 USE_REMOVE_PADDING=${USE_REMOVE_PADDING:-True}
 
+# ---- speedup preset (opt-in bundle) --------------------------------------
+# FAST_PRESET=1 flips on the speedups that have been benchmarked to be safe
+# on this stack:
+#   * all three FSDP offloads OFF (5-10x update_actor speedup, costs HBM)
+#   * ref policy param offload OFF (saves ~half the 63s ref forward)
+#   * ULYSSES_SP_SIZE=2 (cuts eager-attention compute ~4x; needs even gpus)
+#   * PPO_MICRO_BATCH_SIZE_PER_GPU bumped to 4 (works with offloads off)
+#   * ENABLE_BYPASS_MODE=1 (skips the third actor forward each step; ~3% on
+#     the profile we measured but free)
+# Each of these is still overridable individually after the preset block, so
+# you can FAST_PRESET=1 PPO_MICRO_BATCH_SIZE_PER_GPU=2 if you OOM at 4.
+FAST_PRESET=${FAST_PRESET:-0}
+if [ "${FAST_PRESET}" = "1" ]; then
+    export PARAM_OFFLOAD=${PARAM_OFFLOAD:-False}
+    export OPTIMIZER_OFFLOAD=${OPTIMIZER_OFFLOAD:-False}
+    export ACTIVATION_OFFLOAD=${ACTIVATION_OFFLOAD:-False}
+    export REF_PARAM_OFFLOAD=${REF_PARAM_OFFLOAD:-False}
+    export PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-4}
+    export ENABLE_BYPASS_MODE=${ENABLE_BYPASS_MODE:-1}
+    if (( N_GPUS_PER_NODE % 2 == 0 )); then
+        export ULYSSES_SP_SIZE=${ULYSSES_SP_SIZE:-2}
+    fi
+    echo "[launch] FAST_PRESET=1: offloads off, ulysses_sp=${ULYSSES_SP_SIZE:-1}, micro=${PPO_MICRO_BATCH_SIZE_PER_GPU}, bypass_mode=${ENABLE_BYPASS_MODE}"
+fi
+
 # ---- offload knobs (perf/memory trade-off) -------------------------------
 # Defaults are conservative because sglang doesn't fully release its memory
 # when "asleep" — it keeps ~26 GB resident on every GPU (model weights +
@@ -172,6 +203,17 @@ fi
 # you have spare GPUs and want a ~4x attention speedup. Leave at 1 for
 # the default 8x DP setup.
 ULYSSES_SP_SIZE=${ULYSSES_SP_SIZE:-1}
+
+# Ref policy: saves ~half the ref forward (63s on the measured profile)
+# when its params live on GPU. Costs ~5GB / GPU. Default True keeps the
+# previous behaviour; FAST_PRESET=1 flips it to False.
+REF_PARAM_OFFLOAD=${REF_PARAM_OFFLOAD:-True}
+
+# Bypass mode for rollout correction: reuses rollout log_probs as
+# old_log_prob, skipping the third actor forward each step. Requires
+# `calculate_log_probs=True` in rollout (which ENABLE_TIS already sets).
+# Independent of the FAST_PRESET so you can opt in alone.
+ENABLE_BYPASS_MODE=${ENABLE_BYPASS_MODE:-0}
 
 # NOTE: do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here.
 # sglang's torch_memory_saver (the thing that releases KV cache between
@@ -338,7 +380,8 @@ log "topology: NNODES=${NNODES}  N_GPUS_PER_NODE=${N_GPUS_PER_NODE}  TOTAL_GPUS=
 log "batch:    TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} (= ${TRAIN_BATCH_SIZE_PER_NODE} per-node x ${NNODES} nodes)"
 log "          PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE}  PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU}"
 log "rollout:  TP=${ROLLOUT_TP_SIZE}  DP=$((TOTAL_GPUS / ROLLOUT_TP_SIZE))  N=${ROLLOUT_N}  GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL}"
-log "offload:  PARAM=${PARAM_OFFLOAD}  OPTIMIZER=${OPTIMIZER_OFFLOAD}  ACTIVATION=${ACTIVATION_OFFLOAD}  ULYSSES_SP=${ULYSSES_SP_SIZE}"
+log "offload:  PARAM=${PARAM_OFFLOAD}  OPTIMIZER=${OPTIMIZER_OFFLOAD}  ACTIVATION=${ACTIVATION_OFFLOAD}  REF=${REF_PARAM_OFFLOAD}  ULYSSES_SP=${ULYSSES_SP_SIZE}"
+log "speedups: FAST_PRESET=${FAST_PRESET}  ENABLE_BYPASS_MODE=${ENABLE_BYPASS_MODE}  ENABLE_TIS=${ENABLE_TIS}"
 log "launching GRPO training"
 
 # Build optional MoE-stability args (TIS via rollout correction).
@@ -353,9 +396,28 @@ if [ "${ENABLE_TIS}" = "1" ]; then
     CALC_LOGP=True
 fi
 
+# Optional: bypass-mode shortcut for the actor's old_log_prob phase.
+# Reuses the rollout's log-probs (already calculated when CALC_LOGP=True)
+# instead of running a third actor forward each PPO step.
+BYPASS_ARGS=()
+if [ "${ENABLE_BYPASS_MODE}" = "1" ]; then
+    if [ "${CALC_LOGP}" != "True" ]; then
+        echo "[launch] WARNING: ENABLE_BYPASS_MODE=1 but CALC_LOGP=False;" >&2
+        echo "        bypass_mode requires calculate_log_probs=True in rollout." >&2
+        echo "        Either set ENABLE_TIS=1 (which turns it on) or unset bypass." >&2
+    else
+        log "enabling rollout-correction bypass_mode (skips one actor forward per step)"
+        BYPASS_ARGS=(
+            algorithm.rollout_correction.bypass_mode=True
+            algorithm.rollout_correction.loss_type=ppo_clip
+        )
+    fi
+fi
+
 "${PYTHON}" -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     "${TIS_ARGS[@]}" \
+    "${BYPASS_ARGS[@]}" \
     data.train_files="${DATA_DIR}/train.parquet" \
     data.val_files="${DATA_DIR}/test.parquet" \
     data.train_batch_size="${TRAIN_BATCH_SIZE}" \
@@ -393,7 +455,7 @@ fi
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
     actor_rollout_ref.ref.use_torch_compile="${USE_TORCH_COMPILE}" \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.fsdp_config.param_offload="${REF_PARAM_OFFLOAD}" \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger="${LOGGER}" \
