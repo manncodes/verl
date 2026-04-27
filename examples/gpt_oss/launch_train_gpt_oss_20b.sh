@@ -146,23 +146,42 @@ USE_REMOVE_PADDING=${USE_REMOVE_PADDING:-True}
 #   * all three FSDP offloads OFF (5-10x update_actor speedup, costs HBM)
 #   * ref policy param offload OFF (saves ~half the 63s ref forward)
 #   * ULYSSES_SP_SIZE=2 (cuts eager-attention compute ~4x; needs even gpus)
-#   * PPO_MICRO_BATCH_SIZE_PER_GPU bumped to 4 (works with offloads off)
+#   * MAX_PROMPT_LENGTH=256, MAX_RESPONSE_LENGTH=1024 — gsm8k mean is ~137
+#     prompt / ~350 response tokens with reasoning_effort=medium. The 512 /
+#     2048 defaults were ~7-8x too big on the actual distribution; eager
+#     attention is O(seq^2) so the wasted budget shows up as both wasted
+#     compute AND wasted activation memory. Right-sizing lets us pack many
+#     more sequences per micro-step.
+#   * PPO_MICRO_BATCH_SIZE_PER_GPU bumped to 8 (up from 2/4): with the
+#     1280-token per-seq budget above, 8 sequences pack to ~10k tokens per
+#     GPU, well under verl's default ppo_max_token_len_per_gpu of 16k. This
+#     drops accumulation steps from 16 to 4 per mini-batch on 8 GPUs.
+#   * ROLLOUT_GPU_MEM_UTIL dropped to 0.5 (smaller responses need less KV
+#     cache, freeing HBM for the now-resident actor).
 #   * ENABLE_BYPASS_MODE=1 (skips the third actor forward each step; ~3% on
 #     the profile we measured but free)
 # Each of these is still overridable individually after the preset block, so
-# you can FAST_PRESET=1 PPO_MICRO_BATCH_SIZE_PER_GPU=2 if you OOM at 4.
+# you can FAST_PRESET=1 PPO_MICRO_BATCH_SIZE_PER_GPU=4 MAX_RESPONSE_LENGTH=2048
+# if you OOM or expect longer responses. Watch the trainer's truncation rate;
+# if it climbs, bump MAX_RESPONSE_LENGTH back up.
 FAST_PRESET=${FAST_PRESET:-0}
 if [ "${FAST_PRESET}" = "1" ]; then
     export PARAM_OFFLOAD=${PARAM_OFFLOAD:-False}
     export OPTIMIZER_OFFLOAD=${OPTIMIZER_OFFLOAD:-False}
     export ACTIVATION_OFFLOAD=${ACTIVATION_OFFLOAD:-False}
     export REF_PARAM_OFFLOAD=${REF_PARAM_OFFLOAD:-False}
-    export PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-4}
+    export MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-256}
+    export MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-1024}
+    export PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-8}
+    export ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.5}
     export ENABLE_BYPASS_MODE=${ENABLE_BYPASS_MODE:-1}
     if (( N_GPUS_PER_NODE % 2 == 0 )); then
         export ULYSSES_SP_SIZE=${ULYSSES_SP_SIZE:-2}
     fi
-    echo "[launch] FAST_PRESET=1: offloads off, ulysses_sp=${ULYSSES_SP_SIZE:-1}, micro=${PPO_MICRO_BATCH_SIZE_PER_GPU}, bypass_mode=${ENABLE_BYPASS_MODE}"
+    echo "[launch] FAST_PRESET=1: offloads off, ulysses_sp=${ULYSSES_SP_SIZE:-1}, "\
+"micro=${PPO_MICRO_BATCH_SIZE_PER_GPU}, prompt=${MAX_PROMPT_LENGTH}, "\
+"response=${MAX_RESPONSE_LENGTH}, gpu_mem=${ROLLOUT_GPU_MEM_UTIL}, "\
+"bypass_mode=${ENABLE_BYPASS_MODE}"
 fi
 
 # ---- offload knobs (perf/memory trade-off) -------------------------------
@@ -380,6 +399,9 @@ log "topology: NNODES=${NNODES}  N_GPUS_PER_NODE=${N_GPUS_PER_NODE}  TOTAL_GPUS=
 log "batch:    TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} (= ${TRAIN_BATCH_SIZE_PER_NODE} per-node x ${NNODES} nodes)"
 log "          PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE}  PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU}"
 log "rollout:  TP=${ROLLOUT_TP_SIZE}  DP=$((TOTAL_GPUS / ROLLOUT_TP_SIZE))  N=${ROLLOUT_N}  GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL}"
+log "seq:      MAX_PROMPT=${MAX_PROMPT_LENGTH}  MAX_RESPONSE=${MAX_RESPONSE_LENGTH}  total_per_seq=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))"
+log "          tokens_per_micro_gpu=$((PPO_MICRO_BATCH_SIZE_PER_GPU * (MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))) (worst-case, padded)"
+log "          accum_steps_per_minibatch=$((PPO_MINI_BATCH_SIZE / (TOTAL_GPUS * PPO_MICRO_BATCH_SIZE_PER_GPU)))"
 log "offload:  PARAM=${PARAM_OFFLOAD}  OPTIMIZER=${OPTIMIZER_OFFLOAD}  ACTIVATION=${ACTIVATION_OFFLOAD}  REF=${REF_PARAM_OFFLOAD}  ULYSSES_SP=${ULYSSES_SP_SIZE}"
 log "speedups: FAST_PRESET=${FAST_PRESET}  ENABLE_BYPASS_MODE=${ENABLE_BYPASS_MODE}  ENABLE_TIS=${ENABLE_TIS}"
 log "launching GRPO training"

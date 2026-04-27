@@ -273,17 +273,44 @@ FAST_PRESET=1 bash examples/gpt_oss/launch_train_gpt_oss_20b.sh
 
 Sets, in one go:
 
-- `PARAM_OFFLOAD=False`, `OPTIMIZER_OFFLOAD=False`, `ACTIVATION_OFFLOAD=False`
-  (5-10× on `update_actor`, costs HBM)
-- `REF_PARAM_OFFLOAD=False` (saves ~half the 63 s ref forward)
-- `ULYSSES_SP_SIZE=2` (eager-attention compute drops ~4×; only if
-  `N_GPUS_PER_NODE` is even)
-- `PPO_MICRO_BATCH_SIZE_PER_GPU=4` (works with offloads off)
-- `ENABLE_BYPASS_MODE=1` (skips the third actor forward each step; ~3%
-  on the measured profile, free)
+- **Right-sized sequence budget**: `MAX_PROMPT_LENGTH=256`,
+  `MAX_RESPONSE_LENGTH=1024`. gsm8k under `reasoning_effort=medium` has
+  mean prompt ≈ 137 tok and mean response ≈ 350 tok; the previous 512 /
+  2048 budget left token utilisation under 6%. Eager attention is
+  O(seq²), so wasted budget burns both compute and activation memory.
+- **Packed micro-batches**: `PPO_MICRO_BATCH_SIZE_PER_GPU=8` (up from
+  2). With the tighter 1280-token per-seq budget, 8 sequences pack to
+  ~10k tokens per GPU per micro-step — well under the
+  `ppo_max_token_len_per_gpu=16384` default. Drops accumulation steps
+  from 16 to 4 per mini-batch on 8 GPUs.
+- **No FSDP offloads**: `PARAM_OFFLOAD=False`, `OPTIMIZER_OFFLOAD=False`,
+  `ACTIVATION_OFFLOAD=False` (5-10× on `update_actor`, costs HBM that's
+  now freed by the smaller seq budget and the lower KV reserve).
+- **Ref policy on GPU**: `REF_PARAM_OFFLOAD=False` (saves ~half the 63 s
+  ref forward).
+- **Ulysses SP=2**: eager-attention compute drops ~4×. Only set if
+  `N_GPUS_PER_NODE` is even.
+- **Lower KV reservation**: `ROLLOUT_GPU_MEM_UTIL=0.5` (smaller responses
+  need less KV cache, freeing HBM for the now-resident actor).
+- **bypass_mode**: `ENABLE_BYPASS_MODE=1` skips the third actor forward
+  each step (~3% on the measured profile, free).
 
 Each of these is overridable individually after the preset:
-`FAST_PRESET=1 PPO_MICRO_BATCH_SIZE_PER_GPU=2 bash …` if you OOM at 4.
+`FAST_PRESET=1 PPO_MICRO_BATCH_SIZE_PER_GPU=4 bash …` if you OOM at 8;
+`FAST_PRESET=1 MAX_RESPONSE_LENGTH=2048 bash …` if your dataset has
+longer responses than gsm8k. Watch the trainer's truncation rate; if it
+climbs, bump `MAX_RESPONSE_LENGTH` back up.
+
+Expected on 8×H100 80GB at the previous 1027 s baseline (gsm8k,
+reasoning_effort=medium):
+
+| phase | offloads-on baseline | FAST_PRESET=1 (estimated) |
+| --- | --- | --- |
+| `update_actor` | 900 s | 80-130 s |
+| `ref` | 63 s | 25-30 s |
+| `old_log_prob` | 31 s | 0 s (bypass) |
+| `gen` | 26 s | 25 s |
+| total step | ~1027 s | ~150-200 s |
 
 ### Flex Attention with sinks (experimental, NOT wired into training yet)
 
