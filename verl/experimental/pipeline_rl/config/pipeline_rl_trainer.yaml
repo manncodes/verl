@@ -1,0 +1,84 @@
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# PipelineRL extends fully-async PPO with eager (per-step) in-flight weight
+# updates and per-token policy-version tagging. Most of the surface area is
+# inherited from the fully_async config; the pipeline_rl-specific knobs live
+# under async_training.pipeline_rl.
+
+async_training:
+
+  # Bound on tolerated trajectory staleness. Set to 0 for "strict pipeline"
+  # operation: every batch the trainer consumes must have been produced after
+  # the most recent weight broadcast.
+  staleness_threshold: 0
+
+  # PipelineRL pushes weights every step. Keep at 1 unless you want to
+  # explicitly batch weight updates for throughput.
+  trigger_parameter_sync_step: 1
+
+  # Number of ppo_mini_batches the trainer pulls per fit step.
+  require_batches: 1
+
+  # Keep prefixes alive across in-flight weight swaps (PipelineRL invariant).
+  partial_rollout: True
+
+  # Trainer-side validation off by default; flip on if validation is desired
+  # without spinning up a separate validator.
+  use_trainer_do_validate: False
+
+  pipeline_rl:
+    # Master toggle. When False the recipe degrades to FullyAsyncTrainer
+    # behavior, but with the PipelineRLTrainer/PipelineRLRollouter classes still
+    # in place (useful for A/B comparisons).
+    enabled: True
+
+    # When True, request a non-aborting in-place swap from the checkpoint
+    # engine. Backends that do not support this fall back to the standard
+    # abort+resume path and prefixes are preserved.
+    non_aborting_swap: False
+
+# Rollout sub-config
+rollout:
+  nnodes: 1
+  n_gpus_per_node: 8
+  n: 4
+  total_rollout_steps: 100
+
+data:
+  gen_batch_size: 1
+
+actor_rollout_ref:
+
+  rollout:
+    # MUST be enabled: the per-token IS in rollout_corr_helper requires
+    # rollout_log_probs to be persisted with the trajectory.
+    calculate_log_probs: True
+
+    checkpoint_engine:
+      backend: "nccl"
+
+  actor:
+    # Use rollout log probs as old log probs to enable mixed-version IS.
+    use_rollout_log_probs: True
+
+  model:
+    use_remove_padding: True
+
+
+# bypass_mode keeps old_log_probs == rollout_log_probs (the rollout-time
+# logprob recorded by the engine that actually sampled the token), which is
+# the sound choice when tokens of one trajectory may have been sampled under
+# different policy versions. The existing token-level IS in
+# rollout_corr_helper.compute_rollout_correction_and_add_to_batch then
+# automatically corrects the off-policy gap on a per-token basis.
+algorithm:
+  rollout_correction:
+    bypass_mode: True
+    rollout_is: token
+    rollout_is_threshold: 2.0
