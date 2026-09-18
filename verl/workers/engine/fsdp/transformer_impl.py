@@ -1339,11 +1339,24 @@ class FSDPEngineWithLMHead(FSDPEngine):
         )
         distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
         distillation_only = tu.get_non_tensor_data(data=micro_batch, key="distillation_only", default=False)
+        calculate_score_centering = tu.get_non_tensor_data(
+            data=micro_batch, key="calculate_score_centering", default=False
+        )
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
                 "calculate_sum_pi_squared=True is not supported with use_fused_kernels=True: "
                 "fused kernels do not materialize the full logits tensor needed for Σπ²."
+            )
+        if calculate_score_centering and use_fused_kernels:
+            raise NotImplementedError(
+                "calculate_score_centering=True is not supported with use_fused_kernels=True: "
+                "fused kernels do not materialize the full logits tensor needed for score centering's head gather."
+            )
+        if calculate_score_centering and use_remove_padding:
+            raise NotImplementedError(
+                "calculate_score_centering=True is not yet supported with use_remove_padding=True "
+                "(Ulysses sequence parallelism); only the dense use_remove_padding=False path is implemented."
             )
 
         model_output = {}
@@ -1495,6 +1508,25 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 if calculate_sum_pi_squared:
                     sum_pi_squared = verl_F.calculate_sum_pi_squared_from_logits(logits)
 
+                if calculate_score_centering:
+                    # `rollout_topk_ids`/`rollout_topk_logprobs`: nested tensors with the same
+                    # per-sample (prompt+response) lengths as `input_ids`, holding the rollout
+                    # policy's transported top-k vocabulary head at every position (prompt-region
+                    # entries are never read: the narrow below discards everything outside each
+                    # sample's true length, and only the response range is used further down the
+                    # ppo_loss pipeline). See score_centering_correction_from_logits for the math.
+                    topk = micro_batch["rollout_topk_ids"].size(-1)
+                    dense_shape = (*logits.shape[:2], topk)
+                    topk_ids = torch.nested.to_padded_tensor(
+                        micro_batch["rollout_topk_ids"], padding=0, output_size=dense_shape
+                    )
+                    rollout_topk_logprobs = torch.nested.to_padded_tensor(
+                        micro_batch["rollout_topk_logprobs"], padding=0.0, output_size=dense_shape
+                    )
+                    score_centering_correction = verl_F.score_centering_correction_from_logits(
+                        logits, topk_ids, rollout_topk_logprobs
+                    )
+
                 if pad_mode == DatasetPadMode.NO_PADDING:
                     cu_seqlens = input_ids.offsets()
                     seq_lengths = cu_seqlens.diff()
@@ -1534,6 +1566,14 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         )
                         sum_pi_squared_rmpad = torch.cat([t for t in sum_pi_squared.unbind()])
                         sum_pi_squared = torch.nested.nested_tensor_from_jagged(sum_pi_squared_rmpad, cu_seqlens)
+                    if calculate_score_centering:
+                        score_centering_correction = torch.nested.narrow(
+                            score_centering_correction, 1, starts, seq_lengths, layout=torch.jagged
+                        )
+                        score_centering_correction_rmpad = torch.cat([t for t in score_centering_correction.unbind()])
+                        score_centering_correction = torch.nested.nested_tensor_from_jagged(
+                            score_centering_correction_rmpad, cu_seqlens
+                        )
                 else:
                     raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
@@ -1543,6 +1583,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
             model_output["entropy"] = entropy
         if calculate_sum_pi_squared:
             model_output["sum_pi_squared"] = sum_pi_squared
+        if calculate_score_centering:
+            model_output["score_centering_correction"] = score_centering_correction
 
         return model_output
 

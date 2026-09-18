@@ -61,7 +61,7 @@ tracking metrics to diagnose and correct off-policy issues.
 """
 
 import math
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -127,6 +127,30 @@ def _parse_rollout_is_threshold(threshold_spec: str | float) -> tuple[float, Opt
             raise ValueError("rollout_is_threshold lower bound must be <= upper bound.")
 
     return upper, lower
+
+
+def score_centering_weight_fn(
+    rollout_is_threshold: Optional[str | float],
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Build the `weight_fn` for `verl.utils.torch_functional.score_centering_correction`
+    from the same threshold spec `compute_rollout_correction_weights` uses, so composing
+    score centering with truncated (TIS) or masked (IcePop/MIS) importance sampling reuses
+    one threshold knob (`rollout_is_threshold`) instead of a second, disconnected one.
+
+    Args:
+        rollout_is_threshold: None for score centering alone (weight 1, `torch.ones_like`,
+            i.e. no IS reweighting); a single float/float-like string for TIS (clamp to
+            the upper bound); a "lower_upper" string for IcePop/MIS (zero outside the band).
+
+    Returns:
+        A callable weight_fn(ratio) -> weight, applied elementwise to p/q ratios.
+    """
+    if rollout_is_threshold is None:
+        return torch.ones_like
+    upper, lower = _parse_rollout_is_threshold(rollout_is_threshold)
+    if lower is None:
+        return lambda r: r.clamp(max=upper)
+    return lambda r: torch.where((r >= lower) & (r <= upper), r, torch.zeros_like(r))
 
 
 def _parse_rollout_rs_thresholds(

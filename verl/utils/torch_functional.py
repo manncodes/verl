@@ -18,7 +18,7 @@ Contain small torch utilities
 import math
 import os
 from contextlib import contextmanager
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.distributed
@@ -702,6 +702,67 @@ def calculate_sum_pi_squared_from_logits(logits: torch.Tensor):
         Sum of squared probabilities tensor (...).
     """
     return torch.exp(torch.logsumexp(2.0 * logits, dim=-1) - 2.0 * torch.logsumexp(logits, dim=-1))
+
+
+def score_centering_correction(
+    train_head_logp: torch.Tensor,
+    rollout_head_logp: torch.Tensor,
+    weight_fn: Callable[[torch.Tensor], torch.Tensor] = torch.ones_like,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Per-token score-centering control variate.
+
+    Marek & Ryabinin, "Score Centering Stabilizes Off-policy Reinforcement Learning"
+    (arXiv:2609.20807). Under a training/rollout policy mismatch, REINFORCE's score
+    E_q[grad log p] no longer vanishes; this control variate cancels that drift by
+    modeling the vocabulary tail beyond the rollout's transported top-k head as
+    proportional to the trainer's own tail, so the correction reduces to a finite sum
+    over the head and is exact whenever the head covers the full vocabulary. It vanishes
+    identically when `train_head_logp == rollout_head_logp` (on-policy).
+
+    Args:
+        train_head_logp: log p_theta(v) at the rollout's top-k ids v, shape (..., k).
+        rollout_head_logp: log p_rollout(v) at the same ids, shape (..., k).
+        weight_fn: importance-sampling weight applied to the ratio p/q. The default,
+            `torch.ones_like` (weight 1, i.e. no IS reweighting), gives score centering
+            alone; pass `verl.trainer.ppo.rollout_corr_helper.score_centering_weight_fn(...)`
+            to compose it with truncated (TIS) or masked (IcePop/MIS) importance sampling.
+        eps: floor on the modeled tail mass, avoiding division by zero.
+
+    Returns:
+        Term to ADD to the (advantage-weighted) REINFORCE score alongside the sampled
+        token's log-prob, shape (...).
+    """
+    p_head, q_head = train_head_logp.exp(), rollout_head_logp.exp()
+    p_tail = (1.0 - p_head.sum(-1)).clamp_min(eps)
+    q_tail = (1.0 - q_head.sum(-1)).clamp_min(eps)
+    rho = q_tail / p_tail
+    alpha = rho * weight_fn(1.0 / rho)
+    head_weight = weight_fn((train_head_logp - rollout_head_logp).exp())
+    residual = q_head * head_weight - alpha.unsqueeze(-1) * p_head
+    return (residual.detach() * train_head_logp).sum(-1)
+
+
+def score_centering_correction_from_logits(
+    logits: torch.Tensor,
+    topk_ids: torch.Tensor,
+    rollout_topk_logprobs: torch.Tensor,
+    weight_fn: Callable[[torch.Tensor], torch.Tensor] = torch.ones_like,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """`score_centering_correction`, gathering the trainer's head log-probs from raw logits.
+
+    Args:
+        logits: Unnormalized trainer logits, shape (..., vocab_size).
+        topk_ids: Vocabulary ids of the rollout's transported top-k head, shape (..., k).
+        rollout_topk_logprobs: log p_rollout at `topk_ids`, shape (..., k).
+        weight_fn, eps: see `score_centering_correction`.
+
+    Returns:
+        Correction term, shape (...) (one value per leading position, summed over k).
+    """
+    train_head_logp = torch.log_softmax(logits.float(), dim=-1).gather(-1, topk_ids)
+    return score_centering_correction(train_head_logp, rollout_topk_logprobs, weight_fn=weight_fn, eps=eps)
 
 
 """

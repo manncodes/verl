@@ -54,6 +54,29 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     return loss, {}
 
 
+def score_centering_loss(
+    correction: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str,
+    global_batch_info: dict,
+) -> torch.Tensor:
+    """Additive score-centering term (arXiv:2609.20807) for any policy loss.
+
+    `correction` (`model_output["score_centering_correction"]`, see
+    `verl.utils.torch_functional.score_centering_correction`) is a per-token control
+    variate; adding `advantages.detach() * correction` to an existing REINFORCE-family
+    `pg_loss` cancels drift from a training/rollout policy mismatch without touching that
+    loss's own clipping or importance-sampling mechanics.
+    """
+    return agg_loss(
+        loss_mat=advantages.detach() * correction,
+        loss_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        **global_batch_info,
+    )
+
+
 def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     """Computes ppo loss from model output (log_prob, entropy, values, etc. ) and old_log_probs from data."""
     log_prob = no_padding_2_padding(model_output["log_probs"], data)
@@ -118,6 +141,14 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     metrics.update(pg_metrics)
     metrics["actor/pg_loss"] = Metric(value=pg_loss, aggregation=metric_aggregation)
     policy_loss = pg_loss
+
+    # add score centering correction, if the engine computed one (see score_centering_loss)
+    correction = model_output.get("score_centering_correction", None)
+    if correction is not None:
+        correction = no_padding_2_padding(correction, data)
+        sc_loss = score_centering_loss(correction, advantages, response_mask, loss_agg_mode, config.global_batch_info)
+        policy_loss = policy_loss + sc_loss
+        metrics["actor/score_centering_loss"] = Metric(value=sc_loss, aggregation=metric_aggregation)
 
     # add entropy loss
     if entropy is not None:

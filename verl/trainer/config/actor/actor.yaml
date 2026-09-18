@@ -99,6 +99,12 @@ calculate_entropy: false
 # c.f. https://yingru.notion.site/The-Optimal-Token-Baseline-399211a558b782cfa936014c0d42dfb8
 calculate_sum_pi_squared: false
 
+# Score centering (arXiv:2609.20807): a control variate that cancels REINFORCE's drift
+# under a training/rollout mismatch. Requires "rollout_topk_ids"/"rollout_topk_logprobs"
+# in the batch (the rollout policy's transported top-k vocabulary head) and, for now,
+# only the FSDP engine's dense (use_remove_padding=false, use_fused_kernels=false) path.
+calculate_score_centering: false
+
 # Whether to use KL loss instead of KL reward penalty. True for GRPO
 use_kl_loss: false
 
