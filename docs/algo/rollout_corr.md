@@ -2,7 +2,7 @@
 
 **Author:** [Yingru Li](https://richardli.xyz/)
 
-Last updated: 09/23/2026.
+Last updated: 10/21/2026.
 
 ---
 
@@ -141,6 +141,7 @@ config = RolloutCorrectionConfig.decoupled_seq_is()             # Seq-TIS
 config = RolloutCorrectionConfig.decoupled_seq_is_rs()          # Seq-MIS
 config = RolloutCorrectionConfig.decoupled_geo_rs()             # Geo-RS (ratio mode)
 config = RolloutCorrectionConfig.decoupled_geo_rs_token_tis()   # Geo-RS + Token-TIS
+config = RolloutCorrectionConfig.decoupled_token_cis()          # Token-CIS (arXiv 2609.32444)
 
 # === K3 KL Estimator presets (more stable for small KL) ===
 config = RolloutCorrectionConfig.decoupled_k3_rs()              # K3-RS only
@@ -177,6 +178,8 @@ algorithm:
     rollout_is: token # IS weights: "token", "sequence", or null
     rollout_is_threshold: 2.0 # TIS upper bound, or "0.5_5.0" for IcePop
     rollout_is_batch_normalize: false # Batch normalize IS weights to mean=1.0
+    rollout_is_cis_lambda: null # CIS threshold; a float replaces TIS/IcePop by CIS (decoupled, token only)
+    rollout_is_cis_kappa: 0.005 # CIS floor on 1 - π_old
     rollout_rs: null # Rejection sampling: comma-separated canonical options (e.g. "token_k1,seq_max_k2")
     rollout_rs_threshold: null # Threshold spec: float(s) or "lower_upper" string(s)
     bypass_mode: false # Skip old_log_prob computation (sets π_old = π_rollout)
@@ -216,11 +219,13 @@ actor_rollout_ref:
 - `recipe/dapo/run_dapo_qwen2.5_32b_rollout_corr.sh` - DAPO example with Rollout Correction
 - `examples/rollout_correction/run_qwen2_5_7b_fsdp.sh` - Basic example
 - `examples/rollout_correction/run_qwen2_5_7b_fsdp_multi_rs.sh` - Multi-RS example
+- `examples/rollout_correction/run_qwen1_5_moe_a2_7b_cis_fsdp.sh` - Baseline / TIS / CIS ablation arms
 
 ### **Tests**
 
 - `tests/trainer/ppo/test_rollout_corr.py` - Unit tests for IS/RS mechanisms
 - `tests/trainer/ppo/test_rollout_corr_integration.py` - Integration tests
+- `tests/trainer/ppo/test_rollout_corr_cis_on_cpu.py` - CIS operator, config validation and trainer wiring
 
 ## Configuration Parameters
 
@@ -263,6 +268,17 @@ Apply batch normalization to IS weights. Default: `False`
 - Reduces variance by ensuring average weight is 1.0 per batch
 - Applied AFTER truncation to preserve truncation semantics
 - Only affects IS weight values, not rejection sampling
+
+### `rollout_is_cis_lambda` (float or null) and `rollout_is_cis_kappa` (float)
+
+Calibrated importance sampling ([CIS](#9-calibrated-importance-sampling-decoupled_token_cis)).
+Defaults: `null` (disabled) and `0.005`.
+
+- A float `λ >= 0` replaces the TIS / IcePop weight by `min(π_old / π_rollout, 1 + λ * max(1 - π_old, κ))`
+- `κ` must lie in `[0, 1]`; the paper uses `λ = 2.3`, `κ = 0.005`
+- Requires `rollout_is="token"`, `bypass_mode=False`, `rollout_is_batch_normalize=False`, an actor
+  `policy_loss.loss_mode` other than `bypass_mode`, and no IcePop lower bound (raises `ValueError` otherwise)
+- `rollout_is_threshold` is not used while CIS is enabled
 
 ### `rollout_rs` (str or null)
 
@@ -359,6 +375,7 @@ This section provides detailed guidance on choosing and using the verified prese
 | `decoupled_seq_is_rs()`                                                        | Seq-MIS          | Decoupled          | sequence | sequence | Sequence IS + seq_sum_k1 RS               |
 | `decoupled_geo_rs()`                                                           | Geo-RS           | Decoupled          | -        | sequence | Geometric RS (seq_mean_k1)               |
 | `decoupled_geo_rs_token_tis()`                                                 | Geo-RS-Token-TIS | Decoupled          | token    | sequence | Geometric RS + token IS |
+| `decoupled_token_cis()`                                                        | Token-CIS        | Decoupled          | token    | -        | Confidence-dependent token cap          |
 | **K3 KL Estimator** (more stable for small KL values)                          |
 | `decoupled_k3_rs()`                                                            | K3-RS            | Decoupled          | -        | sequence       | seq_mean_k3 RS             |
 | `decoupled_k3_rs_token_tis()`                                                  | K3-RS-Token-TIS  | Decoupled          | token    | sequence       | seq_mean_k3 RS  + token IS        |
@@ -379,7 +396,8 @@ This section provides detailed guidance on choosing and using the verified prese
   - `"ppo_clip"` (default): PPO clipped objective where ratio = π_θ/π_rollout already handles IS
   - `"reinforce"`: REINFORCE with explicit IS weights as π_θ/π_rollout
 - Both loss types benefit from rejection sampling (RS) which masks out-of-distribution samples.
-- All estimators (Token-TIS, Seq-TIS, Seq-MIS, Geo-RS, ...) are compatible with Decoupled and Bypass modes.
+- All estimators (Token-TIS, Seq-TIS, Seq-MIS, Geo-RS, ...) are compatible with Decoupled and Bypass modes,
+  except Token-CIS, which needs the old policy recomputed by the trainer and therefore Decoupled mode.
 
 #### Other Supported Combinations (Manual Configuration Required)
 
@@ -683,6 +701,96 @@ algorithm:
   reports approximate rows with near-unit head mass but no coverage proof. Trainer head mass
   is the full-vocabulary mass of the actual support for aligned rows and the recorded head for
   approximate rows. Head mass close to one alone is not a completeness test
+
+
+### 9. Calibrated importance sampling (`decoupled_token_cis`)
+
+[Yu et al., 2026](https://arxiv.org/abs/2609.32444), reference implementation
+[kzhao5/CIS-RL](https://github.com/kzhao5/CIS-RL).
+
+**Configuration:**
+
+```python
+config = RolloutCorrectionConfig.decoupled_token_cis()  # λ = 2.3, κ = 5e-3
+```
+
+```bash
+algorithm.rollout_correction.rollout_is=token \
+algorithm.rollout_correction.rollout_is_cis_lambda=2.3 \
+algorithm.rollout_correction.rollout_is_cis_kappa=0.005 \
+actor_rollout_ref.rollout.calculate_log_probs=True
+```
+
+**Weight:** with `p = π_old(y_t)` and `q = π_rollout(y_t)` the probabilities of the sampled token and `k = p / q`,
+
+```
+w_t = min(k, 1 + λ * max(1 - p, κ))
+```
+
+The engine mismatch enters `k = p + (1 - p) * exp(ε)` through a log-odds displacement `ε` whose
+spread barely depends on confidence, so a single threshold `exp(ε) <= 1 + λ` becomes a ratio cap that
+tightens as `p -> 1`. The floor `κ` keeps the cap of confident tokens above the storage resolution of
+the log-probabilities. This is Algorithm 1 of the paper and `cis.cis_weight` of the reference implementation.
+
+**How verl computes it:**
+
+- `p` comes from `old_log_probs`, the old policy recomputed by the training backend in Decoupled mode.
+  It is never the current differentiable `log_prob`, and never `rollout_log_probs`. Configurations that
+  would substitute either are rejected: `bypass_mode=True` (here `old_log_probs` *are* the rollout
+  log-probs) and actor `policy_loss.loss_mode=bypass_mode` (the bypass loss discards precomputed weights
+  and would recompute them from the current policy). Fully async and one-step-off configs default to
+  `bypass_mode=True` and must set it to `False`.
+- Only the upper side is truncated. There is no lower clipping and no batch normalization, and the weight is
+  detached. It multiplies the token loss after PPO's own ratio clipping, exactly where Token-TIS
+  applies `min(k, C)`. `clip_ratio_*`, dual-clip and `loss_agg_mode` are unchanged.
+- A non-finite log-ratio gets weight one, as in the reference; padding gets weight zero, and garbage
+  values under the mask never reach the CIS weights or CIS metrics. Truncation is done in log space, so
+  extreme ratios cannot overflow; below the cap the weight is the exact ratio.
+
+**Metrics** (prefix `rollout_corr/`): the usual token-level IS metrics, with `1 + λ`, the loosest cap,
+as their threshold (`rollout_is_ratio_fraction_high` is the share of raw ratios above it), plus
+
+- `rollout_is_cis_truncated_fraction`: share of tokens whose ratio exceeds their own cap
+- `rollout_is_cis_floor_fraction`: share of tokens whose cap is set by the floor `κ`
+
+**Limitations:**
+
+- `rollout_log_probs` and `old_log_probs` must describe the same sampling distribution.
+  Temperature is fine (vLLM records `processed_logprobs`, and the trainer scales logits by the same
+  temperature). `top_p < 1` or `top_k > 0` make the two differ by more than numerical mismatch. The
+  paper and the recipe use `top_p=1`, `top_k=-1`.
+- In verl's synchronous trainer, π_old and π_rollout share parameters, so `k` isolates the engine
+  mismatch. The paper's AReaL runs also carry up to two versions of rollout staleness in `k`.
+- The faithful recipe uses the `vanilla` policy loss. Other losses consume `rollout_is_weights` under
+  their own semantics; for example, `geo_mean` uses the per-sequence geometric mean of the weights.
+- `λ` and `κ` were chosen on Qwen1.5-MoE-A2.7B, with `κ` set from the storage resolution of the
+  log-probabilities in the paper's bf16 setup. The paper trains three MoE models (2.7B to 30B) on GSM8K. It
+  reports five-benchmark gains of 1.3 to 3.8 points over no correction and 0.4 to 0.6 over the best baseline,
+  with three seeds each. On other models, data or trainers, these gains are hypotheses to test.
+- verl's objective is not bit-identical to the paper's. verl applies dual-clip PPO (`clip_ratio_c=3`) to
+  negative advantages and GRPO without batch-level advantage normalization, and the reward and
+  evaluation pipelines differ. Compare arms within verl, not against the paper's numbers.
+
+**Ablation recipe:** `examples/rollout_correction/run_qwen1_5_moe_a2_7b_cis_fsdp.sh` launches one arm per run
+(`ARM=baseline|tis|cis`, `SEED=...`). All arms share the checkpoint, data files and order (`data.seed`,
+`actor.data_loader_seed`), rollout seed, token budget (prompt/response lengths, `n`, batch size, epochs),
+optimizer and PPO settings, and hardware layout. The baseline still records `rollout_log_probs`, so
+the mismatch diagnostics (`rollout_corr/kl`, `k3_kl`, `chi2_token`, `log_ppl_abs_diff`) are logged in
+every arm. Compare arms with the same seeds, and track:
+
+| Quantity                          | Where                                                                                 |
+| --------------------------------- | ------------------------------------------------------------------------------------- |
+| Held-out accuracy per domain      | `val-core/<data_source>/{acc,reward}/mean@1` (greedy, one data source per domain)     |
+| Truncation rate                   | `response_length/clip_ratio`; validation dumps in `trainer.validation_data_dir`        |
+| Repetition rate                   | offline from the validation dumps, e.g. seq-rep-4 (1 − distinct / total 4-grams)       |
+| Response length                   | `response_length/mean`                                                                |
+| Entropy                           | `actor/entropy`                                                                       |
+| Importance-weight tails           | `rollout_corr/rollout_is_max`, `rollout_is_ratio_fraction_high`, `rollout_is_cis_truncated_fraction`, `rollout_is_eff_sample_size`, `chi2_token` |
+| Gradient norm                     | `actor/grad_norm`                                                                     |
+| Throughput                        | `perf/throughput`, `timing_s/step`, `timing_s/old_log_prob`                           |
+
+Run at least three seeds per arm and report every seed. Single-seed differences of the size reported
+by the paper are within seed noise: TIS alone has a 2.5-point standard deviation on Qwen1.5-MoE.
 
 ---
 

@@ -657,6 +657,70 @@ def compute_rollout_correction_weights(
     return rollout_is_weights, metrics
 
 
+def compute_cis_weights(
+    old_log_prob: torch.Tensor,
+    rollout_log_prob: torch.Tensor,
+    response_mask: torch.Tensor,
+    cis_lambda: float = 2.3,
+    cis_kappa: float = 5e-3,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Compute calibrated importance sampling (CIS) weights, Algorithm 1 of arXiv 2609.32444.
+
+    With p = π_old(y_t) and q = π_rollout(y_t) the probabilities of the sampled token, CIS truncates the
+    importance ratio k = p / q at a cap that tightens as the token becomes more confident:
+
+        f = min(k, 1 + λ * max(1 - p, κ))
+
+    Only the upper side is truncated, and the weights are neither normalized nor differentiable.
+    As in the reference implementation, a non-finite log-ratio gets weight one; padding gets weight zero.
+
+    Args:
+        old_log_prob: Log probabilities of the old policy recomputed by the training backend,
+            shape (batch_size, seq_length). The cap is computed from these, so they must be neither
+            an alias of ``rollout_log_prob`` nor the current policy's differentiable log probabilities.
+        rollout_log_prob: Log probabilities recorded by the rollout engine at sampling time,
+            shape (batch_size, seq_length).
+        response_mask: Binary mask for valid tokens (1=valid, 0=padding),
+            shape (batch_size, seq_length).
+        cis_lambda: Threshold λ.
+        cis_kappa: Floor κ on the uncertainty 1 - p.
+
+    Returns:
+        Tuple containing:
+            rollout_is_weights: Detached float32 CIS weights (zero for padding tokens),
+                shape (batch_size, seq_length).
+            metrics: Dictionary of IS weight metrics (all scalars), see compute_is_metrics, plus
+                - rollout_is_cis_truncated_fraction: fraction of tokens whose ratio exceeds its cap
+                - rollout_is_cis_floor_fraction: fraction of tokens whose cap is set by the floor κ
+    """
+    mask = response_mask.bool()
+    old_log_prob = old_log_prob.detach().float()
+    log_ratio = old_log_prob - rollout_log_prob.detach().float()
+    log_ratio = torch.where(torch.isfinite(log_ratio), log_ratio, 0.0)
+
+    # Truncating in log space cannot overflow for extreme ratios, and is exact below the cap.
+    uncertainty = 1.0 - old_log_prob.exp()
+    log_cap = torch.log1p(cis_lambda * uncertainty.clamp(min=cis_kappa))
+    rollout_is_weights = torch.where(mask, torch.minimum(log_ratio, log_cap).exp(), 0.0)
+
+    # The weights never exceed 1 + λ, which therefore plays the role of the TIS threshold in the metrics.
+    metrics = compute_is_metrics(
+        rollout_is_weights=rollout_is_weights,
+        raw_rollout_is_weights=torch.where(mask, log_ratio.clamp(max=SAFETY_BOUND).exp(), 0.0),
+        log_ratio_for_metrics=log_ratio,
+        response_mask=response_mask,
+        rollout_is="token",
+        rollout_is_threshold=1.0 + cis_lambda,
+    )
+    metrics["rollout_is_cis_truncated_fraction"] = verl_F.masked_mean(
+        (log_ratio > log_cap).float(), response_mask
+    ).item()
+    metrics["rollout_is_cis_floor_fraction"] = verl_F.masked_mean(
+        (uncertainty < cis_kappa).float(), response_mask
+    ).item()
+    return rollout_is_weights, metrics
+
+
 def compute_is_metrics(
     rollout_is_weights: torch.Tensor,
     raw_rollout_is_weights: torch.Tensor,
@@ -792,6 +856,8 @@ def compute_rollout_correction_and_rejection_mask(
     rollout_is_batch_normalize: bool = False,
     rollout_rs: Optional[str] = None,
     rollout_rs_threshold: Optional[str | float] = None,
+    rollout_is_cis_lambda: Optional[float] = None,
+    rollout_is_cis_kappa: float = 5e-3,
 ) -> tuple[Optional[DataProto], torch.Tensor, dict[str, float]]:
     """Unified interface for computing IS weights and rejection masks.
 
@@ -821,6 +887,9 @@ def compute_rollout_correction_and_rejection_mask(
             ``lower_upper`` to denote the lower/upper ratio bounds.
         rollout_is_batch_normalize: Whether to normalize IS weights to have mean=1.0 per batch.
             Default: False.
+        rollout_is_cis_lambda: CIS threshold λ (see compute_cis_weights). When set, token-level CIS
+            weights replace TIS / IcePop and ``rollout_is_threshold`` is not used. Default: None.
+        rollout_is_cis_kappa: CIS floor κ. Default: 5e-3.
 
     Returns:
         Tuple containing:
@@ -851,7 +920,18 @@ def compute_rollout_correction_and_rejection_mask(
 
     # Step 2: Compute IS weights (if enabled)
     rollout_is_weights: Optional[torch.Tensor] = None
-    if rollout_is is not None and rollout_is_threshold is not None:
+    if rollout_is_cis_lambda is not None:
+        if rollout_is != "token" or rollout_is_batch_normalize:
+            raise ValueError("CIS requires rollout_is='token' and rollout_is_batch_normalize=False.")
+        rollout_is_weights, is_metrics = compute_cis_weights(
+            old_log_prob=old_log_prob,
+            rollout_log_prob=rollout_log_prob,
+            response_mask=response_mask,
+            cis_lambda=rollout_is_cis_lambda,
+            cis_kappa=rollout_is_cis_kappa,
+        )
+        metrics.update(is_metrics)
+    elif rollout_is is not None and rollout_is_threshold is not None:
         rollout_is_weights, is_metrics = compute_rollout_correction_weights(
             log_ratio=log_ratio,
             response_mask=response_mask,
@@ -1045,7 +1125,8 @@ def compute_rollout_correction_and_add_to_batch(
     rollout_rs = rollout_corr_config.get("rollout_rs", None)
     rollout_rs_threshold = rollout_corr_config.get("rollout_rs_threshold", None)
 
-    # Compute IS weights and get modified response_mask
+    # Compute IS weights and get modified response_mask.
+    # In decoupled mode old_log_probs are the training backend's recomputation of π_old, which CIS requires.
     rollout_is_weights, modified_response_mask, rollout_corr_metrics = compute_rollout_correction_and_rejection_mask(
         old_log_prob=batch.batch["old_log_probs"],
         rollout_log_prob=batch.batch["rollout_log_probs"],
@@ -1055,6 +1136,8 @@ def compute_rollout_correction_and_add_to_batch(
         rollout_is_batch_normalize=rollout_is_batch_normalize,
         rollout_rs=rollout_rs,
         rollout_rs_threshold=rollout_rs_threshold,
+        rollout_is_cis_lambda=rollout_corr_config.get("rollout_is_cis_lambda", None),
+        rollout_is_cis_kappa=rollout_corr_config.get("rollout_is_cis_kappa", 5e-3),
     )
 
     # ALWAYS update response_mask with rejection applied
@@ -1133,6 +1216,8 @@ def apply_bypass_mode(
             "bypass_mode=True requires rollout_log_probs in batch. "
             "Ensure rollout worker is configured to calculate_log_probs=true."
         )
+    if (rollout_corr_config or {}).get("rollout_is_cis_lambda", None) is not None:
+        raise ValueError("CIS requires bypass_mode=False: its cap needs old_log_probs recomputed by the trainer.")
 
     # Use rollout log probs as old log probs (zero-cost substitution)
     batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
