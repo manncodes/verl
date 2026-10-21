@@ -16,13 +16,16 @@ import asyncio
 import logging
 import os
 
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from verl.single_controller.ray.base import RayResourcePool, split_resource_pool
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.ray_utils import auto_await
-from verl.workers.config import DistillationConfig, DistillationTeacherModelConfig, HFModelConfig
+from verl.utils.tracking import RLInsightLogger
+from verl.workers.config import DistillationConfig, DistillationTeacherModelConfig
+from verl.workers.rollout.llm_server import LLMServerClient
 from verl.workers.rollout.replica import get_rollout_replica_class
+from verl.workers.rollout.utils import update_prometheus_config
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -74,7 +77,16 @@ class TeacherModelManager:
         gpus_per_node = self.distillation_config.n_gpus_per_node
         rollout_replica_class = get_rollout_replica_class(teacher_model_config.inference.name)
         rollout_config = teacher_model_config.inference
-        model_config = HFModelConfig(path=teacher_model_config.model_path)
+        # Keep the model path unresolved until the rollout server actor is
+        # placed. Each server backend converts this DictConfig to HFModelConfig
+        # in its own process, so HDFS models are copied into that node's local
+        # cache instead of the controller's local /tmp.
+        model_config = OmegaConf.create(
+            {
+                "_target_": "verl.workers.config.HFModelConfig",
+                "path": teacher_model_config.model_path,
+            }
+        )
         name_suffix = (teacher_model_config.key or "").replace("/", "_")
         self.rollout_replicas = [
             rollout_replica_class(
@@ -98,6 +110,18 @@ class TeacherModelManager:
         )
         self.server_handles = [server._server_handle for server in self.rollout_replicas]
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
+
+        needs_metrics = rollout_config.prometheus.enable or RLInsightLogger.enabled()
+        if rollout_config.disable_log_stats and needs_metrics:
+            raise ValueError("Metrics monitoring requires disable_log_stats=False, but it is currently True.")
+        if not rollout_config.disable_log_stats and rollout_config.prometheus.enable:
+            update_prometheus_config(rollout_config.prometheus, self.server_addresses, rollout_config.name)
+        if not rollout_config.disable_log_stats and RLInsightLogger.enabled():
+            RLInsightLogger.register_rollout_metrics(
+                self.server_addresses,
+                rollout_config.name,
+                labels=[{"replica": f"teacher_{rank}"} for rank, server in enumerate(self.rollout_replicas)],
+            )
 
     def _validate_replica_node_alignment(self, replica_pools, per_replica_world_size, gpus_per_node):
         """Verify that each replica occupies the expected number of nodes.
@@ -143,10 +167,11 @@ class TeacherModelManager:
                 )
 
     def _initialize_load_balancer_handle(self):
-        from verl.experimental.agent_loop.agent_loop import GlobalRequestLoadBalancer
+        from verl.workers.rollout.router import get_router_handle
 
-        self.load_balancer_handle = GlobalRequestLoadBalancer.remote(
-            server_actor_ids=self.server_addresses,
+        self.load_balancer_handle = get_router_handle(
+            servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
+            router_config_path=self.teacher_model_config.inference.router_config_path,
         )
 
 
@@ -191,3 +216,13 @@ class MultiTeacherModelManager:
             self.server_addresses[key] = manager.server_addresses
             self.server_handles[key] = manager.server_handles
             self.load_balancer_handle[key] = manager.load_balancer_handle
+
+    def get_client(self) -> dict[str, LLMServerClient]:
+        """Get the LLMServerClient for each teacher model."""
+        teacher_clients = {}
+        for key, manager in self.teacher_model_managers.items():
+            teacher_clients[key] = LLMServerClient(
+                config=self.config,
+                load_balancer_handle=manager.load_balancer_handle,
+            )
+        return teacher_clients

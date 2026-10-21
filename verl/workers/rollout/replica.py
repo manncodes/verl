@@ -13,27 +13,22 @@
 # limitations under the License.
 import asyncio
 import logging
-import os
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, Callable, Optional
 
 import ray
 from omegaconf import DictConfig
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel
 from ray.actor import ActorHandle
 
+from verl.plugin.platform import get_platform
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup, ResourcePoolManager
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import is_torch_npu_available
-from verl.workers.config import DiffusionRolloutConfig, HFModelConfig, RolloutConfig
+from verl.utils.device import get_device_name
+from verl.workers.config import HFModelConfig, RolloutConfig
 
 logger = logging.getLogger(__file__)
-
-
-# Max number of concurrent calls to the methods of Rollout,
-# excluding calls to generate method.
-CONTROL_METHOD_CONCURRENCY = 16
 
 
 class TokenOutput(BaseModel):
@@ -43,21 +38,6 @@ class TokenOutput(BaseModel):
     """logprobs of response token ids"""
     routed_experts: Optional[Any] = None
     """routed experts of response token ids"""
-    stop_reason: Optional[str] = None
-    """stop reason: 'completed', 'aborted', or None for unknown"""
-    num_preempted: Optional[int] = None
-    """number of preempted times for metric calculation"""
-    extra_fields: dict[str, Any] = {}
-    """Extra fields for dynamic addition."""
-
-
-class DiffusionOutput(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    diffusion_output: Any
-    """generated image tensor (CHW format) / video tensor (TCHW format)"""
-    log_probs: Optional[Any] = None
-    """logprobs of generated image/video"""
     stop_reason: Optional[str] = None
     """stop reason: 'completed', 'aborted', or None for unknown"""
     num_preempted: Optional[int] = None
@@ -108,7 +88,7 @@ class RolloutReplica(ABC):
     def __init__(
         self,
         replica_rank: int,
-        config: RolloutConfig | DiffusionRolloutConfig,
+        config: RolloutConfig,
         model_config: DictConfig,
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
@@ -116,7 +96,7 @@ class RolloutReplica(ABC):
         name_suffix: str = "",
     ) -> None:
         self.replica_rank = replica_rank
-        self.config: RolloutConfig | DiffusionRolloutConfig = omega_conf_to_dataclass(config)
+        self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = model_config
 
         self.world_size = (
@@ -196,43 +176,56 @@ class RolloutReplica(ABC):
             bin_pack=False,
             name_prefix=name_prefix,
             use_gpu=use_gpu,
-            device_name="cuda" if not is_torch_npu_available(check_device=False) else "npu",
+            device_name=get_device_name(),
         )
         self.workers = worker_group.workers
         await self.launch_servers()
 
-    async def init_standalone(self):
-        """Init standalone rollout server, create new resource pool for this rollout."""
-        # create resource pool for this rollout
+    async def init_standalone(self, resource_pool: Optional[RayResourcePool] = None):
+        """Init standalone rollout server.
+
+        Args:
+            resource_pool: Existing pool to attach. If omitted, create a new
+                per-replica pool as before. Callers that already sliced a parent
+                pool (e.g. async-RL) pass the slice here so replica placement
+                stays under their ResourcePoolManager.
+        """
         self.rollout_mode = RolloutMode.STANDALONE
-        if self.is_reward_model:
-            resource_pool_name = f"rollout_pool_reward_{self.replica_rank}{self.name_suffix}"
-        elif self.is_teacher_model:
-            resource_pool_name = f"rollout_pool_teacher_{self.replica_rank}{self.name_suffix}"
-        else:
-            resource_pool_name = f"rollout_pool_{self.replica_rank}{self.name_suffix}"
-        resource_pool_spec = {
-            resource_pool_name: [self.gpus_per_replica_node] * self.nnodes,
-        }
-        resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=None)
-        resource_pool_manager.create_resource_pool()
-        self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
+        if resource_pool is None:
+            if self.is_reward_model:
+                resource_pool_name = f"rollout_pool_reward_{self.replica_rank}{self.name_suffix}"
+            elif self.is_teacher_model:
+                resource_pool_name = f"rollout_pool_teacher_{self.replica_rank}{self.name_suffix}"
+            else:
+                resource_pool_name = f"rollout_pool_{self.replica_rank}{self.name_suffix}"
+            resource_pool_spec = {
+                resource_pool_name: [self.gpus_per_replica_node] * self.nnodes,
+            }
+            resource_pool_manager = ResourcePoolManager(
+                resource_pool_spec=resource_pool_spec,
+                mapping=None,
+                max_colocate_count=2,
+            )
+            resource_pool_manager.create_resource_pool()
+            resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
+        self.resource_pool = resource_pool
 
         # create worker group for this rollout
-        use_gpu = self.rollout_worker_use_gpu()
         if self.is_reward_model:
             name_prefix = f"rollout_reward_standalone_{self.replica_rank}{self.name_suffix}"
         elif self.is_teacher_model:
             name_prefix = f"rollout_teacher_standalone_{self.replica_rank}{self.name_suffix}"
         else:
             name_prefix = f"rollout_standalone_{self.replica_rank}{self.name_suffix}"
+        # These workers share each bundle's device with the rollout engine's own workers. Where a
+        # device cannot be shared between processes (TPU), they must not claim it.
         worker_group = RayWorkerGroup(
             resource_pool=self.resource_pool,
             ray_cls_with_init=self.get_ray_class_with_init_args(),
             bin_pack=False,
             name_prefix=name_prefix,
-            use_gpu=use_gpu,
-            device_name="cuda" if not is_torch_npu_available(check_device=False) else "npu",
+            use_gpu=get_platform().supports_colocated_worker_groups(),
+            device_name=get_device_name(),
         )
         self.workers = worker_group.workers
         await self.launch_servers()
@@ -265,12 +258,6 @@ class RolloutReplica(ABC):
         """Get rollout server handle for Token-in-token-out generation."""
         return self._server_handle
 
-    @property
-    def max_concurrency(self) -> int:
-        # 1000 is Ray's default max_concurrency for async execution.
-        # Add some margin to account for control method call.
-        return max(1000, self.config.max_num_seqs + CONTROL_METHOD_CONCURRENCY)
-
     def rollout_worker_use_gpu(self) -> bool:
         return True
 
@@ -282,9 +269,19 @@ class RolloutReplica(ABC):
         """Sleep each rollout server."""
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
-    async def abort_all_requests(self):
-        """Partial rollout: abort and save all unfinished requests in each rollout server."""
-        await asyncio.gather(*[server.abort_all_requests.remote() for server in self.servers])
+    async def abort_all_requests(self, reject_request: bool = False):
+        """Partial rollout: abort and save all unfinished requests in each rollout server.
+
+        Args:
+            reject_request: Fail requests that arrive while generation is blocked instead
+                of holding them until the next resume_generation(). Pass True when the
+                replica is leaving the load balancer and no resume is coming soon.
+                Backends that cannot intercept their own admission path log a warning
+                and ignore it.
+        """
+        await asyncio.gather(
+            *[server.abort_all_requests.remote(reject_request=reject_request) for server in self.servers]
+        )
 
     async def resume_generation(self):
         """Resume generation on all servers after abort_all_requests."""
@@ -293,6 +290,14 @@ class RolloutReplica(ABC):
     async def clear_kv_cache(self):
         """reset kv cache in each rollout server."""
         await asyncio.gather(*[server.clear_kv_cache.remote() for server in self.servers])
+
+    async def release_kv_cache(self):
+        """Release only the kv_cache GPU memory, keeping model weights in place."""
+        await asyncio.gather(*[server.release_kv_cache.remote() for server in self.servers])
+
+    async def resume_kv_cache(self):
+        """Restore the kv_cache GPU memory after a weight sync."""
+        await asyncio.gather(*[server.resume_kv_cache.remote() for server in self.servers])
 
     async def start_profile(self, **kwargs):
         """Start profiling on the replica."""
@@ -328,18 +333,7 @@ def _load_vllm():
     return vLLMReplica
 
 
-def _load_vllm_omni():
-    try:
-        from verl.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniReplica
-    except ImportError as err:
-        raise ImportError("vllm-omni rollout requires vllm-omni to be installed.") from err
-
-    return vLLMOmniReplica
-
-
 def _load_sglang():
-    os.environ["SGLANG_USE_CPU_ENGINE"] = "1"
-
     try:
         import vllm  # noqa: F401
     except ImportError:
@@ -377,7 +371,6 @@ def _load_sglang():
 
     from verl.workers.rollout.sglang_rollout.async_sglang_server import SGLangReplica
 
-    del os.environ["SGLANG_USE_CPU_ENGINE"]
     return SGLangReplica
 
 
@@ -391,9 +384,31 @@ def _load_trtllm():
 RolloutReplicaRegistry.register("vllm", _load_vllm)
 RolloutReplicaRegistry.register("sglang", _load_sglang)
 RolloutReplicaRegistry.register("trtllm", _load_trtllm)
-RolloutReplicaRegistry.register("vllm_omni", _load_vllm_omni)
 
 
-# Original function for backward compatibility
-def get_rollout_replica_class(rollout: str) -> type[RolloutReplica]:
+def get_rollout_replica_class(rollout: str, disaggregation_enabled: bool = False) -> type[RolloutReplica]:
+    """Resolve a replica class by backend name.
+
+    PD-disaggregated rollouts reuse the base backend name (``sglang`` /
+    ``vllm``); the dispatch here picks the PD class only when the caller
+    asserts ``disaggregation_enabled=True`` (sourced from
+    ``RolloutConfig.disaggregation.enabled``). Validation in
+    ``RolloutConfig.__post_init__`` rejects the flag for backends without a
+    PD class.
+    """
+    if disaggregation_enabled:
+        if rollout == "sglang":
+            # _load_sglang side-effect: installs vllm mocks needed by SGLangPDReplica's
+            # transitive imports. Cheap if already installed.
+            RolloutReplicaRegistry.get("sglang")
+            from verl.workers.rollout.sglang_rollout.sglang_pd_replica import SGLangPDReplica
+
+            return SGLangPDReplica
+        if rollout == "vllm":
+            from verl.workers.rollout.vllm_rollout.vllm_pd_replica import vLLMPDReplica
+
+            return vLLMPDReplica
+        raise NotImplementedError(
+            f"PD disaggregation is only supported with rollout in ('sglang', 'vllm'); got {rollout!r}."
+        )
     return RolloutReplicaRegistry.get(rollout)

@@ -17,7 +17,6 @@ Bucketed weight transfer via ZMQ + IPC (or shared memory fallback).
 Not recommended depending on vllm for this file.
 """
 
-import gc
 import logging
 import os
 from multiprocessing import shared_memory
@@ -27,7 +26,7 @@ import torch
 import zmq
 from torch.multiprocessing.reductions import reduce_tensor
 
-from verl.utils.device import get_device_id, get_device_name, get_torch_device
+from verl.utils.device import get_device_id, get_device_name, get_torch_device, is_support_ipc
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -38,6 +37,7 @@ class TensorMetadata(TypedDict):
     shape: torch.Size
     dtype: torch.dtype
     offset: int
+    handle: tuple
 
 
 # copy from https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/rlhf_utils.py
@@ -124,29 +124,41 @@ class BucketedWeightSender:
                 # transfer volume.
                 # weight = weight.to(dtype, non_blocking=True)
 
+                # Align each tensor before the receiver views the byte buffer
+                # using that tensor's dtype.
+                alignment = weight.element_size()
+                offset = (offset + alignment - 1) // alignment * alignment
+
                 # fill the tensor bucket
-                if offset + weight.nbytes > self.bucket_size:
+                if offset + weight.nbytes > self.bucket_size and len(bucket_meta) > 0:
                     get_torch_device().synchronize()
                     self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
                     self.socket.recv()
                     bucket_meta = {}
                     offset = 0
 
-                # TODO: slice embedding layer weight into chunks
-                assert offset + weight.nbytes <= self.bucket_size, (
-                    f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket."
-                    f"Please increase rollout.update_weights_bucket_megabytes({self.bucket_size_mb} MB)."
-                )
+                if offset + weight.nbytes > self.bucket_size:
+                    assert not self.use_shm, (
+                        f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket."
+                        f"Please increase rollout.update_weights_bucket_megabytes({self.bucket_size_mb} MB)."
+                    )
+                    self._direct_send_large_weight(name, weight)
+                    continue
+
                 bucket_meta[name] = {
                     "name": name,
                     "shape": weight.shape,
                     "dtype": weight.dtype,
                     "offset": offset,
+                    "handle": None,
                 }
-                self.buffer[offset : offset + weight.nbytes].copy_(weight.view(-1).view(torch.uint8), non_blocking=True)
+                self.buffer[offset : offset + weight.nbytes].view(dtype=weight.dtype).view(weight.shape).copy_(
+                    weight, non_blocking=True
+                )
                 offset += weight.nbytes
 
             # send the last bucket
+            name = weight = None
             get_torch_device().synchronize()
             self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": True})
             self.socket.recv()
@@ -204,9 +216,25 @@ class BucketedWeightSender:
             self.shm.unlink()
             del self.shm
             self.shm = None
-        gc.collect()
-        get_torch_device().ipc_collect()
+        if is_support_ipc():
+            get_torch_device().ipc_collect()
         get_torch_device().empty_cache()
+
+    def _direct_send_large_weight(self, name: str, weight: torch.Tensor):
+        """Send a weight larger than the bucket size via cuda ipc or share memory."""
+        logger.debug(f"Direct sending large weight {name}({weight.shape}, {weight.dtype})")
+        # TODO: support fallback to shared memory
+        handle = reduce_tensor(weight)
+        bucket_meta: dict[str, TensorMetadata] = {}
+        bucket_meta[name] = {
+            "name": name,
+            "shape": weight.shape,
+            "dtype": weight.dtype,
+            "offset": 0,
+            "handle": handle,
+        }
+        self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
+        self.socket.recv()
 
 
 class BucketedWeightReceiver:
@@ -236,13 +264,18 @@ class BucketedWeightReceiver:
         self.socket = None
         self.buffer = None
         self.shm = None
+        self._ack_pending = False
 
     def receive_weights(self, on_bucket_received: callable):
         """
         Receive weights from sender and process each bucket via callback.
 
         Args:
-            on_bucket_received: Callback function(weights: list[(name, tensor)]) called per bucket.
+            on_bucket_received: Callback function(weights: list[(name, tensor)],
+            is_last: bool) called per bucket. ``is_last`` marks the final bucket
+            of a weight-sync round so consumers that need the complete tensor set
+            (e.g. vLLM ``add_lora``, which takes one adapter dict per call) can
+            defer their finalization until the whole adapter has arrived.
         """
         try:
             self._init_socket()
@@ -253,17 +286,24 @@ class BucketedWeightReceiver:
                 metadata = self.socket.recv_pyobj()
                 weights, tensor = [], None
                 for name, meta in metadata["bucket_meta"].items():
-                    shape, dtype, offset = meta["shape"], meta["dtype"], meta["offset"]
+                    shape, dtype, offset, handle = meta["shape"], meta["dtype"], meta["offset"], meta["handle"]
+                    if handle is not None:
+                        tensor = rebuild_ipc(handle, self.device.index)
+                        weights.append((name, tensor))
+                        continue
                     size = dtype.itemsize * shape.numel()
                     tensor = self.buffer[offset : offset + size].view(dtype=dtype).view(shape)
                     if self.use_shm:
                         tensor = tensor.to(self.device)
                     weights.append((name, tensor))
-                on_bucket_received(weights)
+                is_last = metadata["is_last"]
+                on_bucket_received(weights, is_last)
                 get_torch_device().synchronize()
-                self.socket.send(b"")
                 del weights, tensor
-                if metadata["is_last"]:
+                if not is_last:
+                    self.socket.send(b"")
+                else:
+                    self._ack_pending = True
                     break
         finally:
             self._cleanup()
@@ -291,9 +331,6 @@ class BucketedWeightReceiver:
 
     def _cleanup(self):
         """clean up"""
-        if self.socket is not None:
-            self.socket.close()
-            self.socket = None
         # Synchronize before releasing the buffer to ensure all async ops
         # referencing it (e.g. clone, .to()) have completed.
         get_torch_device().synchronize()
@@ -303,6 +340,16 @@ class BucketedWeightReceiver:
             self.shm.close()
             del self.shm
             self.shm = None
-        gc.collect()
-        get_torch_device().ipc_collect()
+        if is_support_ipc():
+            get_torch_device().ipc_collect()
         get_torch_device().empty_cache()
+        # Ack last, after the buffer is released: the sender reclaims its bucket
+        # buffer the moment this ack returns, and CUDA IPC only frees the sender's
+        # block once our ref counter reaches zero. Acking earlier strands it in
+        # CudaIPCSentDataLimbo until some later round drains the limbo.
+        # The guard keeps the REP socket's strict recv/send alternation valid.
+        if self.socket is not None:
+            if self._ack_pending:
+                self.socket.send(b"")
+            self.socket.close()
+            self.socket = None

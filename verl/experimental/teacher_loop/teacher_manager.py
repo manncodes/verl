@@ -11,21 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
+import os
 from typing import Any, Optional
 from uuid import uuid4
 
-import ray
 import torch
 from omegaconf import DictConfig
 from torch.nn import functional as F
 
-from verl.experimental.agent_loop import AsyncLLMServerManager
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import (
     DistillationConfig,
     DistillationLossConfig,
     DistillationTeacherModelConfig,
 )
+from verl.workers.rollout.llm_server import LLMServerClient
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 def _get_teacher_sampling_params(
@@ -33,14 +37,23 @@ def _get_teacher_sampling_params(
     distillation_loss_config: DistillationLossConfig,
 ) -> dict[str, Any]:
     """Get sampling parameters for teacher model when computing log probabilities for distillation."""
+    # Temperature has no effect on prompt_logprobs: the teacher performs a forward pass over
+    # existing tokens (no sampling). Always use temperature=1.0 regardless of the config value.
+    # The default distillation.yaml copies the student rollout temperature via Hydra interpolation
+    # (temperature: ${oc.select:actor_rollout_ref.rollout.temperature}), which causes a spurious
+    # crash when rollout.temperature != 1.0.
     if teacher_model_config.inference.temperature != 1.0:
-        raise NotImplementedError("vLLM does not support temperature for prompt_logprobs.")
-
+        logger.warning(
+            "Teacher inference temperature is set to %.1f, but temperature has no effect "
+            "on prompt_logprobs (forward pass only). Using temperature=1.0.",
+            teacher_model_config.inference.temperature,
+        )
     num_logprobs = distillation_loss_config.topk if distillation_loss_config.loss_settings.use_topk else 0
     return {
         "max_tokens": 1,
-        "temperature": teacher_model_config.inference.temperature,
+        "temperature": 1.0,
         "prompt_logprobs": num_logprobs,
+        "detokenize": False,
     }
 
 
@@ -69,8 +82,7 @@ class AsyncTeacherLLMServerManager:
     def __init__(
         self,
         config: DictConfig,
-        servers: dict[str, list[tuple[str, ray.actor.ActorHandle]]],
-        load_balancer_handle: dict[str, ray.actor.ActorHandle],
+        teacher_client: dict[str, LLMServerClient],
     ):
         self.distillation_config: DistillationConfig = omega_conf_to_dataclass(config.distillation)
         self.distillation_loss_config: DistillationLossConfig = self.distillation_config.distillation_loss
@@ -78,22 +90,12 @@ class AsyncTeacherLLMServerManager:
 
         self.teacher_model_configs: dict[str, DistillationTeacherModelConfig] = self.distillation_config.teacher_models
         expected = set(self.teacher_model_configs)
-        if set(servers.keys()) != expected:
-            raise ValueError(f"server keys {sorted(servers)} do not match teacher routing keys {sorted(expected)}.")
-        if set(load_balancer_handle.keys()) != expected:
+        if set(teacher_client.keys()) != expected:
             raise ValueError(
-                f"load_balancer_handle keys {sorted(load_balancer_handle)} do not match "
-                f"teacher routing keys {sorted(expected)}."
+                f"teacher client keys {sorted(teacher_client.keys())} "
+                f"do not match teacher routing keys {sorted(expected)}."
             )
-
-        self.server_managers: dict[str, AsyncLLMServerManager] = {
-            key: AsyncLLMServerManager(
-                config=config,
-                servers=servers[key],
-                load_balancer_handle=load_balancer_handle[key],
-            )
-            for key in self.teacher_model_configs
-        }
+        self.teacher_client: dict[str, LLMServerClient] = teacher_client
 
     def _resolve_teacher_key(self, routing_key: Optional[str]) -> str:
         if len(self.teacher_model_configs) == 1:
@@ -115,19 +117,24 @@ class AsyncTeacherLLMServerManager:
         self,
         sequence_ids: list[int],
         multi_modal_data: Optional[dict[str, Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        mm_processor_output: Optional[list[dict[str, Any]]] = None,
         routing_key: Optional[str] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute teacher log probabilities for a single unpadded sequence."""
         multi_modal_data = multi_modal_data or {}
         teacher_key = self._resolve_teacher_key(routing_key)
         teacher_model_config = self.teacher_model_configs[teacher_key]
-        server_manager = self.server_managers[teacher_key]
-        teacher_output = await server_manager.generate(
+        client = self.teacher_client[teacher_key]
+        teacher_output = await client.generate(
             request_id=uuid4().hex,
             prompt_ids=sequence_ids,
             sampling_params=_get_teacher_sampling_params(teacher_model_config, self.distillation_loss_config),
             image_data=multi_modal_data.get("images"),
             video_data=multi_modal_data.get("videos"),
+            audio_data=multi_modal_data.get("audios"),
+            mm_processor_output=mm_processor_output,
+            mm_processor_kwargs=mm_processor_kwargs,
         )
         # Shapes: # S, (1 or K), where S is the response length, K is either 1 or topk depending on
         # the distillation loss settings.

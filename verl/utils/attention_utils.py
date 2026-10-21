@@ -24,20 +24,18 @@ def _get_attention_functions() -> tuple[Callable, Callable, Callable, Callable]:
 
     global _index_first_axis, _pad_input, _rearrange, _unpad_input
 
-    if is_torch_npu_available(check_device=False):
-        from verl.utils.npu_flash_attn_utils import index_first_axis, pad_input, rearrange, unpad_input
-    else:
+    # flash-attn only ships CUDA wheels, so every other backend -- NPU, and any
+    # device without a flash-attn build -- as well as CPU-only installs (unit
+    # tests, dev boxes) use the pure-torch port in attention_padding_utils.
+    use_flash_attn = not is_torch_npu_available(check_device=False)
+    if use_flash_attn:
         try:
             from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
         except ImportError:
-            # flash_attn unavailable or broken ABI (e.g. the prebuilt .so was
-            # compiled against a different torch — symbol like
-            # _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_jb is missing).
-            # Fall back to the pure-torch helpers in npu_flash_attn_utils;
-            # they use only torch + einops and run fine on CUDA.
-            from einops import rearrange
+            use_flash_attn = False
 
-            from verl.utils.npu_flash_attn_utils import index_first_axis, pad_input, unpad_input
+    if not use_flash_attn:
+        from verl.utils.attention_padding_utils import index_first_axis, pad_input, rearrange, unpad_input
 
     _index_first_axis, _pad_input, _rearrange, _unpad_input = index_first_axis, pad_input, rearrange, unpad_input
 
@@ -46,13 +44,11 @@ def _get_attention_functions() -> tuple[Callable, Callable, Callable, Callable]:
 
 def index_first_axis(*args, **kwargs):
     """
-    Unified entry point for `index_first_axis` across CUDA and NPU backends.
+    Unified entry point for `index_first_axis` across backends.
 
-    Dynamically dispatches to the appropriate device-specific implementation:
-      - On CUDA: `flash_attn.bert_padding.index_first_axis`
-      - On NPU: `transformers.integrations.npu_flash_attention.index_first_axis`
-        (falls back to `transformers.modeling_flash_attention_utils._index_first_axis`
-        in newer versions of transformers).
+    Dynamically dispatches to the appropriate implementation:
+      - With flash-attn installed: `flash_attn.bert_padding.index_first_axis`
+      - Otherwise: `verl.utils.attention_padding_utils.index_first_axis`
 
     Users can call this function directly without worrying about the underlying device.
     """
@@ -62,13 +58,11 @@ def index_first_axis(*args, **kwargs):
 
 def pad_input(*args, **kwargs):
     """
-    Unified entry point for `pad_input` across CUDA and NPU backends.
+    Unified entry point for `pad_input` across backends.
 
-    Dynamically dispatches to the appropriate device-specific implementation:
-      - On CUDA: `flash_attn.bert_padding.pad_input`
-      - On NPU: `transformers.integrations.npu_flash_attention.pad_input`
-        (falls back to `transformers.modeling_flash_attention_utils._pad_input`
-        in newer versions of transformers).
+    Dynamically dispatches to the appropriate implementation:
+      - With flash-attn installed: `flash_attn.bert_padding.pad_input`
+      - Otherwise: `verl.utils.attention_padding_utils.pad_input`
 
     Users can call this function directly without worrying about the underlying device.
     """
@@ -78,12 +72,12 @@ def pad_input(*args, **kwargs):
 
 def rearrange(*args, **kwargs):
     """
-    Unified entry point for `rearrange` across CUDA and NPU backends.
+    Unified entry point for `rearrange` across backends.
 
-    Dynamically dispatches to the appropriate device-specific implementation:
-      - On CUDA: `flash_attn.bert_padding.rearrange`
-      - On NPU: `transformers.integrations.npu_flash_attention.rearrange`
-        (falls back to `einops.rearrange` if no dedicated NPU implementation exists).
+    Dynamically dispatches to the appropriate implementation:
+      - With flash-attn installed: `flash_attn.bert_padding.rearrange`
+      - Otherwise: `einops.rearrange`, re-exported from
+        `verl.utils.attention_padding_utils`
 
     Users can call this function directly without worrying about the underlying device.
     """
@@ -93,13 +87,11 @@ def rearrange(*args, **kwargs):
 
 def unpad_input(*args, **kwargs):
     """
-    Unified entry point for `unpad_input` across CUDA and NPU backends.
+    Unified entry point for `unpad_input` across backends.
 
-    Dynamically dispatches to the appropriate device-specific implementation:
-      - On CUDA: `flash_attn.bert_padding.unpad_input`
-      - On NPU: `transformers.integrations.npu_flash_attention.unpad_input`
-        (falls back to `transformers.modeling_flash_attention_utils._unpad_input`
-        in newer versions of transformers).
+    Dynamically dispatches to the appropriate implementation:
+      - With flash-attn installed: `flash_attn.bert_padding.unpad_input`
+      - Otherwise: `verl.utils.attention_padding_utils.unpad_input`
 
     Users can call this function directly without worrying about the underlying device.
     """

@@ -24,9 +24,17 @@ from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 from verl.utils import omega_conf_to_dataclass
 from verl.utils.device import get_device_name
 from verl.workers.engine_workers import ActorRolloutRefWorker
+from verl.workers.rollout.llm_server import LLMServerManager
 
 
 def init_agent_loop_manager(config: DictConfig) -> AgentLoopManager | RayWorkerGroup:
+    agent_loop_manager, _, _ = init_agent_loop_manager_and_workers(config)
+    return agent_loop_manager
+
+
+def init_agent_loop_manager_and_workers(
+    config: DictConfig,
+) -> tuple[AgentLoopManager, RayWorkerGroup, CheckpointEngineManager]:
     # =========================== 1. Create hybrid ActorRollout workers ===========================
     # The unified model-engine ActorRolloutRefWorker supports both sync and async rollout modes.
     actor_rollout_cls = ActorRolloutRefWorker
@@ -41,15 +49,19 @@ def init_agent_loop_manager(config: DictConfig) -> AgentLoopManager | RayWorkerG
     mapping = {
         Role.ActorRollout: global_pool_id,
     }
-    if config.reward.reward_model.enable_resource_pool:
-        mapping[Role.RewardModel] = "reward_pool"
-        if config.reward.reward_model.n_gpus_per_node <= 0:
-            raise ValueError("config.reward.reward_model.n_gpus_per_node must be greater than 0")
-        if config.reward.reward_model.nnodes <= 0:
-            raise ValueError("config.reward.reward_model.nnodes must be greater than 0")
-
-        reward_pool = [config.reward.reward_model.n_gpus_per_node] * config.reward.reward_model.nnodes
-        resource_pool_spec["reward_pool"] = reward_pool
+    if config.reward.reward_model.enable:
+        if config.reward.reward_model.enable_resource_pool:
+            mapping[Role.RewardModel] = "reward_pool"
+            if config.reward.reward_model.n_gpus_per_node <= 0:
+                raise ValueError("config.reward.reward_model.n_gpus_per_node must be greater than 0")
+            if config.reward.reward_model.nnodes <= 0:
+                raise ValueError("config.reward.reward_model.nnodes must be greater than 0")
+            reward_pool = [config.reward.reward_model.n_gpus_per_node] * config.reward.reward_model.nnodes
+            resource_pool_spec["reward_pool"] = reward_pool
+        else:
+            mapping[Role.RewardModel] = global_pool_id
+            config.reward.reward_model.nnodes = config.trainer.nnodes
+            config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
     resource_pool_manager.create_resource_pool()
     resource_pool_to_cls = {pool: {} for pool in resource_pool_manager.resource_pool_dict.values()}
@@ -84,17 +96,18 @@ def init_agent_loop_manager(config: DictConfig) -> AgentLoopManager | RayWorkerG
         config=config,
         rm_resource_pool=rm_resource_pool,
     )
+    llm_server_manager = LLMServerManager.create(config=config, worker_group=actor_rollout_wg)
     agent_loop_manager = AgentLoopManager.create(
         config=config,
-        worker_group=actor_rollout_wg,
+        llm_client=llm_server_manager.get_client(),
         reward_loop_worker_handles=reward_loop_manager.reward_loop_workers,
     )
     checkpoint_manager = CheckpointEngineManager(
         config=omega_conf_to_dataclass(config.actor_rollout_ref.rollout.checkpoint_engine),
-        trainer=actor_rollout_wg,
-        replicas=agent_loop_manager.rollout_replicas,
+        actor_wg=actor_rollout_wg,
+        replicas=llm_server_manager.get_replicas(),
     )
     checkpoint_manager.sleep_replicas()
     checkpoint_manager.update_weights()
 
-    return agent_loop_manager
+    return agent_loop_manager, actor_rollout_wg, checkpoint_manager

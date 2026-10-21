@@ -21,8 +21,12 @@ import torch
 import torch.distributed
 
 from verl.protocol import DataProto, all_gather_data_proto
-from verl.utils.device import get_device_name
+from verl.utils.device import get_device_name, is_npu_available
 from verl.utils.distributed import initialize_global_process_group
+
+if is_npu_available:
+    # Apply Ascend patches before either test imports Megatron-Core.
+    import megatron_adaptor  # noqa: F401
 
 
 def test_all_gather_data_proto():
@@ -61,7 +65,7 @@ def test_all_gather_data_proto():
 def test_vocab_parallel_entropy():
     from megatron.core import parallel_state as mpu
 
-    from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy
+    from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_entropy_with_chunking
     from verl.utils.profiler import log_gpu_memory_usage
     from verl.utils.torch_functional import entropy_from_logits
 
@@ -114,8 +118,62 @@ def test_vocab_parallel_entropy():
         logits[:, tp_rank * vocab_size_per_tp : (tp_rank + 1) * vocab_size_per_tp], vocab_parallel_logits
     )
 
+    # chunked entropy backpropagates through every chunk and matches the unchunked gradient
+    unchunked_grad = vocab_parallel_logits.grad.clone()
+    vocab_parallel_logits.grad = None
+    chunked_entropy = vocab_parallel_entropy_with_chunking(
+        vocab_parallel_logits.view(batch_size, seqlen, -1), chunk_size=seqlen // 4
+    )
+    torch.testing.assert_close(chunked_entropy.view(-1), target_entropy)
+    chunked_entropy.backward(grad_output.view(batch_size, seqlen))
+    torch.testing.assert_close(vocab_parallel_logits.grad, unchunked_grad)
+
     if mpu.get_tensor_model_parallel_rank() == 0:
         print("test_vocab_parallel_entropy passes")
+
+    mpu.destroy_model_parallel()
+
+
+def test_vocab_parallel_sum_pi_squared():
+    from megatron.core import parallel_state as mpu
+
+    from verl.utils.megatron.tensor_parallel import vocab_parallel_sum_pi_squared
+    from verl.utils.torch_functional import calculate_sum_pi_squared_from_logits
+
+    if not mpu.model_parallel_is_initialized():
+        mpu.initialize_model_parallel(
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=1, virtual_pipeline_model_parallel_size=None
+        )
+
+    batch_size = 2
+    seqlen = 64
+    vocab_size = 4096
+
+    logits = torch.randn(batch_size * seqlen, vocab_size, device=get_device_name())
+
+    # broadcast across tp so every rank shares the same full logits to shard from
+    torch.distributed.broadcast(
+        logits, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group()
+    )
+
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    vocab_size_per_tp = vocab_size // mpu.get_tensor_model_parallel_world_size()
+
+    vocab_parallel_logits = logits[:, tp_rank * vocab_size_per_tp : (tp_rank + 1) * vocab_size_per_tp].clone()
+    pre_call = vocab_parallel_logits.clone()
+
+    output = vocab_parallel_sum_pi_squared(vocab_parallel_logits)
+    target = calculate_sum_pi_squared_from_logits(logits)
+
+    torch.testing.assert_close(output, target, atol=1e-5, rtol=1e-5)
+    # non-destructive: input shard must not be mutated
+    torch.testing.assert_close(vocab_parallel_logits, pre_call)
+    # sanity: Σπ² ∈ (0, 1]
+    assert torch.all(output > 0)
+    assert torch.all(output <= 1.0 + 1e-5)
+
+    if mpu.get_tensor_model_parallel_rank() == 0:
+        print("test_vocab_parallel_sum_pi_squared passes")
 
     mpu.destroy_model_parallel()
 
@@ -124,3 +182,4 @@ if __name__ == "__main__":
     local_rank, rank, world_size = initialize_global_process_group()
     test_all_gather_data_proto()
     test_vocab_parallel_entropy()
+    test_vocab_parallel_sum_pi_squared()

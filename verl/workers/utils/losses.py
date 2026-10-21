@@ -16,7 +16,6 @@
 import torch
 from tensordict import TensorDict
 
-from verl.trainer.diffusion.diffusion_algos import kl_penalty_image
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
@@ -61,6 +60,18 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     entropy = model_output.get("entropy", None)
     if entropy is not None:
         entropy = no_padding_2_padding(entropy, data)
+    sc_outputs = {
+        key: no_padding_2_padding(model_output[key], data)
+        for key in (
+            "sc_correction",
+            "sc_sampler_head_mass",
+            "sc_train_head_mass",
+            "sc_support_aligned",
+            "sc_sampler_tail_mass",
+            "sc_support_unknown",
+        )
+        if key in model_output
+    }
 
     # global batch info for loss aggregation
     config.global_batch_info["dp_size"] = data["dp_size"]
@@ -102,6 +113,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
+    policy_loss_kwargs = {"sc_correction": sc_outputs["sc_correction"]} if sc_outputs else {}
     pg_loss, pg_metrics = policy_loss_fn(
         old_log_prob=old_log_prob,
         log_prob=log_prob,
@@ -110,6 +122,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         loss_agg_mode=loss_agg_mode,
         config=config,
         rollout_is_weights=rollout_is_weights,
+        **policy_loss_kwargs,
     )
 
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
@@ -118,6 +131,32 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     metrics.update(pg_metrics)
     metrics["actor/pg_loss"] = Metric(value=pg_loss, aggregation=metric_aggregation)
+    if sc_outputs:
+        for key in (
+            "sc_sampler_head_mass",
+            "sc_train_head_mass",
+            "sc_support_aligned",
+            "sc_sampler_tail_mass",
+            "sc_support_unknown",
+        ):
+            if key not in sc_outputs:
+                continue
+            if key in ("sc_support_aligned", "sc_sampler_tail_mass", "sc_support_unknown"):
+                # Sum globally normalized token contributions across microbatches; the
+                # worker's DP mean then yields a token-weighted fraction, even for uneven rows.
+                global_tokens = config.global_batch_info["batch_num_tokens"]
+                value = agg_loss(
+                    sc_outputs[key],
+                    response_mask,
+                    "token-mean",
+                    dp_size=config.global_batch_info["dp_size"],
+                    batch_num_tokens=global_tokens,
+                )
+                aggregation = AggregationType.SUM if global_tokens is not None else AggregationType.MEAN
+            else:
+                value = masked_mean(sc_outputs[key], response_mask)
+                aggregation = AggregationType.MEAN
+            metrics[f"actor/{key}"] = Metric(value=value, aggregation=aggregation)
     policy_loss = pg_loss
 
     # add entropy loss
@@ -159,6 +198,25 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
     """
     vpreds = no_padding_2_padding(model_output["values"], data)  # (bsz, response_length)
 
+    # Normalize the value loss over the global mini-batch (dp_size / batch_num_tokens /
+    # global_batch_size) instead of the local micro-batch, so the accumulated critic gradient is
+    # invariant to how the mini-batch is split into micro-batches (as the actor's ppo_loss does).
+    dp_size = data["dp_size"]
+    batch_num_tokens = data["batch_num_tokens"]
+    global_batch_size = data["global_batch_size"]
+
+    # When the loss is normalized over the global batch, each micro-batch contributes a partial sum,
+    # so the loss metric must be aggregated with SUM to reflect the global-batch mean.
+    if (
+        dp_size > 1
+        or batch_num_tokens is not None
+        or global_batch_size is not None
+        or config.loss_scale_factor is not None
+    ):
+        metric_aggregation = AggregationType.SUM
+    else:
+        metric_aggregation = AggregationType.MEAN
+
     # select fields and convert to padded tensor
     data = data.select("values", "returns", "response_mask").to_padded_tensor()
     values = data["values"]
@@ -172,68 +230,16 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
         response_mask=response_mask,
         cliprange_value=config.cliprange_value,
         loss_agg_mode=config.loss_agg_mode,
+        dp_size=dp_size,
+        batch_num_tokens=batch_num_tokens,
+        global_batch_size=global_batch_size,
+        loss_scale_factor=config.loss_scale_factor,
     )
 
-    metrics = {}
-
-    metrics.update(
-        {
-            "critic/vf_loss": vf_loss.detach().item(),
-            "critic/vf_clipfrac": vf_clipfrac.detach().item(),
-            "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
-        }
-    )
+    metrics = {
+        "critic/vf_loss": Metric(value=vf_loss, aggregation=metric_aggregation),
+        "critic/vf_clipfrac": vf_clipfrac.detach().item(),
+        "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
+    }
 
     return vf_loss, metrics
-
-
-def diffusion_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
-    """Compute loss for diffusion model"""
-    log_prob = model_output["log_probs"]
-
-    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
-
-    metrics = {}
-
-    response_mask = data["response_mask"].to(bool)
-    # compute policy loss
-    old_log_prob = data["old_log_probs"]
-    advantages = data["advantages"]
-
-    loss_agg_mode = config.loss_agg_mode
-
-    loss_mode = config.policy_loss.get("loss_mode", "flow_grpo")
-
-    policy_loss_fn = get_policy_loss_fn(loss_mode)
-    pg_loss, pg_metrics = policy_loss_fn(
-        old_log_prob=old_log_prob,
-        log_prob=log_prob,
-        advantages=advantages,
-        response_mask=response_mask,
-        loss_agg_mode=loss_agg_mode,
-        config=config,
-        rollout_is_weights=None,
-    )
-
-    pg_metrics = Metric.from_dict(pg_metrics, aggregation=AggregationType.MEAN)
-
-    metrics.update(pg_metrics)
-    metrics["actor/pg_loss"] = Metric(value=pg_loss, aggregation=AggregationType.MEAN)
-    policy_loss = pg_loss
-
-    if config.use_kl_loss:
-        ref_prev_sample_mean = data["ref_prev_sample_mean"]
-        prev_sample_mean = model_output["prev_sample_mean"]
-        std_dev_t = model_output["std_dev_t"]
-        kl_loss = kl_penalty_image(
-            prev_sample_mean=prev_sample_mean, ref_prev_sample_mean=ref_prev_sample_mean, std_dev_t=std_dev_t
-        )
-
-        policy_loss += kl_loss * config.kl_loss_coef
-        metrics["kl_loss"] = Metric(value=kl_loss, aggregation=AggregationType.MEAN)
-        metrics["kl_coef"] = config.kl_loss_coef
-
-    gradient_accumulation_steps = tu.get_non_tensor_data(data, "gradient_accumulation_steps", default=None)
-    policy_loss = policy_loss / gradient_accumulation_steps
-
-    return policy_loss, metrics

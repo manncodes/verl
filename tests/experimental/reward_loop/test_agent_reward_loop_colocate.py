@@ -23,12 +23,13 @@ from verl.experimental.agent_loop import AgentLoopManager
 from verl.experimental.reward_loop import RewardLoopManager
 from verl.protocol import DataProto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
-from verl.trainer.main_ppo import create_rl_sampler
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+from verl.trainer.ppo.utils import create_rl_sampler
 from verl.utils import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 from verl.utils.device import get_device_name
 from verl.workers.engine_workers import ActorRolloutRefWorker
+from verl.workers.rollout.llm_server import LLMServerManager
 
 
 def test_agent_reward_loop_standalone():
@@ -97,15 +98,16 @@ def test_agent_reward_loop_standalone():
     )
     actor_rollout_wg.init_model()
 
+    llm_server_manager = LLMServerManager.create(config=config, worker_group=actor_rollout_wg)
     agent_loop_manager = AgentLoopManager.create(
         config=config,
-        worker_group=actor_rollout_wg,
+        llm_client=llm_server_manager.get_client(),
     )
     # sleep rollout replicas
     checkpoint_manager = CheckpointEngineManager(
         config=omega_conf_to_dataclass(config.actor_rollout_ref.rollout.checkpoint_engine),
-        trainer=actor_rollout_wg,
-        replicas=agent_loop_manager.rollout_replicas,
+        actor_wg=actor_rollout_wg,
+        replicas=llm_server_manager.get_replicas(),
     )
     checkpoint_manager.sleep_replicas()
     reward_loop_manager = RewardLoopManager(config, rm_resource_pool=resource_pool)

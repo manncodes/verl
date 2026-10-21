@@ -95,8 +95,8 @@ Key RPCs
 
    ``train_mini_batch`` splits the batch into mini-batches, iterates
    over PPO epochs, and calls ``TrainingWorker.train_batch`` for each
-   mini-batch (one optimizer step per mini-batch). The PPO loss,
-   diffusion loss, or distillation loss is wired by ``init_model`` via
+   mini-batch (one optimizer step per mini-batch). The PPO loss
+   or distillation loss is wired by ``init_model`` via
    ``TrainingWorker.set_loss_fn``.
 
 4. ``update_weights``
@@ -114,7 +114,10 @@ Key RPCs
      directly. LoRA adapters are merged into base weights up-front when
      ``model.lora.merge=True``.
    - For **disaggregated async training**: send the weights through
-     ``self.checkpoint_engine.send_weights`` instead.
+     ``self.checkpoint_engine.send_weights`` instead. The transport is chosen by
+     ``checkpoint_engine.backend`` (e.g. ``nccl`` for a full-weight broadcast, or
+     ``delta`` to broadcast only the parameters that changed since the previous
+     sync — see :doc:`../advance/one_step_off`).
 
 5. ``save_checkpoint`` / ``load_checkpoint``
 
@@ -139,7 +142,7 @@ Construction takes a single
 ``model_config``, ``engine_config``, ``optimizer_config``,
 ``checkpoint_config`` and ``profiler_config``. The backend is chosen
 from ``engine_config.strategy`` (``fsdp``, ``fsdp2``, ``megatron``,
-``automodel``, ``veomni``, ``torchtitan``).
+``automodel``, ``veomni``, ``torchtitan``, ``fsdp_turbo``).
 
 Key RPCs
 ^^^^^^^^
@@ -150,7 +153,7 @@ Key RPCs
    load/offload control. ``device`` must be either ``"cpu"`` or
    ``"device"`` (which is mapped to the actual accelerator name).
 -  ``set_loss_fn(loss_fn)`` – install the loss closure (PPO loss,
-   diffusion loss, distillation loss, or any custom callable that
+   distillation loss, or any custom callable that
    accepts ``(model_output, batch)``).
 -  ``train_mini_batch(data)`` – mini-batch + PPO-epoch loop; one
    optimizer step per mini-batch; allgather metrics across DP.
@@ -173,7 +176,7 @@ Set the ``strategy`` field on ``actor.engine`` / ``critic.engine`` /
 
    actor_rollout_ref:
      actor:
-       strategy: fsdp2        # or: fsdp, megatron, automodel, veomni, torchtitan
+       strategy: fsdp2        # or: fsdp, megatron, automodel, veomni, torchtitan, fsdp_turbo
        engine:
          strategy: fsdp2
          param_offload: False
@@ -183,20 +186,19 @@ The ``EngineRegistry`` dispatches on ``(model_type, backend, device)`` –
 for example ``(language_model, fsdp2, cuda)`` or
 ``(language_model, megatron, npu)``:
 
-=====================  =====================  =====================  =============================================================
-model_type             backend                device                 Engine class
-=====================  =====================  =====================  =============================================================
-``language_model``     ``fsdp`` / ``fsdp2``   ``cuda`` / ``npu``     ``verl.workers.engine.fsdp.FSDPEngineWithLMHead``
-``language_model``     ``megatron``           ``cuda``               ``verl.workers.engine.megatron.MegatronEngineWithLMHead``
-``language_model``     ``megatron``           ``npu``                ``verl.workers.engine.mindspeed.MindspeedEngineWithLMHead``
-``language_model``     ``mindspeed_llm``      ``npu``                ``verl.workers.engine.mindspeed.MindSpeedLLMEngineWithLMHead``
-``language_model``     ``automodel``          ``cuda``               ``verl.workers.engine.automodel.AutomodelEngineWithLMHead``
-``language_model``     ``veomni``             ``cuda`` / ``npu``     ``verl.workers.engine.veomni.VeOmniEngineWithLMHead``
-``language_model``     ``torchtitan``         ``cuda`` / ``npu``     ``verl.workers.engine.torchtitan.TorchTitanEngineWithLMHead``
-``value_model``        ``fsdp`` / ``fsdp2``   ``cuda`` / ``npu``     ``verl.workers.engine.fsdp.FSDPEngineWithValueHead``
-``value_model``        ``megatron``           ``cuda``               ``verl.workers.engine.megatron.MegatronEngineWithValueHead``
-``diffusion_model``    ``fsdp`` / ``fsdp2``   ``cuda``               ``verl.workers.engine.fsdp.DiffusersFSDPEngine``
-=====================  =====================  =====================  =============================================================
+=====================  ======================  =====================  =====================================================================
+model_type             backend                 device                 Engine class
+=====================  ======================  =====================  =====================================================================
+``language_model``     ``fsdp`` / ``fsdp2``    ``cuda`` / ``npu``     ``verl.workers.engine.fsdp.FSDPEngineWithLMHead``
+``language_model``     ``megatron``            ``cuda``               ``verl.workers.engine.megatron.MegatronEngineWithLMHead``
+``language_model``     ``megatron``            ``npu``                ``verl.workers.engine.mindspeed.MindspeedEngineWithLMHead``
+``language_model``     ``automodel``           ``cuda``               ``verl.workers.engine.automodel.AutomodelEngineWithLMHead``
+``language_model``     ``veomni``              ``cuda`` / ``npu``     ``verl.workers.engine.veomni.VeOmniEngineWithLMHead``
+``language_model``     ``torchtitan``          ``cuda`` / ``npu``     ``verl.workers.engine.torchtitan.TorchTitanEngineWithLMHead``
+``language_model``     ``fsdp_turbo``          ``cuda`` / ``npu``     ``verl.workers.engine.fsdp.FSDPTurboEngineWithLMHead``
+``value_model``        ``fsdp`` / ``fsdp2``    ``cuda`` / ``npu``     ``verl.workers.engine.fsdp.FSDPEngineWithValueHead``
+``value_model``        ``megatron``            ``cuda``               ``verl.workers.engine.megatron.MegatronEngineWithValueHead``
+=====================  ======================  =====================  =====================================================================
 
 Migrating from Legacy Workers
 -----------------------------
