@@ -2488,6 +2488,11 @@ def compute_policy_loss_bypass_mode(
             "rollout_correction config not found in policy_loss. "
             "When using loss_mode='bypass_mode', ensure rollout_correction config is passed."
         )
+    if rollout_corr_config.get("rollout_is_cis_lambda", None) is not None:
+        raise ValueError(
+            "CIS is not supported with loss_mode='bypass_mode': without old_log_probs recomputed by the trainer, "
+            "its cap would be computed from the current or the rollout policy."
+        )
 
     # Extract parameters
     loss_type = rollout_corr_config.get("loss_type", "ppo_clip")

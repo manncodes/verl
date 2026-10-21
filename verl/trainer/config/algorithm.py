@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -101,6 +102,19 @@ class RolloutCorrectionConfig(BaseConfig):
             - Only affects IS weight values, not rejection sampling
             Default: False (no batch normalization)
 
+        rollout_is_cis_lambda (Optional[float]): Threshold λ of calibrated importance sampling (CIS).
+            - None: CIS disabled, ``rollout_is_threshold`` selects TIS or IcePop
+            - float >= 0: replace the TIS / IcePop weight by the CIS weight
+              ``min(π_old / π_rollout, 1 + λ * max(1 - π_old, κ))``, where π_old is the probability of the
+              sampled token under the old policy recomputed by the training backend (``old_log_probs``)
+            Requires ``rollout_is="token"``, ``bypass_mode=False`` and ``rollout_is_batch_normalize=False``;
+            ``rollout_is_threshold`` is not used. The paper uses λ = 2.3.
+            Default: None
+
+        rollout_is_cis_kappa (float): Floor κ in [0, 1] of CIS on the uncertainty 1 - π_old, which keeps the
+            cap of confident tokens above the storage resolution of the log-probabilities. Only used when
+            ``rollout_is_cis_lambda`` is set. Default: 5e-3
+
         rollout_rs (Optional[str]): Rejection sampling aggregation modes.
             Accepts a comma-delimited list (duplicates removed) of canonical options implemented in
             ``rollout_corr_helper``:
@@ -154,6 +168,7 @@ class RolloutCorrectionConfig(BaseConfig):
         # IS weights correct for gap between π_old and π_rollout
         config = RolloutCorrectionConfig.decoupled_token_is()  # Token-TIS
         config = RolloutCorrectionConfig.decoupled_seq_is()    # Seq-TIS
+        config = RolloutCorrectionConfig.decoupled_token_cis() # Token-CIS
         config = RolloutCorrectionConfig.decoupled_seq_is_rs() # Seq-MIS
         config = RolloutCorrectionConfig.decoupled_geo_rs()    # Geo-RS (ratio mode)
 
@@ -190,11 +205,17 @@ class RolloutCorrectionConfig(BaseConfig):
         Marek, Ryabinin (2026)
         "Score Centering Stabilizes Off-policy Reinforcement Learning"
         https://arxiv.org/abs/2609.20807
+
+        Yu, Zhao, Li, Yang, Jenkins, Zhang, Killian (2026)
+        "Rethinking Training-Inference Mismatch in LLM Reinforcement Learning: Where It Arises and How to Correct It"
+        https://arxiv.org/abs/2609.32444
     """
 
     rollout_is: Optional[str] = "sequence"
     rollout_is_threshold: str | float = 2.0
     rollout_is_batch_normalize: bool = False
+    rollout_is_cis_lambda: Optional[float] = None
+    rollout_is_cis_kappa: float = 5e-3
     rollout_rs: Optional[str] = None
     rollout_rs_threshold: Optional[str | float] = None
     bypass_mode: bool = False
@@ -202,6 +223,26 @@ class RolloutCorrectionConfig(BaseConfig):
     score_centering: bool = False
 
     def __post_init__(self):
+        if self.rollout_is_cis_lambda is not None:
+            lam, kappa = self.rollout_is_cis_lambda, self.rollout_is_cis_kappa
+            if not (math.isfinite(lam) and lam >= 0 and 0 <= kappa <= 1):
+                raise ValueError(f"CIS requires finite lambda >= 0 and 0 <= kappa <= 1, got {lam} and {kappa}.")
+            if self.bypass_mode:
+                raise ValueError(
+                    "CIS requires bypass_mode=False: its cap is computed from old_log_probs recomputed by the "
+                    "training backend, which bypass mode replaces with rollout_log_probs."
+                )
+            if (
+                self.rollout_is != "token"
+                or self.rollout_is_batch_normalize
+                or (isinstance(self.rollout_is_threshold, str) and "_" in self.rollout_is_threshold)
+            ):
+                raise ValueError(
+                    "CIS is an unnormalized, upper-truncated token weight: it requires rollout_is='token', "
+                    "rollout_is_batch_normalize=False and no IcePop lower bound, got "
+                    f"rollout_is={self.rollout_is!r}, rollout_is_batch_normalize={self.rollout_is_batch_normalize}, "
+                    f"rollout_is_threshold={self.rollout_is_threshold!r}."
+                )
         if not self.score_centering:
             return
         if not self.bypass_mode or self.loss_type != "reinforce":
@@ -259,6 +300,24 @@ class RolloutCorrectionConfig(BaseConfig):
             RolloutCorrectionConfig configured for decoupled mode with token-level IcePop
         """
         return cls(rollout_is="token", rollout_is_threshold=f"{threshold_lower}_{threshold}", rollout_rs=None)
+
+    @classmethod
+    def decoupled_token_cis(cls, cis_lambda: float = 2.3, cis_kappa: float = 5e-3) -> "RolloutCorrectionConfig":
+        """Decoupled Mode with token-level calibrated importance sampling (CIS).
+
+        Weights each token by min(π_old / π_rollout, 1 + λ * max(1 - π_old, κ)), a cap that tightens as the
+        token becomes more confident (https://arxiv.org/abs/2609.32444).
+
+        Args:
+            cis_lambda (float): Threshold λ. Default: 2.3
+            cis_kappa (float): Floor κ on 1 - π_old. Default: 5e-3
+
+        Returns:
+            RolloutCorrectionConfig configured for decoupled mode with token-level CIS
+        """
+        return cls(
+            rollout_is="token", rollout_is_cis_lambda=cis_lambda, rollout_is_cis_kappa=cis_kappa, rollout_rs=None
+        )
 
     @classmethod
     def decoupled_seq_is_rs(

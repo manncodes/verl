@@ -119,6 +119,28 @@ def _validate_score_centering_config(config: DictConfig) -> None:
         raise ValueError("score centering cannot be combined with distillation.")
 
 
+def _validate_cis_config(config: DictConfig) -> None:
+    algorithm_rc = config.algorithm.get("rollout_correction") or {}
+    actor_policy_loss = config.actor_rollout_ref.actor.policy_loss
+    actor_rc = actor_policy_loss.get("rollout_correction") or {}
+    if algorithm_rc.get("rollout_is_cis_lambda") is None:
+        if actor_rc.get("rollout_is_cis_lambda") is not None:
+            raise ValueError(
+                "CIS weights are computed by the trainer: set algorithm.rollout_correction.rollout_is_cis_lambda "
+                "instead of actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_is_cis_lambda."
+            )
+        return
+    from verl.trainer.config.algorithm import RolloutCorrectionConfig
+
+    # the trainer reads algorithm.rollout_correction as a plain mapping, so run the dataclass checks on it here
+    RolloutCorrectionConfig(**algorithm_rc)
+    if actor_policy_loss.get("loss_mode") == "bypass_mode":
+        raise ValueError(
+            "CIS requires actor_rollout_ref.actor.policy_loss.loss_mode other than 'bypass_mode', "
+            "which discards the trainer's rollout_is_weights."
+        )
+
+
 def validate_config(
     config: DictConfig,
     use_reference_policy: bool,
@@ -199,6 +221,7 @@ def validate_config(
     actor_config.validate(n_gpus, config.data.train_batch_size, config.actor_rollout_ref.model)
     _validate_router_replay_config(actor_config, config.algorithm.get("rollout_correction", None))
     _validate_score_centering_config(config)
+    _validate_cis_config(config)
 
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if use_reference_policy:

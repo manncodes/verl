@@ -896,6 +896,8 @@ algorithm:
     bypass_mode: false
     loss_type: ppo_clip
     rollout_is_batch_normalize: false
+    rollout_is_cis_lambda: null
+    rollout_is_cis_kappa: 0.005
     score_centering: false
   _target_: verl.trainer.config.AlgoConfig
   gamma: 1.0
