@@ -958,6 +958,24 @@ trainer:
   max_critic_ckpt_to_keep: null
   ray_wait_register_center_timeout: 300
   device: cuda
+  elastic:
+    _target_: verl.trainer.config.ElasticConfig
+    enable: false
+    health_check_interval_s: 5.0
+    request_retries: 60
+    min_rollout_gpus: 0
+    max_rollout_gpus: null
+    autoscale: false
+    policy: static
+    up_wait_ratio: 0.2
+    patience: 3
+    scale_step_gpus: 8
+    max_weight_fraction: 0.5
+    tp_by_accelerator: {}
+    stable_node_resource: null
+    rollout_node_resource: null
+    max_consecutive_failures: 5
+    borrow_rollout_after_s: 120.0
   use_v1: true
   v1:
     trainer_mode: sync

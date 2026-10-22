@@ -302,6 +302,7 @@ def _create_global_sticky_inflight(
     servers: dict[str, Any],
     full_determinism: bool = False,
     load_balancer_cls: type | None = None,
+    actor_options: dict | None = None,
 ):
     """Factory for the default sticky-session + least-inflight strategy.
 
@@ -312,6 +313,7 @@ def _create_global_sticky_inflight(
         load_balancer_cls: Class to use as the routing actor. A subclass overrides
             :meth:`acquire_server` and takes full control of routing, so
             ``full_determinism`` is not forwarded to it.
+        actor_options: Ray actor options of the routing actor, e.g. its placement.
     """
     kwargs = dict(servers=servers, max_cache_size=DEFAULT_ROUTING_CACHE_SIZE)
     # The default GlobalRequestLoadBalancer honors the full_determinism flag
@@ -319,7 +321,7 @@ def _create_global_sticky_inflight(
     # full control of routing, so the flag is not forwarded to it.
     if load_balancer_cls is GlobalRequestLoadBalancer:
         kwargs["full_determinism"] = full_determinism
-    return ray.remote(load_balancer_cls).remote(**kwargs)
+    return ray.remote(load_balancer_cls).options(**(actor_options or {})).remote(**kwargs)
 
 
 def _load_router_yaml(router_config_path: str) -> dict:
@@ -360,6 +362,7 @@ def _resolve_router_class(router_class: str) -> type:
 def _create_plugin_extension(
     servers: dict[str, Any],
     router_config_path: str,
+    actor_options: dict | None = None,
 ):
     """Factory for a user-defined load balancer loaded from an external YAML.
 
@@ -369,6 +372,7 @@ def _create_plugin_extension(
     Args:
         servers: ``{server_address: actor_handle}`` mapping.
         router_config_path: Path to the external YAML file.
+        actor_options: Ray actor options of the routing actor, e.g. its placement.
 
     Raises:
         ValueError: If ``router_config_path`` is missing or the YAML lacks
@@ -391,7 +395,7 @@ def _create_plugin_extension(
         yaml_config,
     )
     ray_cls = cls if isinstance(cls, ray.actor.ActorClass) else ray.remote(cls)
-    return ray_cls.remote(servers, yaml_config)
+    return ray_cls.options(**(actor_options or {})).remote(servers, yaml_config)
 
 
 def get_router_handle(
@@ -399,6 +403,7 @@ def get_router_handle(
     router_config_path: str | None = None,
     full_determinism: bool = False,
     load_balancer_cls: type | None = None,
+    actor_options: dict | None = None,
 ) -> Any:
     """Create a load balancer instance from router configuration.
 
@@ -412,9 +417,12 @@ def get_router_handle(
         load_balancer_cls: Optional subclass of the default strategy's load
             balancer. Takes precedence over the config-selected strategy; not
             applicable to the YAML plugin.
+        actor_options: Ray actor options of the routing actor, e.g. its placement.
     """
     if router_config_path and load_balancer_cls is None:
-        return _create_plugin_extension(servers=servers, router_config_path=router_config_path)
+        return _create_plugin_extension(
+            servers=servers, router_config_path=router_config_path, actor_options=actor_options
+        )
 
     # Programmatic injection (e.g. verl-omni's Deterministic* subclasses)
     # overrides the config-selected strategy. If both are set, the YAML is
@@ -430,4 +438,5 @@ def get_router_handle(
         servers=servers,
         full_determinism=full_determinism,
         load_balancer_cls=load_balancer_cls or GlobalRequestLoadBalancer,
+        actor_options=actor_options,
     )

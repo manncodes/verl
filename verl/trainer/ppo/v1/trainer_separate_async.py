@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import inspect
 import logging
 import os
 import time
@@ -18,23 +19,31 @@ from collections import deque
 from copy import deepcopy
 from dataclasses import replace
 from enum import Enum
+from typing import Optional
 
 import ray
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from transfer_queue import KVBatchMeta
 
-from verl.checkpoint_engine import CheckpointEngineManager
+from verl.checkpoint_engine import CheckpointEngineManager, CheckpointEngineRegistry
 from verl.experimental.separation.engine_workers import DetachActorWorker
-from verl.trainer.config import HybridRolloutSwitchConfig
+from verl.single_controller.ray.fate import kill
+from verl.trainer.config import ElasticConfig, HybridRolloutSwitchConfig
 from verl.trainer.ppo.utils import Role, need_reward_model
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer, register_trainer
+from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
+from verl.workers.rollout.elastic import ElasticRolloutPool, ReplicaShaper, StepStats, list_nodes, model_footprint
 from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient, LLMServerManager
 from verl.workers.rollout.utils import update_prometheus_config
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def _node_id(actor) -> str:
+    return ray.get_runtime_context().get_node_id()
 
 
 class HybridEngineMode(Enum):
@@ -52,6 +61,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
     # Default for instances that bypass __init__ (e.g. test stubs): hybrid
     # replicas are enabled unless hybrid_rollout.enable_switch=False.
     _enable_hybrid_replicas = True
+    elastic_config: ElasticConfig = ElasticConfig()
+    elastic_rollout: Optional[ElasticRolloutPool] = None
 
     def __init__(self, config: DictConfig):
         train_batch_size = config.data.train_batch_size
@@ -62,7 +73,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             f"training, but got train_batch_size={train_batch_size}, "
             f"parameter_sync_step={parameter_sync_step}, ppo_mini_batch_size={ppo_mini_batch_size}"
         )
-        assert config.actor_rollout_ref.rollout.nnodes > 0, "nnodes must be > 0 in separate async training"
+        elastic = config.trainer.get("elastic", {}).get("enable", False)
+        assert config.actor_rollout_ref.rollout.nnodes > 0 or elastic, "nnodes must be > 0 in separate async training"
         assert config.actor_rollout_ref.rollout.n_gpus_per_node > 0, (
             "n_gpus_per_node must be > 0 in separate async training"
         )
@@ -117,6 +129,30 @@ class PPOTrainerSeparateAsync(PPOTrainer):
                 )
             self._init_hybrid_rollout_state()
 
+        self.elastic_config = omega_conf_to_dataclass(
+            self.config.trainer.get("elastic", {}), dataclass_type=ElasticConfig
+        )
+        if self.elastic_config.enable:
+            self._validate_elastic()
+
+    def _validate_elastic(self):
+        rollout_cfg = self.config.actor_rollout_ref.rollout
+        backend = rollout_cfg.checkpoint_engine.backend
+        if backend == "delta_sharded":
+            raise ValueError("trainer.elastic needs full-weight syncs: a replica that joins late never gets the base")
+        if rollout_cfg.get("disaggregation", {}).get("enabled", False):
+            raise ValueError("trainer.elastic does not support rollout disaggregation")
+        if self.hybrid_rollout_config.enable_switch:
+            raise ValueError(
+                "trainer.elastic does not support hybrid_rollout.enable_switch: hybrid replicas die with the trainer"
+            )
+        # Replicas join and leave between syncs, and a restarted trainer brings a new sender, so every sync must
+        # build its communication group afresh.
+        if "rebuild_group" in inspect.signature(CheckpointEngineRegistry.get(backend)).parameters:
+            OmegaConf.update(
+                rollout_cfg, f"checkpoint_engine.engine_kwargs.{backend}.rebuild_group", True, force_add=True
+            )
+
     def _init_resource_pool_mgr(self):
         super()._init_resource_pool_mgr()
         # Replace ActorRolloutRefWorker with DetachActorWorker to get CPU save/restore
@@ -164,7 +200,10 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         standalone_memory = standalone_rollout_config.get("standalone_gpu_memory_utilization")
         if standalone_memory is not None:
             standalone_rollout_config.gpu_memory_utilization = standalone_memory
-        self.standalone_server_manager: LLMServerManager = LLMServerManager.create(
+        # An elastic pool may start without rollout nodes and fill up as they join.
+        empty = self.elastic_config.enable and standalone_rollout_config.nnodes == 0
+        create = LLMServerManager.create_empty if empty else LLMServerManager.create
+        self.standalone_server_manager: LLMServerManager = create(
             config=standalone_config, start_rank=hybrid_num_replicas
         )
         rollout_config = self.config.actor_rollout_ref.rollout
@@ -181,6 +220,9 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             actor_wg=self.actor_rollout_wg,
             replicas=self.standalone_server_manager.get_replicas(),
         )
+
+        if self.elastic_config.enable:
+            self._setup_elastic()
 
         # hybrid engine is in rollout mode after initialization
         if self._enable_hybrid_replicas:
@@ -237,7 +279,7 @@ class PPOTrainerSeparateAsync(PPOTrainer):
 
     def on_init_end(self):
         # update weights after loading checkpoint
-        self.standalone_checkpoint_manager.update_weights(self.global_steps)
+        self._sync_standalone(self.global_steps)
         if self._enable_hybrid_replicas:
             self.checkpoint_manager.update_weights(self.global_steps)
 
@@ -250,6 +292,7 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             self.switch_to_rollout()
 
     def on_step_begin(self):
+        self._step_start = time.perf_counter()
         self._step_sample_wait_seconds = 0.0
         self._step_wait_samples = 0
         self._step_threshold = 0
@@ -392,9 +435,10 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             prepare_seconds = time.perf_counter() - prepare_start
 
         with marked_timer("update_weights", self.timing_raw, color="red"):
-            self._pending_sync_metrics = dict(
-                self.standalone_checkpoint_manager.update_weights(self.global_steps) or {}
-            )
+            self._pending_sync_metrics = self._sync_standalone(self.global_steps)
+
+        if self.elastic_rollout is not None:
+            self._elastic_step_end()
 
         if config.enable_switch:
             self._pending_sync_metrics.update(decision_metrics)
@@ -409,6 +453,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
     def _get_n_gpus_for_throughput(self) -> int:
         """Include standalone rollout GPUs in the throughput denominator."""
         trainer_gpus = self.resource_pool_manager.get_n_gpus()
+        if self.elastic_rollout is not None:
+            return trainer_gpus + sum(r.world_size for r in self.standalone_server_manager.rollout_replicas)
         rollout_gpus = (
             self.config.actor_rollout_ref.rollout.n_gpus_per_node * self.config.actor_rollout_ref.rollout.nnodes
         )
@@ -451,3 +497,141 @@ class PPOTrainerSeparateAsync(PPOTrainer):
     def clear_sticky_cache(self) -> dict:
         global_load_balancer = self.standalone_server_manager.global_load_balancer
         return ray.get(global_load_balancer.clear_sticky_cache.remote())
+
+    # ------------------------------ elastic training ------------------------------
+
+    def _setup_elastic(self):
+        """Hand the standalone replicas to an elastic pool and watch the trainer for lost nodes."""
+        config, model = self.elastic_config, self.config.actor_rollout_ref.model
+        footprint = (
+            (0, 0)
+            if "*" in config.tp_by_accelerator
+            else model_footprint(model.path, model.get("trust_remote_code", False))
+        )
+        shaper = ReplicaShaper(*footprint, config.max_weight_fraction, config.tp_by_accelerator)
+        self.elastic_rollout = ElasticRolloutPool(self.standalone_server_manager, config, shaper)
+        self.elastic_rollout.monitor.watch("trainer", self._trainer_actors())
+        self.replay_buffer.on_idle = self._admit_replicas
+        self._consecutive_failures = 0
+
+        # A restarting trainer may only borrow rollout nodes like the ones it was placed on.
+        node_id = ray.get(self.actor_rollout_wg.workers[0].__ray_call__.remote(_node_id))
+        self._trainer_accelerator = next((n.accelerator for n in list_nodes() if n.node_id == node_id), None)
+        self.elastic_rollout.start()
+
+    def _trainer_actors(self) -> list:
+        groups = [self.actor_rollout_wg, getattr(self, "ref_policy_wg", None), getattr(self, "critic_wg", None)]
+        return list({w._actor_id: w for wg in groups if wg is not None for w in wg.workers}.values())
+
+    def _sync_standalone(self, global_steps: int) -> dict:
+        """Sync weights to the standalone replicas; with elastic training, apply membership changes first."""
+        if self.elastic_rollout is None:
+            return dict(self.standalone_checkpoint_manager.update_weights(global_steps) or {})
+        joined = self.elastic_rollout.commit()
+        metrics = self._watched_sync(self.standalone_checkpoint_manager, global_steps)
+        self.elastic_rollout.publish(joined)
+        return metrics
+
+    def _watched_sync(self, checkpoint_manager: CheckpointEngineManager, global_steps: int) -> dict:
+        # A member lost mid-sync would hang the broadcast; the monitor kills the rest so it fails fast instead.
+        participants = self._trainer_actors() + [w for r in checkpoint_manager.replicas for w in r.workers]
+        with self.elastic_rollout.monitor.watching("sync", participants):
+            return dict(checkpoint_manager.update_weights(global_steps) or {})
+
+    def _admit_replicas(self):
+        """While the trainer waits for samples, give replicas that finished launching the last step's weights."""
+        joined = self.elastic_rollout.commit()
+        if not joined:
+            return
+        manager = CheckpointEngineManager(self.standalone_checkpoint_manager.config, self.actor_rollout_wg, joined)
+        self._watched_sync(manager, self.global_steps - 1)
+        self.elastic_rollout.publish(joined)
+        logger.info(f"[Elastic] admitted {len(joined)} rollout replicas while waiting for samples")
+
+    def _elastic_step_end(self):
+        self._consecutive_failures = 0
+        sampleable = getattr(self.replay_buffer, "get_sampleable_count", lambda *_: 0)
+        self.elastic_rollout.step(
+            StepStats(
+                step_s=time.perf_counter() - self._step_start,
+                wait_s=self._step_sample_wait_seconds,
+                backlog=sampleable(self.global_steps + 1, "train"),
+                batch_size=self.config.data.train_batch_size,
+            )
+        )
+        self._pending_sync_metrics.update(self.elastic_rollout.metrics())
+
+    def on_worker_failure(self, error: Exception) -> bool:
+        """Restart the trainer in place when one of its nodes is lost; rollout keeps generating meanwhile."""
+        if self.elastic_rollout is None:
+            return False
+        start = time.perf_counter()
+        while True:
+            self._consecutive_failures += 1
+            if self._consecutive_failures > self.elastic_config.max_consecutive_failures:
+                logger.error(f"[Elastic] giving up after {self._consecutive_failures - 1} failures without progress")
+                return False
+            logger.warning(f"[Elastic] step {self.global_steps} failed with {error!r}, recovering")
+            try:
+                if not self._trainer_alive():
+                    self._restart_trainer()
+                self._sync_standalone(self.global_steps - 1)
+                break
+            except ray.exceptions.RayActorError as e:
+                error = e
+        self.elastic_rollout.counters["recovery_s"] += time.perf_counter() - start
+        return True
+
+    def _trainer_alive(self) -> bool:
+        try:
+            ray.get([w.__ray_ready__.remote() for w in self._trainer_actors()], timeout=30)
+            return True
+        except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError):
+            return False
+
+    def _restart_trainer(self):
+        """Rebuild the trainer worker groups at the same size and roll their state back to the latest checkpoint.
+
+        Waits for replacement nodes; after ``borrow_rollout_after_s`` it drains matching rollout nodes instead. The
+        step counter, data pipeline and rollout carry on, so only the updates since the last checkpoint are lost.
+        """
+        pool, monitor = self.elastic_rollout, self.elastic_rollout.monitor
+        pool.pause()
+        monitor.unwatch("trainer")
+        kill(self._trainer_actors())
+
+        manager = self.resource_pool_manager
+        names = [name for name, rp in manager.resource_pool_dict.items() if self.resource_pool_to_cls.get(rp)]
+        for name in names:
+            manager.resource_pool_dict[name].release()
+        manager.create_resource_pool(names, check=False)
+        self._wait_for_trainer_nodes([manager.resource_pool_dict[name] for name in names])
+
+        self._init_trainer_workers()
+        folder = find_latest_ckpt_path(self._checkpoint_dir())
+        if folder is None and self.config.trainer.resume_mode == "resume_path":
+            folder = self.config.trainer.resume_from_path
+        if folder is None:
+            logger.warning("[Elastic] no checkpoint to restore, the trainer restarts from the initial weights")
+        else:
+            self._load_model_checkpoint(folder)
+        self.standalone_checkpoint_manager.actor_wg = self.checkpoint_manager.actor_wg = self.actor_rollout_wg
+
+        monitor.watch("trainer", self._trainer_actors())
+        pool.counters["trainer_restarts"] += 1
+        pool.resume()
+        logger.warning(f"[Elastic] trainer restarted from {folder}")
+
+    def _wait_for_trainer_nodes(self, pools: list) -> None:
+        ready = [pg.ready() for rp in pools for pg in rp.reserve()]
+        deadline = self.elastic_config.borrow_rollout_after_s
+        start = time.perf_counter()
+        while pending := ray.wait(ready, num_returns=len(ready), timeout=10)[1]:
+            if deadline is not None and time.perf_counter() - start > deadline:
+                drained = self.elastic_rollout.vacate(
+                    len(pending), self.config.trainer.n_gpus_per_node, self._trainer_accelerator
+                )
+                logger.warning(
+                    f"[Elastic] no replacement trainer node after {deadline}s, borrowed {drained} rollout nodes"
+                )
+                deadline = None

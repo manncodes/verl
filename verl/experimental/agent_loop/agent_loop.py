@@ -53,7 +53,7 @@ from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
 from verl.utils.import_utils import resolve_config_path
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import simple_timer
-from verl.utils.ray_utils import auto_await, get_event_loop
+from verl.utils.ray_utils import auto_await, get_event_loop, stable_node_ids, stable_node_resource
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
     rollout_trace_attr,
@@ -1240,7 +1240,8 @@ class AgentLoopManager:
         self.agent_loop_workers = []
         num_workers = self.rollout_config.agent.num_workers
 
-        node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
+        stable = stable_node_resource(self.config)
+        node_ids = stable_node_ids(stable)
         for i in range(num_workers):
             # Round-robin scheduling over the all nodes
             node_id = node_ids[i % len(node_ids)]
@@ -1248,7 +1249,7 @@ class AgentLoopManager:
                 self.agent_loop_workers_class.options(
                     name=f"agent_loop_worker_{i}" + f"_{uuid4().hex[:8]}",
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                        node_id=node_id, soft=True
+                        node_id=node_id, soft=stable is None
                     ),
                 ).remote(
                     self.config,

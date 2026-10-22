@@ -26,6 +26,7 @@ from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.logging_utils import configure_verl_logging
+from verl.utils.ray_utils import stable_node_resource
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -79,6 +80,9 @@ def run_ppo(config, task_runner_class) -> None:
 
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
+    # With elastic training the driver must live on a node that never leaves.
+    stable = stable_node_resource(config)
+    runner_options = {"resources": {stable: 1e-3}} if stable else {}
     if (
         is_cuda_available
         and config.global_profiler.tool == "nsys"
@@ -91,9 +95,9 @@ def run_ppo(config, task_runner_class) -> None:
         nsight_options = OmegaConf.to_container(
             config.global_profiler.global_tool_config.nsys.controller_nsight_options
         )
-        runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
+        runner = task_runner_class.options(runtime_env={"nsight": nsight_options}, **runner_options).remote()
     else:
-        runner = task_runner_class.remote()
+        runner = task_runner_class.options(**runner_options).remote()
     ray.get(runner.run.remote(config))
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None

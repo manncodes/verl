@@ -228,6 +228,64 @@ trainer:
   # Device to run training on (e.g., "cuda", "cpu")
   device: cuda
 
+  # Elastic, fault-tolerant training (v1 separate_async only): rollout follows GPU nodes that join and
+  # leave, and the trainer restarts in place from its latest checkpoint when one of its nodes is lost.
+  elastic:
+
+    # Target dataclass for this configuration
+    _target_: verl.trainer.config.ElasticConfig
+
+    # Turn elastic training on.
+    enable: false
+
+    # Period (seconds) of the background loop that probes, fills and drains rollout replicas.
+    health_check_interval_s: 5.0
+
+    # Times a generation request is retried, one second apart, after its server died.
+    request_retries: 60
+
+    # Lower bound of the rollout GPU target.
+    min_rollout_gpus: 0
+
+    # Upper bound of the rollout GPU target; null uses every free GPU on eligible nodes.
+    max_rollout_gpus: null
+
+    # Publish the rollout GPU target to the Ray autoscaler (requires max_rollout_gpus and rollout_node_resource).
+    autoscale: false
+
+    # Scaling policy that moves the target each step: "static" (hold max_rollout_gpus) or "backlog".
+    policy: static
+
+    # backlog policy: scale up when the trainer waits for samples longer than this fraction of a step.
+    up_wait_ratio: 0.2
+
+    # backlog policy: consecutive steps a condition must hold before the target moves.
+    patience: 3
+
+    # backlog policy: GPUs added or removed per move.
+    scale_step_gpus: 8
+
+    # Largest fraction of one GPU's memory a replica's weight shard may use; the rest is left for KV cache.
+    max_weight_fraction: 0.5
+
+    # Tensor parallel size per Ray accelerator type (e.g. {H100: 1, L4: 4}), "*" for any; overrides the
+    # memory-based choice.
+    tp_by_accelerator: {}
+
+    # Ray resource advertised by nodes that never leave (head, CPU control group); control plane actors
+    # are pinned there.
+    stable_node_resource: null
+
+    # Ray resource advertised by nodes elastic rollout may use; null allows every GPU node.
+    rollout_node_resource: null
+
+    # Trainer restarts without a completed step before the job gives up.
+    max_consecutive_failures: 5
+
+    # Seconds a restarting trainer waits for a replacement node before taking a matching rollout node;
+    # null never borrows.
+    borrow_rollout_after_s: 120.0
+
   # Whether to use V1 trainer
   use_v1: true
 

@@ -19,10 +19,13 @@ import asyncio
 import concurrent.futures
 import functools
 import inspect
+import logging
 import os
 from typing import Any, Optional
 
 import ray
+
+logger = logging.getLogger(__name__)
 
 
 def ray_noset_visible_devices(env_vars=os.environ):
@@ -137,3 +140,18 @@ def auto_await(func):
             return future.result()
 
     return wrapper
+
+
+def stable_node_resource(config) -> Optional[str]:
+    """The Ray resource marking nodes that never leave, when elastic training is on."""
+    elastic = getattr(getattr(config, "trainer", None), "elastic", None)
+    return elastic.stable_node_resource if elastic is not None and elastic.get("enable", False) else None
+
+
+def stable_node_ids(resource: Optional[str]) -> list[str]:
+    """Alive CPU nodes for control plane actors: those advertising ``resource``, or every node without one."""
+    nodes = [node for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
+    stable = [node for node in nodes if resource and node["Resources"].get(resource, 0) > 0]
+    if resource and not stable:
+        logger.warning(f"No alive node advertises {resource!r}; control plane actors may land on nodes that leave")
+    return [node["NodeID"] for node in stable or nodes]

@@ -15,6 +15,8 @@ import logging
 import os
 import time
 from collections import Counter, defaultdict
+from collections.abc import Callable
+from typing import Optional
 
 import numpy as np
 import transfer_queue as tq
@@ -155,6 +157,8 @@ class ReplayBuffer:
         self.max_off_policy_strategy = max_off_policy_strategy
         self.sampler_kwargs = sampler_kwargs
         self.poll_interval = poll_interval
+        # Called on every poll while sampling waits; the trainer admits new rollout replicas here.
+        self.on_idle: Optional[Callable[[], None]] = None
         self.refill_fn = refill_fn
         self.filter_groups_metric = filter_groups_metric
         self.train_batch_size = train_batch_size
@@ -406,6 +410,8 @@ class ReplayBuffer:
         return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
 
     def _wait_for_next_poll(self, partition_id: str, last_debug_time: float) -> float:
+        if self.on_idle is not None:
+            self.on_idle()
         time.sleep(self.poll_interval)
         now = time.time()
         if now - last_debug_time > VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS:

@@ -29,7 +29,7 @@ from omegaconf import DictConfig
 
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils import normalize_token_ids
-from verl.utils.ray_utils import auto_await
+from verl.utils.ray_utils import auto_await, stable_node_resource
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.tracking import RLInsightLogger
 from verl.workers.rollout.replica import RolloutReplica, TokenOutput, get_rollout_replica_class
@@ -194,6 +194,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         """
         super().__init__(config=config, load_balancer_handle=load_balancer_handle, **kwargs)
         self._only_hybrid = only_hybrid
+        # With elastic training a server may vanish with its node; the request then resumes on another one.
+        elastic = getattr(getattr(config, "trainer", None), "elastic", None)
+        self._failover_retries = elastic.request_retries if elastic is not None and elastic.enable else 0
 
     async def _acquire_server(self, request_id: str, **extra) -> tuple[str, ray.actor.ActorHandle]:
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
@@ -286,19 +289,29 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         # must carry it forward explicitly or the consumer sees 0. Take the first
         # (initial-prompt) prefill's hit count, matching single-prefill semantics.
         num_cached_tokens = None
+        failovers = 0
 
         while True:
             # 1. generate tokens
-            output = await super().generate(
-                request_id=request_id,
-                prompt_ids=prompt_ids + final_output.token_ids,
-                sampling_params=sampling_params,
-                image_data=image_data,
-                video_data=video_data,
-                audio_data=audio_data,
-                mm_processor_kwargs=mm_processor_kwargs,
-                **kwargs,
-            )
+            try:
+                output = await super().generate(
+                    request_id=request_id,
+                    prompt_ids=prompt_ids + final_output.token_ids,
+                    sampling_params=sampling_params,
+                    image_data=image_data,
+                    video_data=video_data,
+                    audio_data=audio_data,
+                    mm_processor_kwargs=mm_processor_kwargs,
+                    **kwargs,
+                )
+            except ray.exceptions.RayActorError:
+                # The server died; keep the tokens generated so far and resume once the load balancer
+                # has evicted it.
+                if failovers >= self._failover_retries:
+                    raise
+                failovers += 1
+                await asyncio.sleep(1)
+                continue
 
             # 2. merge output into final_output
             final_output.token_ids.extend(output.token_ids)
@@ -404,8 +417,6 @@ class LLMServerManager:
         self.start_rank = start_rank
         self._load_balancer_cls = load_balancer_cls
 
-        assert worker_group is not None or self.rollout_config.nnodes > 0, "nnodes must be > 0 in standalone mode"
-
         # for recipe to change
         if not hasattr(self, "rollout_replica_class"):
             self.rollout_replica_class = get_rollout_replica_class(
@@ -449,6 +460,7 @@ class LLMServerManager:
         """
         if start_rank is None:
             start_rank = self.start_rank
+        assert self.worker_group is not None or self.rollout_config.nnodes > 0, "nnodes must be > 0 in standalone mode"
         rollout_world_size = (
             self.rollout_config.tensor_model_parallel_size
             * self.rollout_config.data_parallel_size
@@ -524,11 +536,13 @@ class LLMServerManager:
     async def _init_global_load_balancer(self) -> None:
         from verl.workers.rollout.router import get_router_handle
 
+        stable = stable_node_resource(getattr(self, "config", None))
         self.global_load_balancer = get_router_handle(
             servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
             router_config_path=getattr(self.rollout_config, "router_config_path", None),
             full_determinism=getattr(self.rollout_config, "full_determinism", False),
             load_balancer_cls=self._load_balancer_cls,
+            actor_options={"resources": {stable: 1e-3}} if stable else None,
         )
 
     def get_client(self, client_cls: type[LLMServerClient] | None = None, **kwargs) -> LLMServerClient:

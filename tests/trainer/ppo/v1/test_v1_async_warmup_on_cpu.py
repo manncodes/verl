@@ -120,6 +120,8 @@ def test_loaded_prompt_count_drives_on_train_begin_top_up(monkeypatch, tmp_path)
     stub.actor_rollout_wg = MagicMock()
     stub.train_dataloader = MagicMock()
     stub._load_checkpoint = PPOTrainer._load_checkpoint.__get__(stub)
+    stub._load_model_checkpoint = PPOTrainer._load_model_checkpoint.__get__(stub)
+    stub._checkpoint_dir = PPOTrainer._checkpoint_dir.__get__(stub)
     stub.on_train_begin = PPOTrainerColocateAsync.on_train_begin.__get__(stub)
 
     load_tq_checkpoint = MagicMock()

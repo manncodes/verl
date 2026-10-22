@@ -230,6 +230,69 @@ class PPOTrainer(ABC):
         self._init_dump_executor()
         self._init_resource_pool_mgr()
         self.resource_pool_manager.create_resource_pool()
+        actor_rollout_resource_pool = self._init_trainer_workers()
+
+        # 7. initialize reward loop manager
+        resource_pool = (
+            self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+            if self.config.reward.reward_model.enable
+            else None
+        )
+        self.reward_loop_manager = RewardLoopManager(
+            config=self.config,
+            rm_resource_pool=resource_pool,
+        )
+        logger.info("reward loop manager initialized")
+
+        # 8. initialize teacher loop manager
+        if self.use_teacher_policy:
+            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+            self.teacher_model_manager = MultiTeacherModelManager(
+                config=self.config,
+                resource_pool=teacher_resource_pool,
+            )
+            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
+        else:
+            self.teacher_model_manager = None
+            self.distillation_config = None
+
+        # 9. initialize agent loop manager
+        # Trainers that opt out of colocated rollout replicas on the training
+        # GPUs (v1 separate_async with actor_rollout_ref.hybrid_engine=False)
+        # set ``self._enable_hybrid_replicas = False`` before super()._setup();
+        # they get an empty manager here and serve rollout from their
+        # standalone replicas only.
+        if getattr(self, "_enable_hybrid_replicas", True):
+            self.llm_server_manager: LLMServerManager = LLMServerManager.create(
+                config=self.config,
+                worker_group=self.actor_rollout_wg,
+                rollout_resource_pool=actor_rollout_resource_pool,
+            )
+        else:
+            self.llm_server_manager = LLMServerManager.create_empty(config=self.config)
+
+        # 10. initialize checkpoint engine manager
+        checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+        checkpoint_engine_config.backend = "naive"
+        self.checkpoint_manager: CheckpointEngineManager = CheckpointEngineManager(
+            config=checkpoint_engine_config,
+            actor_wg=self.actor_rollout_wg,
+            replicas=self.llm_server_manager.get_replicas(),
+        )
+        logger.info("checkpoint engine manager initialized")
+
+        # sleep all replicas to load checkpoint
+        self.checkpoint_manager.sleep_replicas()
+        self._load_checkpoint()
+
+        logger.info("all initialize finished, ready to fit")
+
+    def _init_trainer_workers(self):
+        """Create and initialize the actor, reference and critic worker groups on the trainer resource pools.
+
+        Returns:
+            The resource pool of the actor worker group.
+        """
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         lora_rank = self.config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
@@ -339,60 +402,7 @@ class PPOTrainer(ABC):
         if self.ref_in_actor:
             self.ref_policy_wg = self.actor_rollout_wg
 
-        # 7. initialize reward loop manager
-        resource_pool = (
-            self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-            if self.config.reward.reward_model.enable
-            else None
-        )
-        self.reward_loop_manager = RewardLoopManager(
-            config=self.config,
-            rm_resource_pool=resource_pool,
-        )
-        logger.info("reward loop manager initialized")
-
-        # 8. initialize teacher loop manager
-        if self.use_teacher_policy:
-            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
-            self.teacher_model_manager = MultiTeacherModelManager(
-                config=self.config,
-                resource_pool=teacher_resource_pool,
-            )
-            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
-        else:
-            self.teacher_model_manager = None
-            self.distillation_config = None
-
-        # 9. initialize agent loop manager
-        # Trainers that opt out of colocated rollout replicas on the training
-        # GPUs (v1 separate_async with actor_rollout_ref.hybrid_engine=False)
-        # set ``self._enable_hybrid_replicas = False`` before super()._setup();
-        # they get an empty manager here and serve rollout from their
-        # standalone replicas only.
-        if getattr(self, "_enable_hybrid_replicas", True):
-            self.llm_server_manager: LLMServerManager = LLMServerManager.create(
-                config=self.config,
-                worker_group=self.actor_rollout_wg,
-                rollout_resource_pool=actor_rollout_resource_pool,
-            )
-        else:
-            self.llm_server_manager = LLMServerManager.create_empty(config=self.config)
-
-        # 10. initialize checkpoint engine manager
-        checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-        checkpoint_engine_config.backend = "naive"
-        self.checkpoint_manager: CheckpointEngineManager = CheckpointEngineManager(
-            config=checkpoint_engine_config,
-            actor_wg=self.actor_rollout_wg,
-            replicas=self.llm_server_manager.get_replicas(),
-        )
-        logger.info("checkpoint engine manager initialized")
-
-        # sleep all replicas to load checkpoint
-        self.checkpoint_manager.sleep_replicas()
-        self._load_checkpoint()
-
-        logger.info("all initialize finished, ready to fit")
+        return actor_rollout_resource_pool
 
     def get_llm_client(self) -> LLMServerClient:
         """Get the LLM server client for rollout generation."""
@@ -471,22 +481,28 @@ class PPOTrainer(ABC):
             self.timing_raw = {}
 
             # 1. perform rollout and actor/critic training
-            with marked_timer("step", self.timing_raw):
-                self.on_step_begin()
+            try:
+                with marked_timer("step", self.timing_raw):
+                    self.on_step_begin()
 
-                self._start_profiling()
-                batch = self.step(metrics, self.timing_raw)
-                self._stop_profiling()
+                    self._start_profiling()
+                    batch = self.step(metrics, self.timing_raw)
+                    self._stop_profiling()
 
-                # 2. save checkpoint
-                if self.config.trainer.save_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
-                ):
-                    with marked_timer("save_checkpoint", self.timing_raw, color="green"):
-                        self._save_checkpoint()
+                    # 2. save checkpoint
+                    if self.config.trainer.save_freq > 0 and (
+                        is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+                    ):
+                        with marked_timer("save_checkpoint", self.timing_raw, color="green"):
+                            self._save_checkpoint()
 
-                self.on_step_end()
-                metrics.update(self._consume_sync_metrics())
+                    self.on_step_end()
+                    metrics.update(self._consume_sync_metrics())
+            except ray.exceptions.RayActorError as error:
+                # A worker died with its node: retry the step once the trainer has recovered.
+                if not self.on_worker_failure(error):
+                    raise
+                continue
 
             # 4. validate
             if self.config.trainer.test_freq > 0 and (
@@ -654,6 +670,14 @@ class PPOTrainer(ABC):
     def on_train_end(self):
         """Called after the training loop ends."""
         return
+
+    def on_worker_failure(self, error: Exception) -> bool:
+        """Called when a training step fails because a Ray worker died.
+
+        Returns:
+            True once the trainer has recovered and the step should be retried; False to re-raise the error.
+        """
+        return False
 
     def on_validate_begin(self):
         """Called before the validation loop starts."""
@@ -855,11 +879,7 @@ class PPOTrainer(ABC):
         if self.config.trainer.resume_mode == "disable":
             return
         elif self.config.trainer.resume_mode == "auto":
-            checkpoint_folder = self.config.trainer.default_local_dir
-            if not os.path.isabs(checkpoint_folder):
-                working_dir = os.getcwd()
-                checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
-            global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
+            global_step_folder = find_latest_ckpt_path(self._checkpoint_dir())  # None if no latest
             if global_step_folder is None:
                 logger.info("Training from scratch")
                 return
@@ -877,18 +897,8 @@ class PPOTrainer(ABC):
         self.global_steps = int(global_step_folder.split("global_step_")[-1])
         logger.info(f"Resuming from {global_step_folder}, setting global step to {self.global_steps}")
 
-        # 2. load actor checkpoint
-        self.actor_rollout_wg.load_checkpoint(
-            local_path=os.path.join(global_step_folder, "actor"),
-            del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
-        )
-
-        # 3. load critic checkpoint
-        if self.use_critic:
-            self.critic_wg.load_checkpoint(
-                local_path=os.path.join(global_step_folder, str(Role.Critic)),
-                del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
-            )
+        # 2-3. load actor and critic checkpoint
+        self._load_model_checkpoint(global_step_folder)
 
         # 4. load dataloader checkpoint
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
@@ -907,6 +917,24 @@ class PPOTrainer(ABC):
                 tq.load_checkpoint(tq_ckpt_path)
                 self._restored_tq_prompt_count = _count_tq_prompt_groups()
                 logger.info(f"Restored {self._restored_tq_prompt_count} training prompt groups from TransferQueue")
+
+    def _checkpoint_dir(self) -> str:
+        checkpoint_folder = self.config.trainer.default_local_dir
+        if not os.path.isabs(checkpoint_folder):
+            checkpoint_folder = os.path.join(os.getcwd(), checkpoint_folder)
+        return checkpoint_folder
+
+    def _load_model_checkpoint(self, global_step_folder: str):
+        """Load actor and critic weights and optimizer states from a ``global_step_*`` folder."""
+        self.actor_rollout_wg.load_checkpoint(
+            local_path=os.path.join(global_step_folder, "actor"),
+            del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
+        )
+        if self.use_critic:
+            self.critic_wg.load_checkpoint(
+                local_path=os.path.join(global_step_folder, str(Role.Critic)),
+                del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
+            )
 
     def _reissue_inflight_prompts(self, partition_id: str = "train") -> int:
         """Restart checkpointed pending/running prompt groups from their persisted prompt data."""

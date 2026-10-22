@@ -119,6 +119,7 @@ class RayResourcePool(ResourcePool):
         max_colocate_count: int = 10,
         detached=False,
         accelerator_type: Optional[str] = None,
+        bundle_extra: Optional[dict[str, float]] = None,
     ) -> None:
         # TPU claims a chip exclusively per process, so colocating more than one
         # WorkerGroup builds a placement group that can never be satisfied.
@@ -131,10 +132,31 @@ class RayResourcePool(ResourcePool):
         self.pgs = None
         self.detached = detached
         self.accelerator_type = accelerator_type
+        # Extra resources added to every bundle, e.g. {"accelerator_type:H100": 1e-3} to pick a kind of node.
+        self.bundle_extra = bundle_extra or {}
+        self._reserved: Optional[list[PlacementGroup]] = None
+        self._released = False
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
         if self.pgs is not None:
             return self.pgs
+
+        pgs = self.reserve(strategy=strategy, name=name, device_name=device_name)
+        ray.get([pg.ready() for pg in pgs])
+
+        self.pgs = sort_placement_group_by_node_ip(pgs)
+        return pgs
+
+    def reserve(self, strategy="STRICT_PACK", name=None, device_name="cuda") -> list[PlacementGroup]:
+        """Request this pool's placement groups without waiting for them to be scheduled.
+
+        Pending groups are resource demand that the Ray autoscaler acts on. Calling this again
+        returns the same groups.
+        """
+        if self._released:
+            raise RuntimeError(f"resource pool {self.name_prefix!r} was released")
+        if self._reserved is not None:
+            return self._reserved
 
         pg_name_prefix = (
             name if name else f"{self.name_prefix}verl_group_{'_'.join([str(count) for count in self._store])}:"
@@ -156,19 +178,23 @@ class RayResourcePool(ResourcePool):
                 self.accelerator_type = current_platform.auto_assign_accelerator_type(self.name_prefix, None)
             if self.accelerator_type is not None:
                 bundle[self.accelerator_type] = 1e-4
+        bundle.update(self.bundle_extra)
         pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
 
         lifetime = "detached" if self.detached else None
 
-        pgs = [
+        self._reserved = [
             placement_group(bundles=bundles, strategy=strategy, name=pg_name_prefix + str(idx), lifetime=lifetime)
             for idx, bundles in enumerate(pg_scheme)
         ]
+        return self._reserved
 
-        ray.get([pg.ready() for pg in pgs])
-
-        self.pgs = sort_placement_group_by_node_ip(pgs)
-        return pgs
+    def release(self) -> None:
+        """Remove this pool's placement groups, killing the actors on them. A released pool cannot be reused."""
+        for pg in self._reserved or self.pgs or []:
+            ray.util.remove_placement_group(pg)
+        self._reserved = self.pgs = None
+        self._released = True
 
 
 class SubRayResourcePool(RayResourcePool):
@@ -205,15 +231,21 @@ class ResourcePoolManager:
         if not get_platform().supports_colocated_worker_groups():
             self.max_colocate_count = 1
 
-    def create_resource_pool(self):
+    def create_resource_pool(self, names: Optional[list[str]] = None, check: bool = True):
         """Create Ray resource pools for distributed training.
 
         Initializes resource pools based on the resource pool specification,
         with each pool managing GPU resources across multiple nodes.
         For FSDP backend, uses max_colocate_count=1 to merge WorkerGroups.
         For Megatron backend, uses max_colocate_count>1 for different models.
+
+        Args:
+            names: Only (re)create these pools; all of them by default.
+            check: Fail at once when the cluster lacks the devices instead of waiting for them.
         """
         for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
+            if names is not None and resource_pool_name not in names:
+                continue
             # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
             # For FSDP backend, using max_colocate_count=3: actor_critic_ref, rollout, reward model (optional)
             # For Megatron backend, we recommend using max_colocate_count>1
@@ -226,7 +258,8 @@ class ResourcePoolManager:
             )
             self.resource_pool_dict[resource_pool_name] = resource_pool
 
-        self._check_resource_available()
+        if check:
+            self._check_resource_available()
 
     def get_resource_pool(self, role) -> RayResourcePool:
         """Get the resource pool of the worker_cls"""

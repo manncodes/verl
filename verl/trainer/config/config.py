@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["CheckpointConfig", "ProfileConfig", "HybridRolloutSwitchConfig", "BaseModelConfig"]
+__all__ = ["CheckpointConfig", "ProfileConfig", "HybridRolloutSwitchConfig", "ElasticConfig", "BaseModelConfig"]
 
 
 @dataclass
@@ -85,6 +85,64 @@ class HybridRolloutSwitchConfig(BaseConfig):
             raise ValueError(f"switch_threshold_ratio must be in (0, 1], got {self.switch_threshold_ratio}")
         if self.switch_cost_window_size <= 0:
             raise ValueError("switch_cost_window_size must be positive")
+
+
+@dataclass
+class ElasticConfig(BaseConfig):
+    """Configuration for elastic, fault-tolerant training (v1 separate_async trainer).
+
+    Rollout replicas follow the GPU nodes that join and leave the Ray cluster, each shaped for its node,
+    and the trainer restarts in place from its latest checkpoint when one of its nodes is lost.
+
+    Args:
+        enable (bool): Turn elastic training on.
+        health_check_interval_s (float): Period of the background loop that probes, fills and drains.
+        request_retries (int): Times a generation request is retried, one second apart, after its server died.
+        min_rollout_gpus (int): Lower bound of the rollout GPU target.
+        max_rollout_gpus (Optional[int]): Upper bound of the rollout GPU target; None uses every free GPU.
+        autoscale (bool): Publish the target to the Ray autoscaler with ``request_resources``.
+        policy (str): Scaling policy that moves the target: "static" or "backlog".
+        up_wait_ratio (float): backlog policy: scale up when the trainer waits for samples longer than
+            this fraction of a step.
+        patience (int): backlog policy: consecutive steps a condition must hold before the target moves.
+        scale_step_gpus (int): backlog policy: GPUs added or removed per move.
+        max_weight_fraction (float): Largest fraction of one GPU's memory a replica's weight shard may use.
+        tp_by_accelerator (dict[str, int]): Tensor parallel size per Ray accelerator type, "*" for any;
+            overrides the memory-based choice.
+        stable_node_resource (Optional[str]): Ray resource advertised by nodes that never leave; control
+            plane actors are pinned there.
+        rollout_node_resource (Optional[str]): Ray resource advertised by nodes elastic rollout may use.
+        max_consecutive_failures (int): Trainer restarts without a completed step before giving up.
+        borrow_rollout_after_s (Optional[float]): How long a restarting trainer waits for a replacement node
+            before taking a matching rollout node; None never borrows.
+    """
+
+    enable: bool = False
+    health_check_interval_s: float = 5.0
+    request_retries: int = 60
+    min_rollout_gpus: int = 0
+    max_rollout_gpus: Optional[int] = None
+    autoscale: bool = False
+    policy: str = "static"
+    up_wait_ratio: float = 0.2
+    patience: int = 3
+    scale_step_gpus: int = 8
+    max_weight_fraction: float = 0.5
+    tp_by_accelerator: dict[str, int] = field(default_factory=dict)
+    stable_node_resource: Optional[str] = None
+    rollout_node_resource: Optional[str] = None
+    max_consecutive_failures: int = 5
+    borrow_rollout_after_s: Optional[float] = 120.0
+
+    def __post_init__(self):
+        if self.autoscale and (self.max_rollout_gpus is None or self.rollout_node_resource is None):
+            raise ValueError("elastic.autoscale requires max_rollout_gpus and rollout_node_resource")
+        if self.max_rollout_gpus is not None and self.max_rollout_gpus < self.min_rollout_gpus:
+            raise ValueError("elastic.max_rollout_gpus must be >= min_rollout_gpus")
+        if not 0.0 < self.max_weight_fraction <= 1.0:
+            raise ValueError(f"elastic.max_weight_fraction must be in (0, 1], got {self.max_weight_fraction}")
+        if self.policy == "backlog" and self.min_rollout_gpus < 1:
+            raise ValueError("elastic.policy=backlog needs min_rollout_gpus >= 1, or rollout could scale to nothing")
 
 
 @dataclass
