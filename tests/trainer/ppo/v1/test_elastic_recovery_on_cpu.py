@@ -24,6 +24,7 @@ import verl.trainer.ppo.v1.trainer_base as base_module
 import verl.trainer.ppo.v1.trainer_separate_async as trainer_module
 from verl.single_controller.ray.base import RayResourcePool
 from verl.trainer.config import ElasticConfig
+from verl.trainer.main_ppo import pin_transfer_queue_storage
 from verl.trainer.ppo.v1.trainer_separate_async import PPOTrainerSeparateAsync
 
 # ------------------------------ validation ------------------------------
@@ -95,6 +96,30 @@ def test_elastic_off_keeps_today_behaviour(monkeypatch):
 def test_elastic_rejects_unsupported_setups(monkeypatch, kwargs, match):
     with pytest.raises(ValueError, match=match):
         _construct(monkeypatch, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "enable, stable, preset, expected",
+    [
+        (True, "verl_stable", None, "verl_stable"),
+        (True, "verl_stable", "mine", "mine"),
+        (False, "verl_stable", None, None),
+        (True, None, None, None),
+    ],
+)
+def test_transfer_queue_storage_stays_on_stable_nodes(enable, stable, preset, expected):
+    key = "transfer_queue.backend.SimpleStorage.required_node_resource"
+    config = OmegaConf.create(
+        {
+            "trainer": {"elastic": {"enable": enable, "stable_node_resource": stable}},
+            "transfer_queue": {"backend": {"SimpleStorage": {"num_data_storage_units": 8}}},
+        }
+    )
+    if preset is not None:
+        OmegaConf.update(config, key, preset)
+    OmegaConf.set_struct(config, True)
+    pin_transfer_queue_storage(config)
+    assert OmegaConf.select(config, key) == expected
 
 
 # ------------------------------ recovery ------------------------------

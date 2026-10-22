@@ -33,6 +33,14 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 # Define a function to run the PPO-like training process
+def pin_transfer_queue_storage(config: DictConfig) -> None:
+    """With elastic training, keep TransferQueue storage units on nodes that never leave."""
+    stable = stable_node_resource(config)
+    key = "transfer_queue.backend.SimpleStorage.required_node_resource"
+    if stable and OmegaConf.select(config, key) is None:
+        OmegaConf.update(config, key, stable, force_add=True)
+
+
 def run_ppo(config, task_runner_class) -> None:
     """Initialize Ray cluster and run distributed PPO training process.
 
@@ -154,6 +162,7 @@ class TaskRunnerV1:
         self.config = config
 
         # initialize transfer queue
+        pin_transfer_queue_storage(config)
         tq.init(config.transfer_queue)
         succeeded = False
         try:

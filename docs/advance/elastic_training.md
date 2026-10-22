@@ -76,6 +76,9 @@ Requirements:
 
 - One image built for every GPU architecture in use.
 - NVIDIA only, because NCCL does not span vendors.
+- Ray names the accelerator type after the first word that follows "NVIDIA" in the GPU name, so an RTX PRO 6000
+  and every other RTX card are all `RTX`. Different RTX models in one pool look the same to the shaper: keep one
+  RTX model per cluster.
 - Logprob differences across hardware are handled by rollout correction or by recomputing `old_log_prob`.
 
 ## Failure semantics
@@ -88,7 +91,7 @@ Requirements:
 | No replacement trainer node | After `borrow_rollout_after_s`, the trainer takes a rollout node with the same GPU type and count. A later replacement node is then filled by rollout. |
 | A process dies during a weight sync | The fate monitor kills every sync participant, so the broadcast fails instead of hanging, and the trainer restarts as above. |
 | Repeated failures without progress | After `max_consecutive_failures`, the error is raised. |
-| Ray head node lost | Not tolerated: it hosts the GCS and the driver. |
+| Ray head node lost | Not tolerated by default: it hosts the GCS and the driver. See [Head node](#head-node). |
 
 The trainer world size never changes, because FSDP checkpoints are written per rank. Keep `save_freq` small and
 `default_local_dir` on storage that every node can reach.
@@ -96,9 +99,14 @@ The trainer world size never changes, because FSDP checkpoints are written per r
 ## Kubernetes setup
 
 Mark the nodes that never leave (the head, and optionally a CPU control group) with a Ray resource and name it in
-`stable_node_resource`. The driver, the load balancer, the agent-loop workers and the reward-loop workers are
-pinned there. To keep rollout away from some GPU nodes, give the rollout groups a second marker and set
-`rollout_node_resource`. `autoscale` requires it.
+`stable_node_resource`. The driver, the load balancer, the agent-loop workers, the reward-loop workers and the
+TransferQueue storage units are pinned there. Storage is pinned by defaulting
+`transfer_queue.backend.SimpleStorage.required_node_resource` to the stable resource. The TransferQueue
+controller cannot be pinned. It is created from the pinned driver and normally lands on the same node, but that
+is not enforced.
+
+To keep rollout away from some GPU nodes, give the rollout groups a second marker and set `rollout_node_resource`.
+`autoscale` requires it.
 
 ### KubeRay
 
@@ -152,6 +160,23 @@ spec:
 - **Node markers:** all workers are alike. The trainer takes its nodes first and rollout fills the rest, so no
   rollout marker is needed.
 
+### Head node
+
+By default, losing the Ray head pod ends the job. The head hosts the GCS, and Ray Jobs runs the driver on the head
+unless the entrypoint requests resources. A worker-only topology, with no work on the head, does not change that
+by itself. Together with the other two steps below, it turns a head restart into a pause:
+
+1. Keep work off the head with `num-cpus: "0"` and `num-gpus: "0"` in its `rayStartParams`. Add a CPU control
+   group that carries `verl_stable` for the control plane.
+2. Run the driver on that group with RayJob `entrypointNumCpus: 1` and `entrypointResources: '{"verl_stable": 1}'`.
+   Ray Jobs then schedules the job supervisor, a detached actor, there instead of on the head.
+3. Enable GCS fault tolerance with an external Redis. Set `RAY_gcs_rpc_server_reconnect_timeout_s` on every pod
+   above the time a head restart takes, because a raylet that cannot reach the GCS within it exits.
+
+While the GCS is away, calls between running actors carry on, which covers most of a training step. Anything that
+needs the GCS waits for it to come back: creating actors or placement groups, and building the communication group
+of a weight sync. This setup has not been tested yet.
+
 ## Metrics
 
 | Metric | Meaning |
@@ -181,5 +206,4 @@ The following can be run by hand on a cluster:
   receive deltas.
 - Each rollout replica runs on a single node.
 - Reward-model and teacher pools are not elastic; keep them on stable nodes.
-- TransferQueue storage units are spread over the nodes alive at startup. Start the job before elastic rollout
-  nodes join, or keep the storage units on stable nodes.
+- The Ray head pod is a single point of failure unless it is set up as in [Head node](#head-node).
